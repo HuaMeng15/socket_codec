@@ -4,11 +4,11 @@ BUILD_DIR = $(TOP_DIR)/build
 CXX=g++
 CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG
 
-INCLUDES = -Icodec -Itransmission -IlogSystem -Itools
+INCLUDES = -Icodec -Itransmission -Ilog_system -Itools
 
 SRCS = $(wildcard codec/*.cc \
 				 transmission/*.cc \
-				 logSystem/*.cc \
+				 log_system/*.cc \
 				 tools/*.cc \
 				 socket_codec.cc)
 
