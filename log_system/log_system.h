@@ -10,10 +10,11 @@
 
 // Log levels
 enum LogLevel {
-  INFO = 0,
-  WARNING = 1,
-  ERROR = 2,
-  FATAL = 3
+  VERBOSE = 0,
+  INFO = 1,
+  WARNING = 2,
+  ERROR = 3,
+  FATAL = 4
 };
 
 // Log stream class to handle the << operator chaining

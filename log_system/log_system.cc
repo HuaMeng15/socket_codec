@@ -3,9 +3,12 @@
 // Initialize static mutex for thread safety
 std::mutex LogStream::log_mutex;
 
+const LogLevel kMinLogLevel = LogLevel::VERBOSE;
+
 // Convert log level to human-readable string with color coding
 std::string logLevelToString(LogLevel level) {
   switch (level) {
+      case LogLevel::VERBOSE: return "\033[34mVERBOSE\033[0m";  // Blue
       case LogLevel::INFO:    return "\033[32mINFO\033[0m";    // Green
       case LogLevel::WARNING: return "\033[33mWARNING\033[0m"; // Yellow
       case LogLevel::ERROR:   return "\033[31mERROR\033[0m";   // Red
@@ -31,7 +34,11 @@ LogStream::LogStream(LogLevel level) : level_(level), timestamp_(std::chrono::sy
 
 // LogStream destructor: output the complete log message
 LogStream::~LogStream() {
-  std::lock_guard<std::mutex> lock(log_mutex);  // Ensure thread-safe output
+  // std::lock_guard<std::mutex> lock(log_mutex);  // Ensure thread-safe output
+
+  if (level_ < kMinLogLevel) {
+      return;  // Skip logs below the minimum level
+  }
 
   // Format the final log line
   std::string log_line = "[" + getCurrentTime() + "] "
