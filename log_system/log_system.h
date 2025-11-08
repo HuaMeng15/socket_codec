@@ -1,43 +1,38 @@
 #ifndef LOG_SYSTEM_H
 #define LOG_SYSTEM_H
 
-#include <iostream>
-#include <string>
 #include <chrono>
 #include <ctime>
-#include <sstream>
+#include <iostream>
 #include <mutex>
+#include <sstream>
+#include <string>
 
 // Log levels
-enum LogLevel {
-  VERBOSE = 0,
-  INFO = 1,
-  WARNING = 2,
-  ERROR = 3,
-  FATAL = 4
-};
+enum LogLevel { VERBOSE = 0, INFO = 1, WARNING = 2, ERROR = 3, FATAL = 4 };
 
 // Log stream class to handle the << operator chaining
 class LogStream {
-public:
+ public:
   // Constructor: captures log level and timestamp
   LogStream(LogLevel level);
 
-  // Destructor: outputs the complete log message when the stream goes out of scope
+  // Destructor: outputs the complete log message when the stream goes out of
+  // scope
   ~LogStream();
 
   // Overload << operator to accept any data type
   template <typename T>
   LogStream& operator<<(const T& data) {
-      log_ss << data;  // Append data to internal string stream
-      return *this;
+    log_ss << data;  // Append data to internal string stream
+    return *this;
   }
 
-private:
-  LogLevel level_;                  // Current log level
-  std::stringstream log_ss;         // Internal stream to accumulate message parts
+ private:
+  LogLevel level_;           // Current log level
+  std::stringstream log_ss;  // Internal stream to accumulate message parts
   std::chrono::system_clock::time_point timestamp_;  // Log creation time
-  static std::mutex log_mutex;      // For thread safety (optional but useful)
+  static std::mutex log_mutex;  // For thread safety (optional but useful)
 };
 
 // Helper function to convert LogLevel to string
@@ -49,4 +44,4 @@ std::string getCurrentTime();
 // Macro definitions for easy logging
 #define LOG(level) LogStream(LogLevel::level)
 
-#endif // LOG_SYSTEM_H
+#endif  // LOG_SYSTEM_H

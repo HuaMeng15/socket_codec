@@ -8,12 +8,18 @@ const LogLevel kMinLogLevel = LogLevel::VERBOSE;
 // Convert log level to human-readable string with color coding
 std::string logLevelToString(LogLevel level) {
   switch (level) {
-      case LogLevel::VERBOSE: return "\033[34mVERBOSE\033[0m";  // Blue
-      case LogLevel::INFO:    return "\033[32mINFO\033[0m";    // Green
-      case LogLevel::WARNING: return "\033[33mWARNING\033[0m"; // Yellow
-      case LogLevel::ERROR:   return "\033[31mERROR\033[0m";   // Red
-      case LogLevel::FATAL:   return "\033[41mFATAL\033[0m";   // Red background
-      default:                return "UNKNOWN";
+    case LogLevel::VERBOSE:
+      return "\033[34mVERBOSE\033[0m";  // Blue
+    case LogLevel::INFO:
+      return "\033[32mINFO\033[0m";  // Green
+    case LogLevel::WARNING:
+      return "\033[33mWARNING\033[0m";  // Yellow
+    case LogLevel::ERROR:
+      return "\033[31mERROR\033[0m";  // Red
+    case LogLevel::FATAL:
+      return "\033[41mFATAL\033[0m";  // Red background
+    default:
+      return "UNKNOWN";
   }
 }
 
@@ -30,26 +36,26 @@ std::string getCurrentTime() {
 }
 
 // LogStream constructor: capture timestamp and level
-LogStream::LogStream(LogLevel level) : level_(level), timestamp_(std::chrono::system_clock::now()) {}
+LogStream::LogStream(LogLevel level)
+    : level_(level), timestamp_(std::chrono::system_clock::now()) {}
 
 // LogStream destructor: output the complete log message
 LogStream::~LogStream() {
   // std::lock_guard<std::mutex> lock(log_mutex);  // Ensure thread-safe output
 
   if (level_ < kMinLogLevel) {
-      return;  // Skip logs below the minimum level
+    return;  // Skip logs below the minimum level
   }
 
   // Format the final log line
-  std::string log_line = "[" + getCurrentTime() + "] "
-                      + "[" + logLevelToString(level_) + "] "
-                      + log_ss.str() + "\n";
+  std::string log_line = "[" + getCurrentTime() + "] " + "[" +
+                         logLevelToString(level_) + "] " + log_ss.str() + "\n";
 
   // Output to standard error (common for logs, but can change to std::cout)
   std::cerr << log_line;
 
   // For FATAL level, exit the program after logging
   if (level_ == LogLevel::FATAL) {
-      std::exit(EXIT_FAILURE);
+    std::exit(EXIT_FAILURE);
   }
 }

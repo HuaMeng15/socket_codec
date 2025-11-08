@@ -2,9 +2,12 @@ TOP_DIR = .
 TRANSMISSION_DIR = $(TOP_DIR)/Transmission
 BUILD_DIR = $(TOP_DIR)/build
 CXX=g++
-CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG
+CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG -mmacosx-version-min=14.6
 
-INCLUDES = -Icodec -Itransmission -Ilog_system -Itools
+INCLUDES = -Icodec -Itransmission -Ilog_system -Itools -I./include
+
+LDFLAGS = -L./lib
+LDLIBS = -lvvenc
 
 SRCS = $(wildcard codec/*.cc \
 				 transmission/*.cc \
@@ -22,7 +25,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 $(BUILD_DIR)/%.o: %.cc
 	mkdir -p $(dir $@)
