@@ -1,5 +1,4 @@
 TOP_DIR = .
-TRANSMISSION_DIR = $(TOP_DIR)/Transmission
 BUILD_DIR = $(TOP_DIR)/build
 CXX=g++
 CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG -mmacosx-version-min=14.6
