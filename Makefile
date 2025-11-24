@@ -3,7 +3,7 @@ BUILD_DIR = $(TOP_DIR)/build
 CXX=g++
 CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG -mmacosx-version-min=14.6
 
-INCLUDES = -Icodec -Itransmission -Ilog_system -Itools -I./include
+INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -I./include
 
 LDFLAGS = -L./lib
 LDLIBS = -lvvenc
@@ -12,6 +12,7 @@ SRCS = $(wildcard codec/*.cc \
 				 transmission/*.cc \
 				 log_system/*.cc \
 				 tools/*.cc \
+				 frame_capture.cc \
 				 socket_codec.cc)
 
 OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(SRCS))
@@ -32,5 +33,22 @@ $(BUILD_DIR)/%.o: %.cc
 
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -f compile_commands.json
 
-.PHONY: all clean
+# Generate compile_commands.json for language servers (requires 'bear' or 'compiledb')
+# Install bear: brew install bear (macOS) or apt-get install bear (Linux)
+# Install compiledb: pip install compiledb
+compile_commands.json:
+	@if command -v bear > /dev/null; then \
+		bear -- make clean all; \
+	elif command -v compiledb > /dev/null; then \
+		compiledb make clean all; \
+	else \
+		echo "Error: Neither 'bear' nor 'compiledb' is installed."; \
+		echo "Install one of them to generate compile_commands.json:"; \
+		echo "  macOS: brew install bear"; \
+		echo "  Linux: apt-get install bear  OR  pip install compiledb"; \
+		exit 1; \
+	fi
+
+.PHONY: all clean compile_commands.json
