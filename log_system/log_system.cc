@@ -35,6 +35,14 @@ std::string getCurrentTime() {
   return std::string(time_str);
 }
 
+// Get thread ID as a formatted string
+std::string getThreadId() {
+  std::thread::id id = std::this_thread::get_id();
+  std::stringstream ss;
+  ss << id;
+  return ss.str();
+}
+
 // LogStream constructor: capture timestamp and level
 LogStream::LogStream(LogLevel level)
     : level_(level), timestamp_(std::chrono::system_clock::now()) {}
@@ -47,9 +55,10 @@ LogStream::~LogStream() {
     return;  // Skip logs below the minimum level
   }
 
-  // Format the final log line
+  // Format the final log line with thread ID
   std::string log_line = "[" + getCurrentTime() + "] " + "[" +
-                         logLevelToString(level_) + "] " + log_ss.str() + "\n";
+                         logLevelToString(level_) + "] " + "[TID:" +
+                         getThreadId() + "] " + log_ss.str() + "\n";
 
   // Output to standard error (common for logs, but can change to std::cout)
   std::cerr << log_line;

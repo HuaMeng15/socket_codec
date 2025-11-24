@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "vvenc/vvenc.h"
+#include "log_system/log_system.h"
 
 struct vvencYUVBuffer;
 

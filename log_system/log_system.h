@@ -7,6 +7,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
 // Log levels
 enum LogLevel { VERBOSE = 0, INFO = 1, WARNING = 2, ERROR = 3, FATAL = 4 };
@@ -40,6 +41,9 @@ std::string logLevelToString(LogLevel level);
 
 // Helper function to get current time as string (YYYY-MM-DD HH:MM:SS)
 std::string getCurrentTime();
+
+// Helper function to get current thread ID as string
+std::string getThreadId();
 
 // Macro definitions for easy logging
 #define LOG(level) LogStream(LogLevel::level)
