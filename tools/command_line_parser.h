@@ -44,6 +44,7 @@ class Flag : public FlagBase {
   T value_;
 };
 
+// Singleton command line parser
 class CmdLineParser {
  public:
   CmdLineParser(const CmdLineParser&) = delete;
