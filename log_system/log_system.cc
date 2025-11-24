@@ -23,16 +23,32 @@ std::string logLevelToString(LogLevel level) {
   }
 }
 
-// Get current time formatted as "YYYY-MM-DD HH:MM:SS"
+// Get current time formatted as "YYYY-MM-DD HH:MM:SS.mmm"
 std::string getCurrentTime() {
   auto now = std::chrono::system_clock::now();
   std::time_t now_time = std::chrono::system_clock::to_time_t(now);
   struct tm time_info;
   localtime_r(&now_time, &time_info);  // Thread-safe version of localtime
 
-  char time_str[20];
+  // Get milliseconds
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch()) % 1000;
+
+  char time_str[24];
   std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &time_info);
-  return std::string(time_str);
+
+  // Append milliseconds with proper padding (always 3 digits)
+  std::string result(time_str);
+  result += ".";
+  int ms_value = static_cast<int>(ms.count());
+  if (ms_value < 10) {
+    result += "00";
+  } else if (ms_value < 100) {
+    result += "0";
+  }
+  result += std::to_string(ms_value);
+
+  return result;
 }
 
 // Get thread ID as a formatted string

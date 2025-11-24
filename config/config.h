@@ -6,6 +6,7 @@
 const uint16_t kDefaultHeight = 1080;
 const uint16_t kDefaultWidth = 1920;
 const uint16_t kDefaultFps = 30;
+const int kDefaultFramesToEncode = 10;
 
 struct FlagInitializer {
   FlagInitializer() {
@@ -18,6 +19,8 @@ struct FlagInitializer {
     parser.AddIntFlag("width", kDefaultWidth, "video width");
     parser.AddIntFlag("height", kDefaultHeight, "video height");
     parser.AddIntFlag("fps", kDefaultFps, "video fps");
+    parser.AddIntFlag("frames_to_encode", kDefaultFramesToEncode,
+                      "number of frames to encode (0 or negative means encode all frames)");
     parser.AddStringFlag("input_video_file", "input/Lecture_5s.yuv",
                          "input YUV video file for sender");
     parser.AddStringFlag("output_video_file", "result/output.266",

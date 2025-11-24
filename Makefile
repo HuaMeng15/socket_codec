@@ -12,7 +12,6 @@ SRCS = $(wildcard codec/*.cc \
 				 transmission/*.cc \
 				 log_system/*.cc \
 				 tools/*.cc \
-				 frame_capture.cc \
 				 socket_codec.cc)
 
 OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(SRCS))
