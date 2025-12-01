@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "log_system/log_system.h"
+#include "packet_header.h"
 
 MessageSender::MessageSender()
     : socket_fd_(-1),

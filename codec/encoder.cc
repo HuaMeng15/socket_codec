@@ -62,7 +62,7 @@ int Encoder::Initialize(int width, int height, int fps, int framesToBeEncoded) {
 
   // Get the adapted config
   vvenc_get_config(encoder_, &params_);
-  LOG(INFO) << "[Encoder] Adapted config";
+  LOG(VERBOSE) << "[Encoder] Adapted config";
 
   // Allocate and initialize the YUV Buffer
   vvenc_YUVBuffer_alloc_buffer(&yuv_input_buffer_, params_.m_internChromaFormat,

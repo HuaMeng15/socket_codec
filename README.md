@@ -30,7 +30,7 @@ VVenc must be installed and available on your system before building socket_code
    ls /usr/local/lib/libvvenc*
    ls /usr/local/include/vvenc/
    ```
-<!-- 
+
 ### 2. Install VVdec (VVC Decoder)
 
 VVdec must also be installed for the decoder functionality.
@@ -39,7 +39,7 @@ VVdec must also be installed for the decoder functionality.
 
 1. Clone the VVdec repository:
    ```bash
-   git clone https://github.com/fraunhoferhhi/vvdec.git
+   git clone https://github.com/HuaMeng15/vvdec.git
    cd vvdec
    ```
 
@@ -48,17 +48,19 @@ VVdec must also be installed for the decoder functionality.
    mkdir build && cd build
    cmake .. -DCMAKE_BUILD_TYPE=Release
    make -j$(nproc)
-   sudo make install
+   make install
    ```
 
-3. Verify installation:
+3. Copy the library and headers to socket_codec:
    ```bash
-   # Check if libraries are installed
-   ls /usr/local/lib/libvvdec*
-   ls /usr/local/include/vvdec/
-   ``` -->
+   # From the vvdec directory, copy the library
+   cp vvdec/lib/release-static/libvvdec.a /path/to/socket_codec/lib/.
 
-### 2. System Requirements
+   # Copy the header files
+   cp -r vvdec/install/include/vvdec/* /path/to/socket_codec/include/vvdec/
+   ```
+
+### 3. System Requirements
 
 - C++23 compatible compiler (GCC 11+ or Clang 14+)
 - Make
@@ -110,7 +112,7 @@ The receiver listens for UDP packets, reassembles frames, decodes them, and save
 
 **Example:**
 ```bash
-./build/socket_codec --file=result/receiver.266
+./build/socket_codec --file=result/rec.y4m
 ```
 
 ### Command Line Arguments

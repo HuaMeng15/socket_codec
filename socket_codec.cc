@@ -2,6 +2,7 @@
 #include <thread>
 #include <chrono>
 
+#include "codec/decoder.h"
 #include "codec/encoder.h"
 #include "config/config.h"
 #include "codec/frame_capture.h"
@@ -11,7 +12,6 @@
 #include "transmission/message_sender.h"
 
 int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int dest_port) {
-  // ========== SENDER MODE ==========
   LOG(INFO) << "[socket_codec_main] Running in sender mode";
 
   std::string input_video_file =
@@ -92,17 +92,35 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   return 0;
 }
 
-int receiver_create_and_run(int dest_port, const std::string& filename) {
-  // ========== RECEIVER MODE ==========
+int receiver_create_and_run(CmdLineParser& parser, int dest_port, const std::string& filename) {
   LOG(INFO) << "[socket_codec_main] Running in receiver mode, saving to file: "
             << filename;
 
-  // Create and initialize message receiver
-  MessageReceiver message_receiver;
-  if (0 != message_receiver.Initialize(dest_port, filename)) {
-    LOG(ERROR) << "[socket_codec_main] Failed to initialize message receiver";
+  // Get video parameters (needed for decoder initialization)
+  int width = parser.GetFlag<int>("width");
+  int height = parser.GetFlag<int>("height");
+
+  LOG(INFO) << "[socket_codec_main] Receiver video parameters: " << width << "x" << height;
+
+  // Create and initialize decoder
+  LOG(INFO) << "[socket_codec_main] Initializing decoder";
+  Decoder decoder;
+  if (0 != decoder.Initialize(width, height, filename)) {
+    LOG(ERROR) << "[socket_codec_main] Failed to initialize decoder";
     return -1;
   }
+  LOG(INFO) << "[socket_codec_main] Decoder initialized";
+
+  // Create and initialize message receiver
+  MessageReceiver message_receiver;
+  if (0 != message_receiver.Initialize(dest_port)) {
+    LOG(ERROR) << "[socket_codec_main] Failed to initialize message receiver";
+    decoder.Cleanup();
+    return -1;
+  }
+
+  // Connect decoder (as message handler) to message receiver
+  message_receiver.SetMessageHandler(&decoder);
 
   LOG(INFO) << "[socket_codec_main] Message receiver initialized, listening on port "
             << dest_port;
@@ -114,6 +132,7 @@ int receiver_create_and_run(int dest_port, const std::string& filename) {
 
   // Cleanup
   message_receiver.Close();
+  decoder.Cleanup();
   return 0;
 }
 
@@ -134,7 +153,7 @@ int main(int argc, char* argv[]) {
       return -1;
     }
   } else {
-    receiver_create_and_run(dest_port, filename);
+    receiver_create_and_run(parser, dest_port, filename);
   }
 
   return 0;
