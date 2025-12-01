@@ -129,6 +129,21 @@ int MessageSender::SendData(const uint8_t* data, size_t data_size,
   return 0;
 }
 
+int MessageSender::SendRaw(const uint8_t* data, size_t data_size) {
+  if (!initialized_ || socket_fd_ < 0) {
+    LOG(ERROR) << "[MessageSender] Not initialized";
+    return -1;
+  }
+
+  if (!data || data_size == 0) {
+    LOG(WARNING) << "[MessageSender] Invalid data or size";
+    return -1;
+  }
+
+  // Send data directly without packet header
+  return SendPacket(data, data_size);
+}
+
 int MessageSender::SendPacket(const uint8_t* packet_data, size_t packet_size) {
   if (socket_fd_ < 0) {
     return -1;

@@ -1,6 +1,7 @@
 #ifndef TRANSMISSION_MESSAGE_HANDLER_H
 #define TRANSMISSION_MESSAGE_HANDLER_H
 
+#include <cstddef>
 #include <cstdint>
 
 // MessageHandler base class for handling received packets

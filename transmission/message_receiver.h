@@ -41,6 +41,10 @@ class MessageReceiver {
   // Check if receiver is initialized
   bool IsInitialized() const;
 
+  // Get the last sender's IP address and port
+  // Returns true if sender info is available, false otherwise
+  bool GetLastSenderInfo(std::string& sender_ip, int& sender_port) const;
+
  private:
   // Receive a single packet
   int ReceivePacket(uint8_t* buffer, size_t buffer_size, ssize_t& bytes_received);
@@ -52,6 +56,11 @@ class MessageReceiver {
 
   // Message handler for processing received packets
   MessageHandler* message_handler_;
+
+  // Last sender information (for feedback)
+  mutable std::string last_sender_ip_;
+  mutable int last_sender_port_;
+  mutable bool has_sender_info_;
 };
 
 #endif  // TRANSMISSION_MESSAGE_RECEIVER_H

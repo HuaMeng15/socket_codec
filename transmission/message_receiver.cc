@@ -13,7 +13,9 @@ MessageReceiver::MessageReceiver()
       listen_port_(0),
       initialized_(false),
       stop_requested_(false),
-      message_handler_(nullptr) {}
+      message_handler_(nullptr),
+      last_sender_port_(0),
+      has_sender_info_(false) {}
 
 MessageReceiver::~MessageReceiver() { Close(); }
 
@@ -114,6 +116,14 @@ int MessageReceiver::ReceivePacket(uint8_t* buffer, size_t buffer_size,
     return -1;
   }
 
+  // Store sender information for feedback
+  char ip_str[INET_ADDRSTRLEN];
+  if (inet_ntop(AF_INET, &sender_addr.sin_addr, ip_str, INET_ADDRSTRLEN) != nullptr) {
+    last_sender_ip_ = std::string(ip_str);
+    last_sender_port_ = ntohs(sender_addr.sin_port);
+    has_sender_info_ = true;
+  }
+
   return 0;
 }
 
@@ -140,3 +150,13 @@ void MessageReceiver::Close() {
 }
 
 bool MessageReceiver::IsInitialized() const { return initialized_; }
+
+bool MessageReceiver::GetLastSenderInfo(std::string& sender_ip,
+                                        int& sender_port) const {
+  if (!has_sender_info_) {
+    return false;
+  }
+  sender_ip = last_sender_ip_;
+  sender_port = last_sender_port_;
+  return true;
+}

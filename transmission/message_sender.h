@@ -20,6 +20,10 @@ class MessageSender {
   // Returns 0 on success, negative value on error
   int SendData(const uint8_t* data, size_t data_size, uint32_t frame_sequence);
 
+  // Send raw data without packet header (for feedback, etc.)
+  // Returns 0 on success, negative value on error
+  int SendRaw(const uint8_t* data, size_t data_size);
+
   // Close the socket
   void Close();
 

@@ -10,6 +10,8 @@
 #include "tools/thread_manager.h"
 #include "transmission/message_receiver.h"
 #include "transmission/message_sender.h"
+#include "transmission/decoder_with_feedback.h"
+#include "transmission/feedback_manage.h"
 
 int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int dest_port) {
   LOG(INFO) << "[socket_codec_main] Running in sender mode";
@@ -65,6 +67,32 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   encoder.SetOutputStream(&cOutBitstream);
   encoder.SetMessageSender(&message_sender);
 
+  // Create and initialize feedback manager
+  FeedbackManage feedback_manage;
+  if (0 != feedback_manage.Initialize()) {
+    LOG(ERROR) << "[socket_codec_main] Failed to initialize feedback manager";
+    return -1;
+  }
+
+  // Create feedback receiver (listens on dest_port + 1)
+  int feedback_port = dest_port + 1;
+  MessageReceiver feedback_receiver;
+  if (0 != feedback_receiver.Initialize(feedback_port)) {
+    LOG(ERROR) << "[socket_codec_main] Failed to initialize feedback receiver";
+    return -1;
+  }
+  LOG(INFO) << "[socket_codec_main] Feedback receiver initialized on port "
+            << feedback_port;
+
+  // Set feedback manager as message handler (it inherits from MessageHandler)
+  feedback_receiver.SetMessageHandler(&feedback_manage);
+
+  // Start feedback receiver in a separate thread
+  LOG(INFO) << "[socket_codec_main] Starting feedback receiver thread";
+  Thread feedback_receiver_thread([&feedback_receiver]() {
+    feedback_receiver.Run();
+  });
+
   LOG(INFO) << "[socket_codec_main] Starting frame capture and encoder threads";
 
   // Create threads for frame capture and encoder
@@ -76,6 +104,10 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   frame_capture_thread.Join();
   encoder_thread.Join();
 
+  // Stop feedback receiver
+  feedback_receiver.Stop();
+  feedback_receiver_thread.Join();
+
   LOG(INFO) << "[socket_codec_main] All threads finished";
 
   // Print summary before cleanup
@@ -86,6 +118,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   encoder.Cleanup();
   frame_capture.Stop();
   message_sender.Close();
+  feedback_receiver.Close();
   if (cOutBitstream.is_open()) {
     cOutBitstream.close();
   }
@@ -119,8 +152,14 @@ int receiver_create_and_run(CmdLineParser& parser, int dest_port, const std::str
     return -1;
   }
 
-  // Connect decoder (as message handler) to message receiver
-  message_receiver.SetMessageHandler(&decoder);
+  // Create decoder wrapper with feedback support
+  // Feedback will be sent to sender on dest_port + 1
+  int feedback_port = dest_port + 1;
+  DecoderWithFeedback decoder_with_feedback(&decoder, &message_receiver,
+                                            feedback_port);
+
+  // Connect decoder wrapper (as message handler) to message receiver
+  message_receiver.SetMessageHandler(&decoder_with_feedback);
 
   LOG(INFO) << "[socket_codec_main] Message receiver initialized, listening on port "
             << dest_port;

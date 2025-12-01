@@ -8,9 +8,12 @@
 #include <vector>
 
 #include "transmission/message_handler.h"
+#include "transmission/message_sender.h"
+#include "transmission/feedback_manage.h"
 #include "vvdec/vvdec.h"
 #include "log_system/log_system.h"
 #include "transmission/packet_header.h"
+#include <chrono>
 
 #define MAX_CODED_PICTURE_SIZE 800000
 
@@ -30,6 +33,13 @@ class Decoder : public MessageHandler {
 
   // Cleanup resources
   void Cleanup();
+
+  // Set feedback sender for sending feedback messages
+  void SetFeedbackSender(MessageSender* feedback_sender);
+
+ private:
+  // Send feedback message for a received packet
+  void SendFeedback(uint32_t frame_sequence, uint16_t packet_index);
 
  private:
   // Frame assembly state
@@ -66,6 +76,9 @@ class Decoder : public MessageHandler {
   std::ofstream output_stream_;
 
   vvdecAccessUnit access_unit_;
+
+  // Feedback sender for sending feedback messages
+  MessageSender* feedback_sender_;
 };
 
 #endif  // CODEC_DECODER_H

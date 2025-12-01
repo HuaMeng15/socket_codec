@@ -2,15 +2,45 @@
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 
 #include "log_system/log_system.h"
 #include "tools/yuv_file_io.h"
+#include "transmission/feedback_manage.h"
+
+// Format current time as yyyy-mm-dd-hh-mm-ss-mmm
+static std::string FormatTimestamp() {
+  auto now = std::chrono::system_clock::now();
+  auto time_t = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch()) % 1000;
+
+  std::tm* tm_info = std::localtime(&time_t);
+  if (!tm_info) {
+    return "0000-00-00-00-00-00-000";
+  }
+
+  std::ostringstream oss;
+  oss << std::setfill('0')
+      << std::setw(4) << (tm_info->tm_year + 1900) << "-"
+      << std::setw(2) << (tm_info->tm_mon + 1) << "-"
+      << std::setw(2) << tm_info->tm_mday << "-"
+      << std::setw(2) << tm_info->tm_hour << "-"
+      << std::setw(2) << tm_info->tm_min << "-"
+      << std::setw(2) << tm_info->tm_sec << "-"
+      << std::setw(3) << ms.count();
+
+  return oss.str();
+}
 
 Decoder::Decoder()
     : decoder_(nullptr),
       initialized_(false),
-      last_completed_frame_(0) {
+      last_completed_frame_(0),
+      feedback_sender_(nullptr) {
   vvdec_accessUnit_default(&access_unit_);
 }
 
@@ -141,6 +171,9 @@ void Decoder::ProcessPacket(const uint8_t* packet_data, size_t packet_size) {
               << (total_packets - 1) << " for frame " << frame_sequence
               << " (" << frame_assembly.received_packets << "/" << total_packets
               << " complete)";
+
+    // Send feedback for received packet
+    SendFeedback(frame_sequence, packet_index);
   }
 
   // Check if frame is complete
@@ -296,4 +329,45 @@ void Decoder::Cleanup() {
 
   frame_assemblies_.clear();
   initialized_ = false;
+}
+
+void Decoder::SetFeedbackSender(MessageSender* feedback_sender) {
+  feedback_sender_ = feedback_sender;
+}
+
+void Decoder::SendFeedback(uint32_t frame_sequence, uint16_t packet_index) {
+  if (!feedback_sender_ || !feedback_sender_->IsInitialized()) {
+    return;
+  }
+
+  // Create feedback packet
+  FeedbackPacket feedback;
+  feedback.frame_sequence = htonl(frame_sequence);
+  feedback.packet_index = htons(packet_index);
+
+  // Format timestamp as string: yyyy-mm-dd-hh-mm-ss-mmm
+  std::string timestamp_str = FormatTimestamp();
+  size_t timestamp_len = timestamp_str.length();
+  if (timestamp_len >= sizeof(feedback.timestamp)) {
+    timestamp_len = sizeof(feedback.timestamp) - 1;
+  }
+  std::memcpy(feedback.timestamp, timestamp_str.c_str(), timestamp_len);
+  feedback.timestamp[timestamp_len] = '\0';
+
+  // Send feedback using SendRaw to avoid adding PacketHeader
+  // Size is: frame_sequence (4) + packet_index (2) + timestamp string (including null terminator)
+  size_t packet_size = sizeof(feedback.frame_sequence) +
+                       sizeof(feedback.packet_index) +
+                       timestamp_len + 1;
+  int ret = feedback_sender_->SendRaw(
+      reinterpret_cast<const uint8_t*>(&feedback),
+      packet_size);
+
+  if (ret != 0) {
+    LOG(WARNING) << "[Decoder] Failed to send feedback for frame "
+                 << frame_sequence << " packet " << packet_index;
+  } else {
+    LOG(VERBOSE) << "[Decoder] Sent feedback for frame " << frame_sequence
+                 << " packet " << packet_index << " timestamp=" << timestamp_str;
+  }
 }
