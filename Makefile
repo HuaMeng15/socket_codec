@@ -6,7 +6,7 @@ CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missi
 INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -I./include
 
 LDFLAGS = -L./lib
-LDLIBS = -lvvenc
+LDLIBS = -lvvenc -lvvdec
 
 SRCS = $(wildcard codec/*.cc \
 				 transmission/*.cc \
@@ -17,13 +17,23 @@ SRCS = $(wildcard codec/*.cc \
 OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(SRCS))
 
 TARGET = $(BUILD_DIR)/socket_codec
+TEST_TARGET = $(BUILD_DIR)/test_decoder
 
 all: $(BUILD_DIR) $(TARGET)
+
+test: $(BUILD_DIR) $(TEST_TARGET)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+# Test decoder target - only includes necessary objects
+TEST_OBJS = $(BUILD_DIR)/log_system/log_system.o \
+            $(BUILD_DIR)/test_decoder.o
+
+$(TEST_TARGET): $(TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
 $(BUILD_DIR)/%.o: %.cc
@@ -50,4 +60,4 @@ compile_commands.json:
 		exit 1; \
 	fi
 
-.PHONY: all clean compile_commands.json
+.PHONY: all test clean compile_commands.json
