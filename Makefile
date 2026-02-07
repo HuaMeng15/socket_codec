@@ -1,18 +1,48 @@
 TOP_DIR = .
 BUILD_DIR = $(TOP_DIR)/build
 CXX=g++
+
+# VVENC flag: set to 1 to enable h266 (VVC) codec support
+# Usage: make VVENC=1
+VVENC ?= 0
+
 CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG -mmacosx-version-min=14.6
 
-INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -I./include
+# Add VVENC define if flag is set
+ifeq ($(VVENC),1)
+  CXXFLAGS += -DVVENC
+endif
 
-LDFLAGS = -L./lib
-LDLIBS = -lvvenc -lvvdec
+# FFmpeg paths (must be built in third_party/ffmpeg before compiling)
+FFMPEG_DIR = third_party/ffmpeg
+FFMPEG_BUILD_DIR = $(FFMPEG_DIR)/build
+FFMPEG_INCLUDE = -I$(FFMPEG_DIR) -I$(FFMPEG_BUILD_DIR)
 
+INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -I./include \
+           $(FFMPEG_INCLUDE)
+
+LDFLAGS = -L./lib -L$(FFMPEG_BUILD_DIR)/libavcodec -L$(FFMPEG_BUILD_DIR)/libavutil
+LDLIBS = -lx264 -lavcodec -lavutil
+
+# Conditionally include vvenc/vvdec libraries if VVENC is enabled
+ifeq ($(VVENC),1)
+  LDLIBS += -lvvenc -lvvdec
+endif
+
+# Source files - conditionally include h266 based on VVENC flag
 SRCS = $(wildcard codec/*.cc \
+				 codec/h264/*.cc \
 				 transmission/*.cc \
 				 log_system/*.cc \
 				 tools/*.cc \
-				 socket_codec.cc)
+				 config/config.cc \
+				 socket_codec.cc \
+				 video_capture_and_send.cc)
+
+# Conditionally add h266 sources
+ifeq ($(VVENC),1)
+  SRCS += $(wildcard codec/h266/*.cc)
+endif
 
 OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(SRCS))
 

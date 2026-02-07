@@ -2,86 +2,111 @@
 #define CODEC_ENCODER_H
 
 #include <atomic>
-#include <condition_variable>
 #include <fstream>
-#include <functional>
-#include <mutex>
+#include <memory>
 #include <string>
 
-#include "tools/yuv_file_io.h"
-#include "vvenc/vvenc.h"
-#include "vvenc/vvencCfg.h"
-
-// Forward declaration
+// Forward declarations
 class FrameCapture;
-class MessageSender;
+class DataSender;
+
+// Common YUV buffer structure (codec-agnostic)
+struct YUVBuffer {
+  struct Plane {
+    uint8_t* ptr;      // Pointer to plane data
+    int stride;        // Stride in bytes
+    int width;         // Width in pixels
+    int height;        // Height in pixels
+  };
+  
+  Plane planes[3];     // Y, U, V planes
+  int64_t sequence_number;
+  int64_t cts;         // Composition timestamp
+  bool cts_valid;
+  
+  YUVBuffer() : sequence_number(0), cts(0), cts_valid(false) {
+    for (int i = 0; i < 3; i++) {
+      planes[i].ptr = nullptr;
+      planes[i].stride = 0;
+      planes[i].width = 0;
+      planes[i].height = 0;
+    }
+  }
+
+  YUVBuffer(int width, int height) : sequence_number(0), cts(0), cts_valid(false) {
+    for (int i = 0; i < 3; i++) {
+      // Allocate memory for the plane based on yuv420 format
+      if (i == 0) {
+        planes[i].ptr = new uint8_t[width * height];
+        planes[i].stride = width;
+        planes[i].width = width;
+        planes[i].height = height;
+      } else if (i == 1) {
+        planes[i].ptr = new uint8_t[width * height / 4];
+        planes[i].stride = width / 2;
+        planes[i].width = width / 2;
+        planes[i].height = height / 2;
+      } else if (i == 2) {
+        planes[i].ptr = new uint8_t[width * height / 4];
+        planes[i].stride = width / 2;
+        planes[i].width = width / 2;
+        planes[i].height = height / 2;
+      }
+    }
+  }
+
+  ~YUVBuffer() {
+    for (int i = 0; i < 3; i++) {
+      if (planes[i].ptr) {
+        delete[] planes[i].ptr;
+        planes[i].ptr = nullptr;
+      }
+    }
+  }
+};
+
+// Base encoded data structure
+struct EncodedData {
+  uint16_t sequence_number;
+  size_t size;
+  std::vector<uint8_t*> data_ptrs;
+  std::vector<size_t> data_sizes;
+
+  EncodedData() : sequence_number(0), size(0), data_ptrs() {}
+
+  void AddData(uint8_t* data, size_t size) {
+    data_ptrs.push_back(data);
+    data_sizes.push_back(size);
+    this->size += size;
+  }
+
+  ~EncodedData() {
+    for (auto data : data_ptrs) {
+      if (data) {
+        delete[] data;
+        data = nullptr;
+      }
+    }
+    data_ptrs.clear();
+    data_sizes.clear();
+  }
+};
 
 class Encoder {
  public:
-  Encoder();
-  ~Encoder();
+  Encoder() = default;
+  virtual ~Encoder() = default;
 
-  // Initialize encoder with configuration
-  int Initialize(int width, int height, int fps, int framesToBeEncoded = -1);
+  virtual int Initialize(int width, int height, int fps, int framesToBeEncoded = -1) = 0;
 
-  // Set output stream for encoded data
-  void SetOutputStream(std::ofstream* output_stream);
+  virtual void SetOutputStream(std::ofstream* output_stream) = 0;
 
-  // Set message sender for network transmission
-  void SetMessageSender(MessageSender* message_sender);
+  virtual std::unique_ptr<EncodedData> EncodeFrame(YUVBuffer* input_buffer) = 0;
 
-  // Set frame capture reference for thread-safe encoding
-  void SetFrameCapture(FrameCapture* frame_capture);
+  virtual void Cleanup() = 0;
 
-  // Run encoder in thread-safe mode (to be called in a separate thread)
-  // Works with FrameCapture for synchronized frame-by-frame encoding
-  void Run();
-
-  // Encode a single frame (for frame-by-frame encoding)
-  // Returns 0 on success, negative value on error
-  int EncodeFrame(vvencYUVBuffer* input_buffer, bool& bEncodeDone);
-
-  // Signal that encoder is ready for next frame
-  void SignalReadyForNextFrame();
-
-  // Stop the encoder
-  void Stop();
-
-  // Check if encoder is stopped
-  bool IsStopped() const;
-
-  // Cleanup resources
-  void Cleanup();
-
-  // Get encoder statistics
-  void PrintSummary() const;
-
- private:
-  // Initialize encoder parameters
-  void InitializeEncoderParams(vvenc_config* params, int width, int height,
-                               int fps, int framesToBeEncoded);
-
-  // Copy frame buffer data from source to encoder's buffer
-  void CopyFrameBuffer(const vvencYUVBuffer* source);
-
-  // Write encoded access unit to output stream
-  void WriteEncodedData(
-      const std::chrono::high_resolution_clock::time_point& start_time);
-
-  FrameCapture* frame_capture_;
-  MessageSender* message_sender_;
-
-  vvencEncoder* encoder_;
-  vvenc_config params_;
-  vvencYUVBuffer yuv_input_buffer_;
-  vvencAccessUnit access_unit_;
-  std::ofstream* output_stream_;
-  bool initialized_;
-  int64_t sequence_number_;
-  int64_t max_frames_;
-
-  // Thread synchronization
-  std::atomic<bool> stop_requested_;
+  virtual void PrintSummary() const = 0;
 };
 
 #endif  // CODEC_ENCODER_H
+

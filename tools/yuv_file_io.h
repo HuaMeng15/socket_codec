@@ -12,6 +12,7 @@
 #include "vvenc/vvenc.h"
 #include "vvdec/vvdec.h"
 #include "log_system/log_system.h"
+#include "codec/encoder.h"
 
 struct vvencYUVBuffer;
 
@@ -136,8 +137,136 @@ class YuvFileIO {
 
     return 0;
   }
+
+  // Read YUV frame into YUVBuffer (codec-agnostic)
+  int readYuvBuf(YUVBuffer* yuvBuf, bool& bEof) {
+    // check end-of-file
+    bEof = false;
+    if (isEof()) {
+      m_lastError = "end of file";
+      bEof = true;
+      return 0;
+    }
+
+    // Read Y, U, V planes (assuming YUV420 format)
+    for (int comp = 0; comp < 3; comp++) {
+      YUVBuffer::Plane& plane = yuvBuf->planes[comp];
+
+      if (plane.ptr == nullptr || plane.width == 0 || plane.height == 0) {
+        m_lastError = "invalid plane " + std::to_string(comp);
+        return -1;
+      }
+
+      // Read plane data line by line
+      for (int y = 0; y < plane.height; y++) {
+        m_cHandle.read(reinterpret_cast<char*>(plane.ptr + y * plane.stride), plane.width);
+        if (m_cHandle.eof() || m_cHandle.fail()) {
+          m_lastError = "error reading YUV plane data: " + std::to_string(comp);
+          bEof = true;
+          return 0;
+        }
+      }
+    }
+
+    return 0;
+  }
 };
 
+/**
+ * \brief Write Y4M header for YUVBuffer
+ * \param[in] f Output stream pointer
+ * \param[in] yuv_buffer YUVBuffer pointer
+ * \param[in] frame_rate Frame rate (default: 50)
+ * \param[in] frame_scale Frame scale (default: 1)
+ * \retval int 0 on success, non-zero on error
+ */
+ inline int writeY4MHeader( std::ostream *f, YUVBuffer *yuv_buffer, int frame_rate = 50, int frame_scale = 1 )
+ {
+   std::stringstream cssHeader;
+
+   if ( f == NULL || yuv_buffer == NULL )
+   {
+     return -1;
+   }
+
+   if ( yuv_buffer->sequence_number == 0 )
+   {
+     // Determine color format based on plane dimensions
+     // Assuming YUV420: U and V are half the size of Y
+     const char *cf = "420";  // Default to YUV420
+     if (yuv_buffer->planes[1].width == yuv_buffer->planes[0].width &&
+         yuv_buffer->planes[1].height == yuv_buffer->planes[0].height) {
+       cf = "444";
+     } else if (yuv_buffer->planes[1].width == yuv_buffer->planes[0].width &&
+                yuv_buffer->planes[1].height == yuv_buffer->planes[0].height / 2) {
+       cf = "422";
+     }
+
+     const char *bdepth = "";  // Assuming 8-bit
+     const char *interlacedMode = " Ip";  // Progressive
+
+     cssHeader << "YUV4MPEG2 W" << yuv_buffer->planes[0].width
+               << " H" << yuv_buffer->planes[0].height
+               << " F" << frame_rate << ":" << frame_scale
+               << interlacedMode << " C" << cf << bdepth << "\n";
+   }
+
+   cssHeader << "FRAME\n";
+
+   f->write( cssHeader.str().c_str(), cssHeader.str().length() );
+
+   return 0;
+ }
+
+ /**
+  * \brief Write decoded YUV frame to file using YUVBuffer
+  * \param[in] f Output stream pointer
+  * \param[in] yuv_buffer YUVBuffer pointer
+  * \param[in] y4mFormat Whether to write in y4m format
+  * \param[in] pyuvOutput Whether to write in packed YUV format (not supported for YUVBuffer, ignored)
+  * \retval int 0 on success, non-zero on error
+  */
+ inline int writeYUVToFile( std::ostream *f, YUVBuffer *yuv_buffer, bool y4mFormat, bool pyuvOutput )
+ {
+   (void)pyuvOutput;  // Not supported for YUVBuffer
+
+   if ( f == NULL || yuv_buffer == NULL )
+   {
+     return -1;
+   }
+
+   if ( y4mFormat )
+   {
+     if ( writeY4MHeader( f, yuv_buffer ) != 0 )
+     {
+       return -1;
+     }
+   }
+
+   // Write each plane (Y, U, V)
+   for ( int c = 0; c < 3; c++ )
+   {
+     const auto& plane = yuv_buffer->planes[c];
+     if ( plane.ptr == nullptr || plane.width == 0 || plane.height == 0 )
+     {
+       continue;  // Skip invalid planes
+     }
+
+     // Write plane data, handling stride
+     for ( int y = 0; y < plane.height; y++ )
+     {
+       f->write( reinterpret_cast<const char*>(plane.ptr + y * plane.stride), plane.width );
+       if ( f->fail() )
+       {
+         return -1;
+       }
+     }
+   }
+
+   return 0;
+ } 
+
+#ifdef VVDEC_TEST
 /**
  * \brief Retrieving of NAL unit start code
  */
@@ -160,7 +289,7 @@ static inline int retrieveNalStartCode( unsigned char *pB, int iZerosInStartcode
 
   return info;
 }
- 
+
 /**
 * \brief Reading of one Annex B NAL unit from file stream
 */
@@ -301,6 +430,7 @@ static int readBitstreamFromFile( std::ifstream *f, vvdecAccessUnit* pcAccessUni
   pcAccessUnit->payloadUsedSize=len;
   return len;
 }
+#endif
 
 // ====================================================================================================================
 // VVDec frame writing functions (for decoded frame output)
@@ -311,7 +441,7 @@ static int readBitstreamFromFile( std::ifstream *f, vvdecAccessUnit* pcAccessUni
  * \param[in] frame Decoded frame pointer
  * \retval int 0 on success, -1 on error
  */
-static int writeY4MHeader( std::ostream *f, vvdecFrame *frame )
+inline int writeY4MHeader( std::ostream *f, vvdecFrame *frame )
 {
   std::stringstream cssHeader;
 
@@ -354,6 +484,7 @@ static int writeY4MHeader( std::ostream *f, vvdecFrame *frame )
   return 0;
 }
 
+#ifdef VVENC
 /**
  * \brief Write a component plane to file
  * \param[in] f Output stream pointer
@@ -573,7 +704,7 @@ static int _writeComponentToFile( std::ostream *f, vvdecPlane *plane, vvdecPlane
  * \param[in] pyuvOutput Whether to write in packed YUV format
  * \retval int 0 on success, non-zero on error
  */
-static int writeYUVToFile( std::ostream *f, vvdecFrame *frame, bool y4mFormat, bool pyuvOutput )
+inline int writeYUVToFile( std::ostream *f, vvdecFrame *frame, bool y4mFormat, bool pyuvOutput )
 {
   uint32_t c = 0;
 
@@ -600,5 +731,7 @@ static int writeYUVToFile( std::ostream *f, vvdecFrame *frame, bool y4mFormat, b
 
   return 0;
 }
+
+#endif // VVENC
 
 #endif

@@ -60,7 +60,44 @@ VVdec must also be installed for the decoder functionality.
    cp -r vvdec/install/include/vvdec/* /path/to/socket_codec/include/vvdec/
    ```
 
-### 3. System Requirements
+### 3. Build FFmpeg (Required for H.264 Decoding)
+
+FFmpeg is required for H.264 decoding functionality. You must compile FFmpeg in the `third_party/ffmpeg` directory before building socket_codec.
+
+**Build Steps:**
+
+1. Navigate to the FFmpeg directory:
+   ```bash
+   cd third_party/ffmpeg
+   ```
+
+2. If the FFmpeg submodule is not initialized, initialize it:
+   ```bash
+   git submodule update --init --recursive
+   ```
+
+3. Build FFmpeg with static libraries (minimal configuration for H.264 decoding):
+   ```bash
+   mkdir -p build
+   cd build
+   ../configure --disable-programs --disable-doc \
+                --disable-avdevice --disable-avfilter \
+                --disable-swscale --disable-swresample \
+                --disable-videotoolbox --disable-audiotoolbox \
+                --disable-iconv --disable-zlib
+   make -j$(nproc)
+   ```
+
+4. Verify the build:
+   ```bash
+   # Check that libraries are built
+   ls libavcodec/libavcodec.a
+   ls libavutil/libavutil.a
+   ```
+
+**Note:** The build process may take several minutes. FFmpeg must be built before running `make` in the socket_codec root directory.
+
+### 4. System Requirements
 
 - C++23 compatible compiler (GCC 11+ or Clang 14+)
 - Make
@@ -112,7 +149,7 @@ The receiver listens for UDP packets, reassembles frames, decodes them, and save
 
 **Example:**
 ```bash
-./build/socket_codec --file=result/rec.y4m
+./build/socket_codec --file=result/rec.yuv
 ```
 
 ### Command Line Arguments

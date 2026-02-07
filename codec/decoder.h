@@ -2,83 +2,34 @@
 #define CODEC_DECODER_H
 
 #include <cstdint>
-#include <fstream>
-#include <map>
 #include <string>
-#include <vector>
 
-#include "transmission/message_handler.h"
-#include "transmission/message_sender.h"
-#include "transmission/feedback_manage.h"
-#include "vvdec/vvdec.h"
-#include "log_system/log_system.h"
-#include "transmission/packet_header.h"
-#include <chrono>
+#include "encoder.h"  // For YUVBuffer
 
-#define MAX_CODED_PICTURE_SIZE 800000
+// Use YUVBuffer for decoded frames (same structure as encoder input)
 
-class Decoder : public MessageHandler {
+// Decoder interface: Only responsible for decoding encoded data to raw YUV data
+class Decoder {
  public:
-  Decoder();
-  ~Decoder();
+  Decoder() = default;
+  virtual ~Decoder() = default;
 
   // Initialize decoder with video parameters
-  // output_file: optional output file path for writing encoded frames
-  int Initialize(int width, int height, const std::string& output_file = "");
+  virtual int Initialize(int width, int height) = 0;
 
-  // HandlePacketMessage implementation from MessageHandler
-  // Handles packet assembly and decodes complete frames
-  int HandlePacketMessage(const uint8_t* packet_data,
-                         size_t packet_size) override;
-
-  // Cleanup resources
-  void Cleanup();
-
-  // Set feedback sender for sending feedback messages
-  void SetFeedbackSender(MessageSender* feedback_sender);
-
- private:
-  // Send feedback message for a received packet
-  void SendFeedback(uint32_t frame_sequence, uint16_t packet_index);
-
- private:
-  // Frame assembly state
-  struct FrameAssembly {
-    std::vector<std::vector<uint8_t>> packets;  // Packets for this frame
-    uint16_t total_packets;                      // Expected total packets
-    uint32_t received_packets;                  // Number of packets received
-    bool complete;                              // Frame is complete
-  };
-
-  // Process a received packet (internal method)
-  void ProcessPacket(const uint8_t* packet_data, size_t packet_size);
-
-  // Decode a complete frame from assembled data
+  // Decode a complete encoded frame to raw YUV data
+  // frame_data: complete encoded frame data (already assembled)
+  // frame_size: size of the encoded frame data
   // Returns decoded frame pointer (caller must call ReleaseFrame when done)
-  vvdecFrame* DecodeFrame(const uint8_t* frame_data, size_t frame_size);
+  // Returns nullptr on error or if more data is needed
+  virtual YUVBuffer* DecodeFrame(const uint8_t* frame_data, size_t frame_size) = 0;
 
-  // Release a decoded frame
-  void ReleaseFrame(vvdecFrame* frame);
+  // Release a decoded frame (free memory)
+  virtual void ReleaseFrame(YUVBuffer* frame) = 0;
 
-  // Write complete frame to file (if output file is set)
-  void DecodeAndWriteFrame(uint32_t frame_sequence, const std::vector<uint8_t>& frame_data);
-
-  vvdecDecoder* decoder_;
-  vvdecParams params_;
-  bool initialized_;
-
-  // Frame assembly map: frame_sequence -> FrameAssembly
-  std::map<uint32_t, FrameAssembly> frame_assemblies_;
-  uint32_t last_completed_frame_;
-
-  // Output file for writing encoded frames
-  std::string output_file_;
-  std::ofstream output_stream_;
-
-  vvdecAccessUnit access_unit_;
-
-  // Feedback sender for sending feedback messages
-  MessageSender* feedback_sender_;
+  // Cleanup decoder resources
+  virtual void Cleanup() = 0;
 };
 
 #endif  // CODEC_DECODER_H
+
