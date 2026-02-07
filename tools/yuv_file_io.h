@@ -9,11 +9,12 @@
 #include <string>
 #include <vector>
 
-#include "vvenc/vvenc.h"
-#include "vvdec/vvdec.h"
 #include "log_system/log_system.h"
 #include "codec/encoder.h"
 
+#ifdef VVENC
+#include "vvenc/vvenc.h"
+#include "vvdec/vvdec.h"
 struct vvencYUVBuffer;
 
 typedef int16_t LPel;
@@ -86,7 +87,7 @@ static bool readYuvPlane(std::istream& fd, vvencYUVPlane& yuvPlane,
   }
   return true;
 }
-
+#endif
 // ====================================================================================================================
 
 class YuvFileIO {
@@ -111,6 +112,7 @@ class YuvFileIO {
   bool isFail() { return m_cHandle.fail(); }
   std::string getLastError() const { return m_lastError; }
 
+#ifdef VVENC
   int readYuvBuf(vvencYUVBuffer& yuvInBuf, bool& bEof) {
     // check end-of-file
     bEof = false;
@@ -137,7 +139,7 @@ class YuvFileIO {
 
     return 0;
   }
-
+#endif
   // Read YUV frame into YUVBuffer (codec-agnostic)
   int readYuvBuf(YUVBuffer* yuvBuf, bool& bEof) {
     // check end-of-file
@@ -432,6 +434,7 @@ static int readBitstreamFromFile( std::ifstream *f, vvdecAccessUnit* pcAccessUni
 }
 #endif
 
+#ifdef VVENC
 // ====================================================================================================================
 // VVDec frame writing functions (for decoded frame output)
 
@@ -484,7 +487,6 @@ inline int writeY4MHeader( std::ostream *f, vvdecFrame *frame )
   return 0;
 }
 
-#ifdef VVENC
 /**
  * \brief Write a component plane to file
  * \param[in] f Output stream pointer

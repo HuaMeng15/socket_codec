@@ -6,7 +6,7 @@ CXX=g++
 # Usage: make VVENC=1
 VVENC ?= 0
 
-CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG -mmacosx-version-min=14.6
+CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG
 
 # Add VVENC define if flag is set
 ifeq ($(VVENC),1)
@@ -22,7 +22,7 @@ INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -I./include \
            $(FFMPEG_INCLUDE)
 
 LDFLAGS = -L./lib -L$(FFMPEG_BUILD_DIR)/libavcodec -L$(FFMPEG_BUILD_DIR)/libavutil
-LDLIBS = -lx264 -lavcodec -lavutil
+LDLIBS = -lx264 -lavcodec -lavutil -llzma -ldrm
 
 # Conditionally include vvenc/vvdec libraries if VVENC is enabled
 ifeq ($(VVENC),1)
