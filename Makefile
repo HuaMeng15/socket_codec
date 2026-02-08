@@ -32,6 +32,7 @@ endif
 # Source files - conditionally include h266 based on VVENC flag
 SRCS = $(wildcard codec/*.cc \
 				 codec/h264/*.cc \
+				 codec/mock_codec/*.cc \
 				 transmission/*.cc \
 				 log_system/*.cc \
 				 tools/*.cc \

@@ -7,8 +7,9 @@
 #include <string>
 
 enum class CodecType {
-  VVENC,  // VVenC/VVdec
-  X264    // x264 (encoder only, decoding requires libavcodec)
+  VVENC,   // VVenC/VVdec
+  X264,    // x264 (encoder only, decoding requires libavcodec)
+  MOCK  // Fake encoder/decoder for ablation (zeros at target bitrate/fps)
 };
 
 class CodecFactory {

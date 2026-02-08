@@ -89,6 +89,20 @@ void X264Encoder::SetOutputStream(std::ofstream* output_stream) {
   output_stream_ = output_stream;
 }
 
+void X264Encoder::SetTargetBitrate(int bitrate_kbps) {
+  if (!initialized_) {
+    LOG(ERROR) << "[X264Encoder] Encoder not initialized";
+    return;
+  }
+
+  params_.rc.i_bitrate = bitrate_kbps;
+  params_.rc.i_vbv_max_bitrate = bitrate_kbps;
+  params_.rc.i_vbv_buffer_size = bitrate_kbps * 0.5; // kbit / 8 * 1000 = byte
+
+  LOG(INFO) << "[X264Encoder] Set target bitrate to " << bitrate_kbps << " kbps";
+  x264_encoder_reconfig(encoder_, &params_);
+}
+
 std::unique_ptr<EncodedData> X264Encoder::EncodeFrame(YUVBuffer* input_buffer) {
   if (!initialized_) {
     LOG(ERROR) << "[X264Encoder] Encoder not initialized";

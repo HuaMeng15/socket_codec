@@ -2,7 +2,6 @@
 #include <thread>
 #include <chrono>
 
-#include "codec/decoder.h"
 #include "codec/codec_factory.h"
 #include "video_capture_and_send.h"
 #include "log_system/log_system.h"

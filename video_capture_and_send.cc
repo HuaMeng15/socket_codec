@@ -83,6 +83,8 @@ void VideoCaptureAndSend::Run() {
     if (!frame_buffer) {
       LOG(ERROR) << "[VideoCaptureAndSend] Failed to read next frame";
       break;
+    } else {
+      LOG(INFO) << "[VideoCaptureAndSend] Read frame " << frame_buffer->sequence_number;
     }
 
     auto encoded_data = encoder_->EncodeFrame(frame_buffer.get());
@@ -108,7 +110,7 @@ void VideoCaptureAndSend::Run() {
       break;
     }
 
-    // Control frame rate
+    // TODO: Should consider encoding time
     std::this_thread::sleep_for(std::chrono::milliseconds(frame_interval_ms));
   }
 

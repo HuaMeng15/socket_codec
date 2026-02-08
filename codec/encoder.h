@@ -107,6 +107,8 @@ class Encoder {
   virtual void Cleanup() = 0;
 
   virtual void PrintSummary() const = 0;
+
+  virtual void SetTargetBitrate(int bitrate_kbps) = 0;
 };
 
 #endif  // CODEC_ENCODER_H

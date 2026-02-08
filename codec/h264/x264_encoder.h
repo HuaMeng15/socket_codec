@@ -17,6 +17,7 @@ class X264Encoder : public Encoder {
   std::unique_ptr<EncodedData> EncodeFrame(YUVBuffer* input_buffer) override;
   void Cleanup() override;
   void PrintSummary() const override;
+  void SetTargetBitrate(int bitrate_kbps) override;
 
  private:
   x264_t* encoder_;
