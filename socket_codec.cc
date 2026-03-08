@@ -9,6 +9,7 @@
 #include "transmission/data_receiver.h"
 #include "transmission/received_frame_data_handler.h"
 #include "transmission/feedback_handler.h"
+#include "transmission/packet_send_time_store.h"
 
 /* Sender has two key components:
 *  1. Video Capture and Send (frame capture + encoding + sending in one thread)
@@ -29,8 +30,15 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   std::string codec_name = parser.GetFlag<std::string>("codec");
   CodecType codec_type = CodecFactory::ParseCodecType(codec_name);
 
+  if (width <= 0 || height <= 0 || width > 7680 || height > 4320) {
+    LOG(ERROR) << "[socket_codec_main] Invalid width/height: " << width << "x" << height;
+    return -1;
+  }
+
   /* Initializations */
+  PacketSendTimeStore send_time_store;
   VideoCaptureAndSend video_capture_and_send;
+  video_capture_and_send.SetSendTimeStore(&send_time_store);
   if (0 != video_capture_and_send.Initialize(input_video_file,
                                              output_video_file,
                                              dest_ip,
@@ -49,6 +57,8 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
     LOG(ERROR) << "[socket_codec_main] Failed to initialize feedback handler";
     return -1;
   }
+  feedback_handler.SetSendTimeStore(&send_time_store);
+  feedback_handler.SetEncoder(video_capture_and_send.GetEncoder());
   int feedback_port = dest_port + 1;
   DataReceiver feedback_receiver;
   if (0 != feedback_receiver.Initialize(feedback_port)) {

@@ -6,6 +6,9 @@
 #include "codec/encoder.h"
 #include "config/config.h"
 
+class PacketSendTimeStore;
+class Pacer;
+
 // Data type enumeration
 enum class FeedbackType {
   ReceiveACK,
@@ -31,6 +34,11 @@ class DataSender {
 
   bool IsInitialized() const;
 
+  /** Optional: set to record send time for each (frame, packet) for latency stats. */
+  void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
+  /** Optional: set to pace packet sends (spread over time by bitrate). */
+  void SetPacer(Pacer* pacer) { pacer_ = pacer; }
+
  private:
   // Send a single packet
   int SendPacket(const uint8_t* packet_data, size_t packet_size);
@@ -41,6 +49,8 @@ class DataSender {
   size_t max_packet_size_;
   bool initialized_;
   uint32_t packet_sequence_;
+  PacketSendTimeStore* send_time_store_ = nullptr;
+  Pacer* pacer_ = nullptr;
 };
 
 #endif  // TRANSMISSION_DATA_SENDER_H

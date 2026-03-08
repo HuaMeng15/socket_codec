@@ -18,6 +18,9 @@ class FrameCapture {
 
   int Initialize(const std::string& input_file, int width, int height, int fps);
 
+  /** Rewind input to the first frame (for looping when max_frames > input length). */
+  void Reset();
+
   std::unique_ptr<YUVBuffer> ReadNextFrame(bool& is_eof);
 
  private:
@@ -28,6 +31,8 @@ class FrameCapture {
   int fps_;
   int frame_interval_ms_;
   int64_t sequence_number_;
+  size_t frame_size_bytes_;  ///< YUV420 frame size for seek/rewind
+  bool forward_;             ///< true = head→tail, false = tail→head
 };
 
 #endif  // FRAME_CAPTURE_H

@@ -107,6 +107,35 @@ class YuvFileIO {
   }
 
   void close() { m_cHandle.close(); }
+  /** Rewind to start of file (e.g. to loop input). Clears eof/fail state and seeks to 0. */
+  void rewind() {
+    m_cHandle.clear();
+    m_cHandle.seekg(0, std::ios::beg);
+  }
+  /** Current read position (bytes from start). */
+  std::streampos tell() {
+    m_cHandle.clear();
+    return m_cHandle.tellg();
+  }
+  /** Seek to absolute position (bytes from start). */
+  void seekTo(std::streamoff position) {
+    m_cHandle.clear();
+    m_cHandle.seekg(position, std::ios::beg);
+  }
+  /** Seek backwards from current position by given bytes. */
+  void seekBack(std::streamoff bytes) {
+    m_cHandle.seekg(-bytes, std::ios::cur);
+  }
+  /** Seek to end of file; use with tell() to get file size. */
+  void seekToEnd() {
+    m_cHandle.clear();
+    m_cHandle.seekg(0, std::ios::end);
+  }
+  /** Seek to start of last frame (for backward reading). Call only if file size >= frame_size_bytes. */
+  void seekToLastFrame(size_t frame_size_bytes) {
+    m_cHandle.clear();
+    m_cHandle.seekg(-static_cast<std::streamoff>(frame_size_bytes), std::ios::end);
+  }
   bool isOpen() { return m_cHandle.is_open(); }
   bool isEof() { return m_cHandle.eof(); }
   bool isFail() { return m_cHandle.fail(); }

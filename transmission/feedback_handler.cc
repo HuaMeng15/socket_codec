@@ -1,10 +1,12 @@
 #include "feedback_handler.h"
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cstring>
 
 #include "log_system/log_system.h"
 #include "packet_header.h"
+#include "packet_send_time_store.h"
 
 FeedbackHandler::FeedbackHandler()
     : initialized_(false), feedback_count_(0) {}
@@ -54,8 +56,34 @@ int FeedbackHandler::HandleFeedback(const uint8_t* feedback_data,
             << " packet=" << (int)packet_index
             << " (total feedbacks=" << feedback_count_ << ")";
 
-  // TODO: Add custom feedback handling logic here
-  // For example: adjust encoding parameters, track packet loss, etc.
+  // Reduce bitrate when current latency > (average of previous 10 packets) + threshold
+  if (send_time_store_ && encoder_) {
+    double recv_time = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    auto send_time = send_time_store_->GetSendTime(frame_sequence, packet_index);
+    if (send_time) {
+      double latency_ms = (recv_time - *send_time) * 1000.0;
+      if (last_latencies_ms_.size() >= kLatencyWindowSize) {
+        double sum = 0.0;
+        for (double L : last_latencies_ms_) {
+          sum += L;
+        }
+        double avg_ms = sum / static_cast<double>(kLatencyWindowSize);
+        double threshold = avg_ms + kLatencyAboveAvgThresholdMs;
+        if (latency_ms > threshold) {
+          LOG(INFO) << "[FeedbackHandler] Packet latency " << latency_ms << " ms > avg "
+                    << avg_ms << " + " << kLatencyAboveAvgThresholdMs << " ms, setting bitrate to "
+                    << kLowBitrateKbps << " kbps";
+          encoder_->SetTargetBitrate(kLowBitrateKbps);
+        }
+      }
+      last_latencies_ms_.push_back(latency_ms);
+      if (last_latencies_ms_.size() > kLatencyWindowSize) {
+        last_latencies_ms_.pop_front();
+      }
+    }
+  }
 
   return 0;
 }

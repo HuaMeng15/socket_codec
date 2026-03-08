@@ -11,6 +11,9 @@
 #include "codec/codec_factory.h"
 #include "transmission/data_sender.h"
 
+class PacketSendTimeStore;
+class Pacer;
+
 class VideoCaptureAndSend {
  public:
   VideoCaptureAndSend();
@@ -42,16 +45,25 @@ class VideoCaptureAndSend {
   // Print encoding summary
   void PrintSummary() const;
 
+  /** Optional: set to record send times for latency stats (e.g. feedback handler). */
+  void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
+  /** Get encoder (e.g. for feedback handler to set bitrate). Non-owning. */
+  Encoder* GetEncoder() { return encoder_.get(); }
+  /** Get pacer (e.g. for feedback handler to set bitrate). Non-owning. */
+  Pacer* GetPacer() { return pacer_.get(); }
+
  private:
   std::unique_ptr<Encoder> encoder_;
   std::unique_ptr<FrameCapture> frame_capture_;
   std::unique_ptr<DataSender> data_sender_;
+  std::unique_ptr<Pacer> pacer_;
   std::ofstream output_stream_;
 
   std::atomic<bool> stop_requested_;
   bool initialized_;
   int fps_;
   int max_frames_;
+  PacketSendTimeStore* send_time_store_ = nullptr;
 };
 
 #endif  // VIDEO_CAPTURE_AND_SEND_H

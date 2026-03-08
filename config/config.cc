@@ -9,7 +9,7 @@ void InitializeFlags() {
   
   auto& parser = CmdLineParser::GetInstance();
   
-  parser.AddStringFlag("ip", "127.0.0.1", "receiver IP address");
+  parser.AddStringFlag("ip", "10.0.0.4", "receiver IP address");
   parser.AddIntFlag("port", 8888, "receiver port");
   parser.AddStringFlag(
       "file", "NONE",
@@ -23,6 +23,6 @@ void InitializeFlags() {
                        "input YUV video file for sender");
   parser.AddStringFlag("output_video_file", "result/output.266",
                        "output encoded video file for receiver");
-  parser.AddStringFlag("codec", "x264",
-                       "codec type: 'vvenc' or 'x264'");
+  parser.AddStringFlag("codec", "mock",
+                       "codec type: 'vvenc', 'x264', or 'mock'");
 }

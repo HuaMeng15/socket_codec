@@ -5,17 +5,23 @@
 
 #include "log_system/log_system.h"
 
-static const int INITIAL_BITRATE = 10000; // 10M
+static const int INITIAL_BITRATE = 10000;  // 10M
 static const int SLICE_MAX_SIZE = 0;
+static const double BANDWIDTH_UTILIZATION = 0.9;
+static const double VBV_NORMAL_RATIO = 0.5;   // normal: vbv_buffer = this * bitrate (kbits)
+static const double VBV_REDUCED_RATIO = 0.04; // when lowering bitrate: use this for ~10 frames
+static const int VBV_RECOVERY_FRAMES = 10;
 
 X264Encoder::X264Encoder()
     : encoder_(nullptr),
       output_stream_(nullptr),
       initialized_(false),
+      target_bitrate_kbps_(INITIAL_BITRATE),
       sequence_number_(0),
       width_(0),
       height_(0),
-      fps_(0) {
+      fps_(0),
+      vbv_recovery_frames_left_(0) {
   memset(&params_, 0, sizeof(params_));
   memset(&pic_in_, 0, sizeof(pic_in_));
   memset(&pic_out_, 0, sizeof(pic_out_));
@@ -35,7 +41,12 @@ int X264Encoder::Initialize(int width, int height, int fps, int /* framesToBeEnc
 
   LOG(INFO) << "[X264Encoder] Initializing encoder with resolution: " << width << "x" << height << " fps: " << fps;
 
-  x264_param_default_preset(&params_, "superfast", "zerolatency");
+  x264_param_default(&params_);
+
+  if (x264_param_default_preset(&params_, "superfast", "zerolatency") < 0) {
+    LOG(ERROR) << "[X264Encoder] x264_param_default_preset failed";
+    return -1;
+  }
 
   /* Configure non-default params */
   params_.i_threads = 1;
@@ -47,17 +58,19 @@ int X264Encoder::Initialize(int width, int height, int fps, int /* framesToBeEnc
   params_.i_bitdepth = 8;
   params_.i_csp = X264_CSP_I420;
   params_.b_repeat_headers = 1;
-  params_.i_log_level = X264_LOG_DEBUG;
   params_.i_log_level = X264_LOG_INFO;
   params_.i_slice_max_size = SLICE_MAX_SIZE;
 
   // ABR
   params_.rc.i_rc_method = X264_RC_ABR;
-  params_.rc.i_bitrate = INITIAL_BITRATE;
+  double bitrate = INITIAL_BITRATE * BANDWIDTH_UTILIZATION;
+  params_.rc.i_bitrate = bitrate;
 
-  params_.rc.i_vbv_max_bitrate = INITIAL_BITRATE;
+  params_.rc.i_vbv_max_bitrate = bitrate;
 
-  params_.rc.i_vbv_buffer_size = INITIAL_BITRATE * 0.5; // kbit / 8 * 1000 = byte
+  params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_NORMAL_RATIO);
+
+  LOG(INFO) << "bitrate: " << params_.rc.i_bitrate << " vbv_max_bitrate: " << params_.rc.i_vbv_max_bitrate << " vbv_buffer_size: " << params_.rc.i_vbv_buffer_size;
 
   // param.rc.b_filler = 1;
 
@@ -68,7 +81,6 @@ int X264Encoder::Initialize(int width, int height, int fps, int /* framesToBeEnc
   params_.b_vfr_input = 0;
   params_.b_cabac = 1;  // 0 for CAVLC， 1 for higher complexity
 
-  // Open encoder
   encoder_ = x264_encoder_open(&params_);
   if (!encoder_) {
     LOG(ERROR) << "[X264Encoder] Failed to create encoder";
@@ -82,6 +94,7 @@ int X264Encoder::Initialize(int width, int height, int fps, int /* framesToBeEnc
   sequence_number_ = 0;
 
   LOG(INFO) << "[X264Encoder] Encoder initialized successfully";
+  LOG(INFO) << "[Encoder] Initial bitrate " << INITIAL_BITRATE << " kbps";
   return 0;
 }
 
@@ -95,11 +108,30 @@ void X264Encoder::SetTargetBitrate(int bitrate_kbps) {
     return;
   }
 
-  params_.rc.i_bitrate = bitrate_kbps;
-  params_.rc.i_vbv_max_bitrate = bitrate_kbps;
-  params_.rc.i_vbv_buffer_size = bitrate_kbps * 0.5; // kbit / 8 * 1000 = byte
+  if (bitrate_kbps == target_bitrate_kbps_) {
+    return;  // Same as last time, ignore
+  }
 
-  LOG(INFO) << "[X264Encoder] Set target bitrate to " << bitrate_kbps << " kbps";
+  int prev_kbps = target_bitrate_kbps_;
+  target_bitrate_kbps_ = bitrate_kbps;
+  double bitrate = bitrate_kbps * BANDWIDTH_UTILIZATION;
+
+  params_.rc.i_bitrate = static_cast<int>(bitrate);
+  params_.rc.i_vbv_max_bitrate = static_cast<int>(bitrate);
+
+  if (bitrate_kbps < prev_kbps) {
+    // Smaller bitrate: use reduced VBV for ~10 frames, then recover in EncodeFrame
+    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_REDUCED_RATIO);
+    if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
+    vbv_recovery_frames_left_ = VBV_RECOVERY_FRAMES;
+    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps << " kbps (reduced VBV for " << VBV_RECOVERY_FRAMES << " frames)";
+  } else {
+    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_NORMAL_RATIO);
+    if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
+    vbv_recovery_frames_left_ = 0;
+    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps << " kbps";
+  }
+
   x264_encoder_reconfig(encoder_, &params_);
 }
 
@@ -149,13 +181,35 @@ std::unique_ptr<EncodedData> X264Encoder::EncodeFrame(YUVBuffer* input_buffer) {
     return nullptr;
   }
 
+  // After a bitrate reduction we use reduced VBV for ~10 frames; then recover to normal VBV
+  if (vbv_recovery_frames_left_ > 0) {
+    vbv_recovery_frames_left_--;
+    if (vbv_recovery_frames_left_ == 0) {
+      double bitrate = target_bitrate_kbps_ * BANDWIDTH_UTILIZATION;
+      params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_NORMAL_RATIO);
+      if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
+      x264_encoder_reconfig(encoder_, &params_);
+      LOG(INFO) << "[X264Encoder] VBV buffer recovered to " << params_.rc.i_vbv_buffer_size << " kbits";
+    }
+  }
+
   auto encoded_data = std::make_unique<EncodedData>();
   encoded_data->sequence_number = sequence_number_;
+  const size_t kMaxNalPayload = 50 * 1024 * 1024;  // 50 MB sanity limit
   for (int i = 0; i < i_nals; i++) {
-    // Copy NAL data (x264 owns the original pointers, we need our own copy)
-    uint8_t* nal_copy = new uint8_t[nals[i].i_payload];
-    std::memcpy(nal_copy, nals[i].p_payload, nals[i].i_payload);
-    encoded_data->AddData(nal_copy, nals[i].i_payload);
+    int payload = nals[i].i_payload;
+    if (payload <= 0 || nals[i].p_payload == nullptr ||
+        static_cast<size_t>(payload) > kMaxNalPayload) {
+      LOG(ERROR) << "[X264Encoder] Invalid NAL " << i << " payload=" << payload << ", skip";
+      continue;
+    }
+    uint8_t* nal_copy = new uint8_t[payload];
+    std::memcpy(nal_copy, nals[i].p_payload, payload);
+    encoded_data->AddData(nal_copy, payload);
+  }
+  if (encoded_data->data_ptrs.empty()) {
+    LOG(ERROR) << "[X264Encoder] No valid NALs";
+    return nullptr;
   }
 
   // Write to file if output stream is set (for debugging)

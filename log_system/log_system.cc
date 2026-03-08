@@ -1,23 +1,27 @@
 #include "log_system.h"
 
+#include <unistd.h>
+
 // Initialize static mutex for thread safety
 std::mutex LogStream::log_mutex;
 
 const LogLevel kMinLogLevel = LogLevel::VERBOSE;
 
-// Convert log level to human-readable string with color coding
+// Convert log level to human-readable string; use colors only when stderr is a TTY
 std::string logLevelToString(LogLevel level) {
+  static const bool use_color = isatty(STDERR_FILENO);
+
   switch (level) {
     case LogLevel::VERBOSE:
-      return "\033[34mVERBOSE\033[0m";  // Blue
+      return use_color ? "\033[34mVERBOSE\033[0m" : "VERBOSE";
     case LogLevel::INFO:
-      return "\033[32mINFO\033[0m";  // Green
+      return use_color ? "\033[32mINFO\033[0m" : "INFO";
     case LogLevel::WARNING:
-      return "\033[33mWARNING\033[0m";  // Yellow
+      return use_color ? "\033[33mWARNING\033[0m" : "WARNING";
     case LogLevel::ERROR:
-      return "\033[31mERROR\033[0m";  // Red
+      return use_color ? "\033[31mERROR\033[0m" : "ERROR";
     case LogLevel::FATAL:
-      return "\033[41mFATAL\033[0m";  // Red background
+      return use_color ? "\033[41mFATAL\033[0m" : "FATAL";
     default:
       return "UNKNOWN";
   }

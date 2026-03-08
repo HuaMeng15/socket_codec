@@ -4,6 +4,8 @@
 
 #include "log_system/log_system.h"
 
+static const double BANDWIDTH_UTILIZATION = 0.8;
+
 MockEncoder::MockEncoder()
     : output_stream_(nullptr),
       initialized_(false),
@@ -34,6 +36,7 @@ int MockEncoder::Initialize(int width, int height, int fps, int /* framesToBeEnc
   LOG(INFO) << "[MockEncoder] Fake encoder: " << width << "x" << height
             << " fps=" << fps << " target_bitrate=" << target_bitrate_kbps_
             << " kbps -> " << bytes_per_frame_ << " bytes/frame";
+  LOG(INFO) << "[Encoder] Initial bitrate " << target_bitrate_kbps_ << " kbps";
 
   initialized_ = true;
   sequence_number_ = 0;
@@ -45,12 +48,17 @@ void MockEncoder::SetTargetBitrate(int bitrate_kbps) {
     LOG(ERROR) << "[MockEncoder] Encoder not initialized";
     return;
   }
+  if (bitrate_kbps == target_bitrate_kbps_) {
+    return;  // Same as last time, ignore
+  }
 
   target_bitrate_kbps_ = bitrate_kbps;
-  bytes_per_frame_ = static_cast<size_t>(target_bitrate_kbps_) * 1000 / (8 * fps_);
+  double bitrate = bitrate_kbps * BANDWIDTH_UTILIZATION;
+  bytes_per_frame_ = static_cast<size_t>(bitrate) * 1000 / (8 * fps_);
   if (bytes_per_frame_ == 0) bytes_per_frame_ = 1;
 
-  LOG(INFO) << "[MockEncoder] Set target bitrate to " << bitrate_kbps << " kbps";
+  LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps << " kbps"
+            << " -> " << bytes_per_frame_ << " bytes/frame";
 }
 
 void MockEncoder::SetOutputStream(std::ofstream* output_stream) {

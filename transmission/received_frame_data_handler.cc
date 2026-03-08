@@ -123,7 +123,7 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
     frame_assembly.complete = false;
     frame_assembly.packets.resize(total_packets);
     LOG(INFO) << "[ReceivedFrameDataHandler] Starting frame " << frame_sequence
-              << " expecting " << total_packets << " packets";
+              << " expecting " << (int)total_packets << " packets";
   }
 
   // Validate packet index

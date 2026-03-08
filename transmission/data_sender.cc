@@ -9,6 +9,8 @@
 
 #include "log_system/log_system.h"
 #include "packet_header.h"
+#include "packet_send_time_store.h"
+#include "pacer.h"
 #include "codec/encoder.h"
 
 DataSender::DataSender()
@@ -116,13 +118,22 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
       // Copy payload
       memcpy(packet + header_size, data + offset, payload_size);
 
+      size_t packet_size = header_size + payload_size;
+      if (pacer_) {
+        pacer_->Pace(packet_size);
+      }
+      if (send_time_store_) {
+        send_time_store_->Record(frame_sequence, packet_index);
+      }
       // Send packet
-      int ret = SendPacket(packet, header_size + payload_size);
+      int ret = SendPacket(packet, packet_size);
       if (ret != 0) {
         LOG(ERROR) << "[DataSender] Failed to send packet " << (int)packet_index
                    << " of frame " << frame_sequence;
         return ret;
       }
+      LOG(VERBOSE) << "[DataSender] Sent packet " << (int)packet_index
+                   << " for frame " << frame_sequence;
 
       offset += payload_size;
       packet_index++;

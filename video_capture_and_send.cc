@@ -5,6 +5,7 @@
 
 #include "codec/codec_factory.h"
 #include "log_system/log_system.h"
+#include "transmission/pacer.h"
 
 VideoCaptureAndSend::VideoCaptureAndSend()
     : stop_requested_(false),
@@ -29,10 +30,15 @@ int VideoCaptureAndSend::Initialize(const std::string& input_file,
     return 0;
   }
 
+  pacer_ = std::make_unique<Pacer>();
   data_sender_ = std::make_unique<DataSender>();
   if (0 != data_sender_->Initialize(dest_ip, dest_port)) {
     LOG(ERROR) << "[VideoCaptureAndSend] Failed to initialize data sender";
     return -1;
+  }
+  data_sender_->SetPacer(pacer_.get());
+  if (send_time_store_) {
+    data_sender_->SetSendTimeStore(send_time_store_);
   }
 
   frame_capture_ = std::make_unique<FrameCapture>();
@@ -78,9 +84,18 @@ void VideoCaptureAndSend::Run() {
   int frame_interval_ms = 1000 / (fps_ > 0 ? fps_ : 30);
   bool is_eof = false;
 
-  while (!stop_requested_ && !is_eof) {
+  while (!stop_requested_) {
+    is_eof = false;
     auto frame_buffer = frame_capture_->ReadNextFrame(is_eof);
     if (!frame_buffer) {
+      if (is_eof && max_frames_ > 0) {
+        frame_capture_->Reset();
+        continue;
+      }
+      if (is_eof) {
+        LOG(INFO) << "[VideoCaptureAndSend] Reached end of input";
+        break;
+      }
       LOG(ERROR) << "[VideoCaptureAndSend] Failed to read next frame";
       break;
     } else {
