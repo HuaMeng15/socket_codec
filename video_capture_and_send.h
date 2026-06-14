@@ -12,6 +12,7 @@
 #include "tools/clock_thread.h"
 #include "transmission/data_sender.h"
 
+class NetworkSimulator;
 class PacketSendTimeStore;
 class Pacer;
 
@@ -48,6 +49,8 @@ class VideoCaptureAndSend {
 
   /** Optional: set to record send times for latency stats (e.g. feedback handler). */
   void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
+  /** Optional: attach network simulator for bandwidth/delay/loss testing. */
+  void SetSimulator(NetworkSimulator* simulator) { simulator_ = simulator; }
   /** Get encoder (e.g. for feedback handler to set bitrate). Non-owning. */
   Encoder* GetEncoder() { return encoder_.get(); }
   /** Get pacer (e.g. for feedback handler to set bitrate). Non-owning. */
@@ -66,6 +69,7 @@ class VideoCaptureAndSend {
   int fps_;
   int max_frames_;
   PacketSendTimeStore* send_time_store_ = nullptr;
+  NetworkSimulator* simulator_ = nullptr;
 };
 
 #endif  // VIDEO_CAPTURE_AND_SEND_H

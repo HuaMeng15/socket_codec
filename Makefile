@@ -81,9 +81,13 @@ TEST_OBJS = $(BUILD_DIR)/log_system/log_system.o \
 $(TEST_TARGET): $(TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
-# Unit tests (gtest)
-GTEST_INCLUDE = -I/opt/homebrew/include
-GTEST_LDFLAGS = -L/opt/homebrew/lib
+# Unit tests (gtest) — detect include/lib paths
+GTEST_INCLUDE ?= $(shell pkg-config --cflags gtest 2>/dev/null || \
+                  ([ -d /opt/homebrew/include/gtest ] && echo "-I/opt/homebrew/include") || \
+                  echo "-I/usr/include")
+GTEST_LDFLAGS ?= $(shell pkg-config --libs-only-L gtest 2>/dev/null || \
+                  ([ -d /opt/homebrew/lib ] && echo "-L/opt/homebrew/lib") || \
+                  echo "")
 GTEST_LDLIBS = -lgtest -lgtest_main
 
 UNIT_TEST_SRCS = $(wildcard tests/*_test.cc)

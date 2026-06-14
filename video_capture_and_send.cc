@@ -39,6 +39,9 @@ int VideoCaptureAndSend::Initialize(const std::string& input_file,
   if (send_time_store_) {
     data_sender_->SetSendTimeStore(send_time_store_);
   }
+  if (simulator_) {
+    data_sender_->SetSimulator(simulator_);
+  }
 
   frame_capture_ = std::make_unique<FrameCapture>();
   if (0 != frame_capture_->Initialize(input_file, width, height, fps)) {
@@ -124,8 +127,9 @@ void VideoCaptureAndSend::Run() {
       }
     }
 
-    // Check if max frames reached
-    if (max_frames_ > 0 && encoded_data->sequence_number >= max_frames_) {
+    // Check if max frames reached (sequence_number is 0-based)
+    if (max_frames_ > 0 &&
+        static_cast<int>(encoded_data->sequence_number) + 1 >= max_frames_) {
       LOG(INFO) << "[VideoCaptureAndSend] Max frames limit reached: " << max_frames_;
       break;
     }

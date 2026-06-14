@@ -6,9 +6,9 @@ void InitializeFlags() {
     return;  // Already initialized, skip
   }
   initialized = true;
-  
+
   auto& parser = CmdLineParser::GetInstance();
-  
+
   parser.AddStringFlag("ip", "10.0.0.4", "receiver IP address");
   parser.AddIntFlag("port", 8888, "receiver port");
   parser.AddStringFlag(
@@ -25,4 +25,14 @@ void InitializeFlags() {
                        "output encoded video file for receiver");
   parser.AddStringFlag("codec", "mock",
                        "codec type: 'vvenc', 'x264', or 'mock'");
+
+  // Network simulator flags (sender-side, 0 = disabled)
+  parser.AddIntFlag("sim_bandwidth_kbps", 0,
+                    "simulated bandwidth in kbps (0 = unlimited)");
+  parser.AddIntFlag("sim_delay_ms", 0,
+                    "simulated one-way delay in ms (0 = none)");
+  parser.AddIntFlag("sim_loss_percent", 0,
+                    "simulated packet loss percentage (0 = none)");
+  parser.AddIntFlag("sim_jitter_ms", 0,
+                    "simulated jitter in ms (0 = none)");
 }

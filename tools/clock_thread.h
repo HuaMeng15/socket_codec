@@ -12,12 +12,16 @@
  *
  * Provides:
  * - Monotonic microsecond timestamps (GetCurrentTimeUs)
- * - Frame-tick mechanism: blocks callers until the next frame boundary
+ * - Frame-tick mechanism: blocks caller until the next frame boundary
  * - Slice-deadline calculation: given N slices per frame, returns the
  *   timestamp by which slice K should be complete
  *
- * Thread-safe: multiple threads can call any method concurrently.
- * Start() begins the internal tick loop; Stop() ends it.
+ * Threading model:
+ * - GetCurrentTimeUs(), GetSliceDeadline(), GetFrameIntervalUs(),
+ *   GetCurrentFrameIndex(): safe to call from any thread concurrently.
+ * - WaitForNextFrameTick(): single-consumer only (the capture/encode loop).
+ *   Multiple waiters would produce duplicate frame indexes.
+ * - Start()/Stop(): call from owner thread.
  */
 class ClockThread {
  public:

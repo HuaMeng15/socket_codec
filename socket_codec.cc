@@ -9,6 +9,7 @@
 #include "transmission/data_receiver.h"
 #include "transmission/received_frame_data_handler.h"
 #include "transmission/feedback_handler.h"
+#include "transmission/network_simulator.h"
 #include "transmission/packet_send_time_store.h"
 
 /* Sender has two key components:
@@ -37,8 +38,34 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
 
   /* Initializations */
   PacketSendTimeStore send_time_store;
+
+  // Set up network simulator if any sim flags are non-zero
+  NetworkSimulator simulator;
+  NetworkSimulator* sim_ptr = nullptr;
+  {
+    int sim_bw = parser.GetFlag<int>("sim_bandwidth_kbps");
+    int sim_delay = parser.GetFlag<int>("sim_delay_ms");
+    int sim_loss = parser.GetFlag<int>("sim_loss_percent");
+    int sim_jitter = parser.GetFlag<int>("sim_jitter_ms");
+    if (sim_bw > 0 || sim_delay > 0 || sim_loss > 0 || sim_jitter > 0) {
+      NetworkSimulator::Config sim_config;
+      sim_config.bandwidth_kbps = sim_bw;
+      sim_config.propagation_delay_ms = sim_delay;
+      sim_config.loss_rate = sim_loss / 100.0;
+      sim_config.jitter_ms = sim_jitter;
+      simulator.SetConfig(sim_config);
+      sim_ptr = &simulator;
+      LOG(INFO) << "[socket_codec_main] Network simulator enabled: bw="
+                << sim_bw << "kbps delay=" << sim_delay << "ms loss="
+                << sim_loss << "% jitter=" << sim_jitter << "ms";
+    }
+  }
+
   VideoCaptureAndSend video_capture_and_send;
   video_capture_and_send.SetSendTimeStore(&send_time_store);
+  if (sim_ptr) {
+    video_capture_and_send.SetSimulator(sim_ptr);
+  }
   if (0 != video_capture_and_send.Initialize(input_video_file,
                                              output_video_file,
                                              dest_ip,
