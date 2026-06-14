@@ -1,7 +1,6 @@
 #include "video_capture_and_send.h"
 
 #include <chrono>
-#include <thread>
 
 #include "codec/codec_factory.h"
 #include "log_system/log_system.h"
@@ -81,10 +80,16 @@ void VideoCaptureAndSend::Run() {
 
   LOG(INFO) << "[VideoCaptureAndSend] Starting capture and send loop";
 
-  int frame_interval_ms = 1000 / (fps_ > 0 ? fps_ : 30);
+  clock_.SetFps(fps_);
+  clock_.Start();
   bool is_eof = false;
 
   while (!stop_requested_) {
+    int frame_idx = clock_.WaitForNextFrameTick();
+    if (frame_idx < 0) {
+      break;  // clock stopped
+    }
+
     is_eof = false;
     auto frame_buffer = frame_capture_->ReadNextFrame(is_eof);
     if (!frame_buffer) {
@@ -103,7 +108,7 @@ void VideoCaptureAndSend::Run() {
     }
 
     auto encoded_data = encoder_->EncodeFrame(frame_buffer.get());
-    
+
     if (!encoded_data) {
       LOG(ERROR) << "[VideoCaptureAndSend] Failed to encode frame";
       continue;
@@ -124,11 +129,9 @@ void VideoCaptureAndSend::Run() {
       LOG(INFO) << "[VideoCaptureAndSend] Max frames limit reached: " << max_frames_;
       break;
     }
-
-    // TODO: Should consider encoding time
-    std::this_thread::sleep_for(std::chrono::milliseconds(frame_interval_ms));
   }
 
+  clock_.Stop();
   LOG(INFO) << "[VideoCaptureAndSend] Capture and send loop finished.";
 }
 

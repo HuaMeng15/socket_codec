@@ -9,6 +9,7 @@
 #include "codec/encoder.h"
 #include "codec/frame_capture.h"
 #include "codec/codec_factory.h"
+#include "tools/clock_thread.h"
 #include "transmission/data_sender.h"
 
 class PacketSendTimeStore;
@@ -57,6 +58,7 @@ class VideoCaptureAndSend {
   std::unique_ptr<FrameCapture> frame_capture_;
   std::unique_ptr<DataSender> data_sender_;
   std::unique_ptr<Pacer> pacer_;
+  ClockThread clock_;
   std::ofstream output_stream_;
 
   std::atomic<bool> stop_requested_;

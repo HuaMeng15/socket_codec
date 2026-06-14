@@ -59,10 +59,14 @@ OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(SRCS))
 
 TARGET = $(BUILD_DIR)/socket_codec
 TEST_TARGET = $(BUILD_DIR)/test_decoder
+UNIT_TEST_TARGET = $(BUILD_DIR)/unit_tests
 
 all: $(BUILD_DIR) $(TARGET)
 
 test: $(BUILD_DIR) $(TEST_TARGET)
+
+unit_test: $(BUILD_DIR) $(UNIT_TEST_TARGET)
+	./$(UNIT_TEST_TARGET)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -76,6 +80,25 @@ TEST_OBJS = $(BUILD_DIR)/log_system/log_system.o \
 
 $(TEST_TARGET): $(TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+# Unit tests (gtest)
+GTEST_INCLUDE = -I/opt/homebrew/include
+GTEST_LDFLAGS = -L/opt/homebrew/lib
+GTEST_LDLIBS = -lgtest -lgtest_main
+
+UNIT_TEST_SRCS = $(wildcard tests/*_test.cc)
+# Source files needed by tests (no main, no socket_codec.cc)
+TESTABLE_SRCS = $(wildcard tools/*.cc log_system/*.cc)
+UNIT_TEST_OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(UNIT_TEST_SRCS)) \
+                 $(patsubst %.cc,$(BUILD_DIR)/%.o,$(TESTABLE_SRCS))
+
+$(UNIT_TEST_TARGET): $(UNIT_TEST_OBJS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(GTEST_INCLUDE) -o $@ $^ $(GTEST_LDFLAGS) $(GTEST_LDLIBS)
+
+# Pattern rules: test sources need gtest includes, placed before generic rule
+$(BUILD_DIR)/tests/%.o: tests/%.cc
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(GTEST_INCLUDE) -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cc
 	mkdir -p $(dir $@)
@@ -101,4 +124,4 @@ compile_commands.json:
 		exit 1; \
 	fi
 
-.PHONY: all test clean compile_commands.json
+.PHONY: all test unit_test clean compile_commands.json
