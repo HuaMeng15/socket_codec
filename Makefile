@@ -6,26 +6,36 @@ CXX=g++
 # Usage: make VVENC=1
 VVENC ?= 0
 
-CXXFLAGS = -pthread -fPIC -std=c++23 -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG
+CXXFLAGS = -pthread -fPIC -std=c++2b -g -ggdb -pedantic -Wall -Wextra -Wno-missing-field-initializers -DDEBUG
 
 # Add VVENC define if flag is set
 ifeq ($(VVENC),1)
   CXXFLAGS += -DVVENC
 endif
 
+# x264 paths (built from source in third_party/x264)
+X264_DIR = third_party/x264
+
 # FFmpeg paths (must be built in third_party/ffmpeg before compiling)
 FFMPEG_DIR = third_party/ffmpeg
 FFMPEG_BUILD_DIR = $(FFMPEG_DIR)/build
 FFMPEG_INCLUDE = -I$(FFMPEG_DIR) -I$(FFMPEG_BUILD_DIR)
 
-INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -I./include \
+INCLUDES = -I. -Icodec -Itransmission -Ilog_system -Itools -Ithird_party \
            $(FFMPEG_INCLUDE)
 
-LDFLAGS = -L./lib -L$(FFMPEG_BUILD_DIR)/libavcodec -L$(FFMPEG_BUILD_DIR)/libavutil
-LDLIBS = -lx264 -lavcodec -lavutil -llzma -ldrm
+LDFLAGS = -L$(X264_DIR) -L$(FFMPEG_BUILD_DIR)/libavcodec -L$(FFMPEG_BUILD_DIR)/libavutil
+LDLIBS = -lx264 -lavcodec -lavutil -llzma
+
+# Linux-only libraries
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+  LDLIBS += -ldrm
+endif
 
 # Conditionally include vvenc/vvdec libraries if VVENC is enabled
 ifeq ($(VVENC),1)
+  LDFLAGS += -L./lib
   LDLIBS += -lvvenc -lvvdec
 endif
 
