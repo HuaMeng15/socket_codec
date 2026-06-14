@@ -87,8 +87,10 @@ GTEST_LDFLAGS = -L/opt/homebrew/lib
 GTEST_LDLIBS = -lgtest -lgtest_main
 
 UNIT_TEST_SRCS = $(wildcard tests/*_test.cc)
-# Source files needed by tests (no main, no socket_codec.cc)
-TESTABLE_SRCS = $(wildcard tools/*.cc log_system/*.cc)
+# Source files needed by tests (no main, no socket_codec.cc, no video_capture_and_send.cc)
+TESTABLE_SRCS = $(wildcard tools/*.cc log_system/*.cc) \
+                transmission/network_simulator.cc \
+                transmission/network_sender.cc
 UNIT_TEST_OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(UNIT_TEST_SRCS)) \
                  $(patsubst %.cc,$(BUILD_DIR)/%.o,$(TESTABLE_SRCS))
 

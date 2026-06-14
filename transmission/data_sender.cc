@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "log_system/log_system.h"
+#include "network_simulator.h"
 #include "packet_header.h"
 #include "packet_send_time_store.h"
 #include "pacer.h"
@@ -61,6 +62,8 @@ int DataSender::Initialize(const std::string& dest_ip, int dest_port,
     socket_fd_ = -1;
     return -1;
   }
+
+  network_sender_.SetSocketFd(socket_fd_);
 
   initialized_ = true;
   LOG(INFO) << "[DataSender] Initialized: " << dest_ip_ << ":" << dest_port_
@@ -177,18 +180,17 @@ int DataSender::SendPacket(const uint8_t* packet_data, size_t packet_size) {
     return -1;
   }
 
-  ssize_t bytes_sent = send(socket_fd_, packet_data, packet_size, 0);
-  if (bytes_sent < 0) {
-    LOG(ERROR) << "[DataSender] send() failed: " << strerror(errno);
+  int ret = network_sender_.Send(packet_data, packet_size);
+  if (ret < 0) {
+    LOG(ERROR) << "[DataSender] NetworkSender::Send() failed";
     return -1;
   }
-
-  if (static_cast<size_t>(bytes_sent) != packet_size) {
-    LOG(WARNING) << "[DataSender] Partial send: " << bytes_sent << "/"
-                 << packet_size;
-  }
-
+  // ret == 1 means simulator dropped it (simulated loss); treat as success
   return 0;
+}
+
+void DataSender::SetSimulator(NetworkSimulator* simulator) {
+  network_sender_.SetSimulator(simulator);
 }
 
 void DataSender::Close() {

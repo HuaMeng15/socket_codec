@@ -2,10 +2,13 @@
 #define TRANSMISSION_DATA_SENDER_H
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include "codec/encoder.h"
 #include "config/config.h"
+#include "network_sender.h"
 
+class NetworkSimulator;
 class PacketSendTimeStore;
 class Pacer;
 
@@ -38,6 +41,8 @@ class DataSender {
   void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
   /** Optional: set to pace packet sends (spread over time by bitrate). */
   void SetPacer(Pacer* pacer) { pacer_ = pacer; }
+  /** Optional: attach a network simulator for bandwidth/delay/loss. */
+  void SetSimulator(NetworkSimulator* simulator);
 
  private:
   // Send a single packet
@@ -49,6 +54,7 @@ class DataSender {
   size_t max_packet_size_;
   bool initialized_;
   uint32_t packet_sequence_;
+  NetworkSender network_sender_;
   PacketSendTimeStore* send_time_store_ = nullptr;
   Pacer* pacer_ = nullptr;
 };
