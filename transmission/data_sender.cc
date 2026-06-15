@@ -146,6 +146,10 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
   LOG(VERBOSE) << "[DataSender] Successfully sent frame " << frame_sequence
             << " in " << (int)total_packets << " packets";
 
+  if (packets_sent_cb_) {
+    packets_sent_cb_(total_packets);
+  }
+
   return 0;
 }
 

@@ -278,17 +278,24 @@ TEST_F(GccControllerTest, OveruseToNormalTransition) {
 
   // Cause overuse
   FeedOveruse(20, send, arrival);
-  int overuse_rate = gcc.GetTargetBitrateKbps();
+  int overuse_rate = gcc.GetDelayBasedBitrateKbps();
   EXPECT_LT(overuse_rate, 5000);
 
-  // Return to stable — after flushing trendline window (20 samples),
-  // overuse should stop and rate stabilizes
+  // Return to stable — flush trendline window (need >20 stable samples)
+  // then verify no further overuse and rate starts recovering
   AdvanceMs(1100);  // past overuse guard
-  FeedStable(30, send, arrival);
+  FeedStable(25, send, arrival);  // flush window with zero-growth data
 
-  int stable_rate = gcc.GetTargetBitrateKbps();
-  // Rate should have stabilized or started recovering (not crashed to min)
-  EXPECT_GT(stable_rate, 100);
+  int rate_after_flush = gcc.GetDelayBasedBitrateKbps();
+
+  // Feed more stable data — rate should now increase (no more overuse)
+  FeedStable(15, send, arrival);
+  int rate_after_recovery = gcc.GetDelayBasedBitrateKbps();
+
+  // After window flush, rate should be recovering (not decreasing)
+  EXPECT_GE(rate_after_recovery, rate_after_flush);
+  // And overuse counter should be back to 0
+  EXPECT_EQ(gcc.GetOveruseCounter(), 0);
 }
 
 // --- Min bitrate floor ---

@@ -55,6 +55,8 @@ class VideoCaptureAndSend {
   Encoder* GetEncoder() { return encoder_.get(); }
   /** Get pacer (e.g. for feedback handler to set bitrate). Non-owning. */
   Pacer* GetPacer() { return pacer_.get(); }
+  /** Get data sender (e.g. for registering send callbacks). Non-owning. */
+  DataSender* GetDataSender() { return data_sender_.get(); }
 
  private:
   std::unique_ptr<Encoder> encoder_;

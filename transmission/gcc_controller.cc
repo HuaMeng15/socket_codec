@@ -156,14 +156,19 @@ void GccController::UpdateTrendline(const TransportFeedback& feedback) {
   prev_arrival_time_ms_ = batch_arrival_ms;
   prev_send_time_ms_ = batch_send_time_ms;
 
-  // Accumulate delay and smooth it (WebRTC: smoothing_coef_ = 0.9)
+  // Accumulate delay (WebRTC: accumulated_delay_ += delay_delta)
   accumulated_delay_ += delay_delta;
+
+  // Smooth the accumulated delay for noise reduction
   smoothed_delay_ = kTrendlineSmoothingCoeff * smoothed_delay_ +
                     (1.0 - kTrendlineSmoothingCoeff) * accumulated_delay_;
 
-  // Add to trendline window
+  // Add to trendline window — use accumulated_delay directly (not smoothed)
+  // so that when delay stops growing, the window fills with a flat signal
+  // and slope goes to zero. Smoothed was causing false-positive slope
+  // during convergence after overuse ends.
   double time_since_first = static_cast<double>(batch_arrival_ms - first_arrival_ms_);
-  trendline_window_.push_back({smoothed_delay_, time_since_first});
+  trendline_window_.push_back({accumulated_delay_, time_since_first});
   if (static_cast<int>(trendline_window_.size()) > kTrendlineWindowSize) {
     trendline_window_.pop_front();
   }

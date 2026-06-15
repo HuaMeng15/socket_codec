@@ -2,6 +2,7 @@
 #define TRANSMISSION_DATA_SENDER_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include "codec/encoder.h"
@@ -46,6 +47,9 @@ class DataSender {
   void SetPacer(Pacer* pacer) { pacer_ = pacer; }
   /** Optional: attach a network simulator for bandwidth/delay/loss. */
   void SetSimulator(NetworkSimulator* simulator);
+  /** Optional: callback invoked with packet count after each SendFrame. */
+  using PacketsSentCallback = std::function<void(int packet_count)>;
+  void SetPacketsSentCallback(PacketsSentCallback cb) { packets_sent_cb_ = std::move(cb); }
 
  private:
   // Send a single packet
@@ -60,6 +64,7 @@ class DataSender {
   NetworkSender network_sender_;
   PacketSendTimeStore* send_time_store_ = nullptr;
   Pacer* pacer_ = nullptr;
+  PacketsSentCallback packets_sent_cb_;
 };
 
 #endif  // TRANSMISSION_DATA_SENDER_H

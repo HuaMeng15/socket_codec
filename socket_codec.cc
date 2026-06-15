@@ -95,12 +95,18 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   gcc.SetInitialBitrate(5000);  // Start at 5 Mbps
   gcc.SetBitrateRange(200, 20000);
 
+  // Wire actual sent packet count from DataSender into GCC
+  DataSender* data_sender_ptr = video_capture_and_send.GetDataSender();
+  if (data_sender_ptr) {
+    data_sender_ptr->SetPacketsSentCallback([&gcc](int count) {
+      gcc.OnPacketsSent(count);
+    });
+  }
+
   Encoder* encoder_ptr = video_capture_and_send.GetEncoder();
   Pacer* pacer_ptr = video_capture_and_send.GetPacer();
   feedback_handler.SetTransportFeedbackCallback(
       [&gcc, encoder_ptr, pacer_ptr](const TransportFeedback& fb) {
-        // Each feedback batch reports N received packets; count them as sent
-        gcc.OnPacketsSent(static_cast<int>(fb.packets.size()));
         gcc.OnTransportFeedback(fb);
         int target = gcc.GetTargetBitrateKbps();
         if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);

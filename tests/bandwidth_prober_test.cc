@@ -57,6 +57,36 @@ TEST_F(BandwidthProberTest, SuccessfulProbeTriggersNextProbe) {
   EXPECT_EQ(probes2[0].target_bitrate_kbps, 24000);
 }
 
+TEST_F(BandwidthProberTest, SecondExponentialProbeAt6x) {
+  // First probe at 3x = 15000
+  prober.GetEffectiveBitrateKbps();
+  auto probes1 = prober.GetPendingProbes();
+  ASSERT_EQ(probes1.size(), 1u);
+  EXPECT_EQ(probes1[0].target_bitrate_kbps, 15000);
+
+  // Report success but below further_probe_threshold: 9000/15000 = 0.6 < 0.7
+  // This means no further probe triggered, but initial probing continues
+  // since exponential_probe_count_ (1) < kMaxExponentialProbes (2)
+  prober.OnProbeResult(9000, true);
+  // The result was success but ratio < 0.7, so no "further" probe.
+  // But initial_probing_done_ is NOT set since count < max.
+  // Actually looking at code: on success with ratio < threshold,
+  // it falls through without setting initial_probing_done_.
+  // State goes back to idle. Next GetEffective should trigger 2nd exponential.
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+
+  // Second exponential probe at 6x (since probe_count is now 1)
+  // Wait for min time
+  AdvanceMs(1100);
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(rate, 30000);  // 6 * 5000 = 30000 (or capped at max)
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+
+  auto probes2 = prober.GetPendingProbes();
+  ASSERT_EQ(probes2.size(), 1u);
+  EXPECT_EQ(probes2[0].target_bitrate_kbps, 30000);
+}
+
 TEST_F(BandwidthProberTest, OveruseCancelsProbe) {
   prober.GetEffectiveBitrateKbps();
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
