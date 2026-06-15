@@ -45,6 +45,15 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   UpdateDelayEstimate(feedback);
   BandwidthUsage usage = DetectOveruse();
   UpdateDelayBasedRate(usage);
+
+  // Feed signals to prober
+  if (usage == BandwidthUsage::kOveruse) {
+    prober_.OnOveruseDetected();
+  } else {
+    prober_.OnStableSignal();
+  }
+  prober_.SetCurrentBitrate(delay_based_bitrate_kbps_);
+
   target_bitrate_kbps_ = ComputeFinalBitrate();
 }
 
@@ -211,6 +220,9 @@ void GccController::UpdateLossBasedRate(int packets_lost, int packets_total) {
 }
 
 int GccController::ComputeFinalBitrate() const {
-  int final_kbps = std::min(delay_based_bitrate_kbps_, loss_based_bitrate_kbps_);
+  int base_kbps = std::min(delay_based_bitrate_kbps_, loss_based_bitrate_kbps_);
+  // Let the prober override if it's actively probing
+  int effective_kbps = const_cast<BandwidthProber&>(prober_).GetEffectiveBitrateKbps();
+  int final_kbps = std::max(base_kbps, effective_kbps);
   return std::clamp(final_kbps, min_bitrate_kbps_, max_bitrate_kbps_);
 }

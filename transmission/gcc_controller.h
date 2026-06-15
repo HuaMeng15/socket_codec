@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 
+#include "bandwidth_prober.h"
 #include "congestion_controller.h"
 
 /**
@@ -94,6 +95,9 @@ class GccController : public CongestionController {
   // Bounds
   int min_bitrate_kbps_;
   int max_bitrate_kbps_;
+
+  // Bandwidth probing
+  BandwidthProber prober_;
 
   // Time tracking for additive increase pacing
   std::chrono::steady_clock::time_point last_increase_time_;
