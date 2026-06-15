@@ -113,3 +113,65 @@ TEST_F(BandwidthProberTest, DropRecoveryProbe) {
   EXPECT_EQ(rate, 4250);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
 }
+
+TEST_F(BandwidthProberTest, ProbeTimesOut) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  prober.GetEffectiveBitrateKbps();  // starts probe
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+
+  // Get pending probes to transition to WaitingForResult
+  auto probes = prober.GetPendingProbes();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kWaitingForResult);
+
+  // Wait for probe timeout (3s)
+  std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+  int rate = prober.GetEffectiveBitrateKbps();
+
+  // Should have timed out and returned to idle
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  EXPECT_EQ(rate, 5000);  // back to estimated
+}
+
+TEST_F(BandwidthProberTest, FailedProbeStopsInitialProbing) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  prober.GetEffectiveBitrateKbps();  // starts first probe at 3x
+  auto probes = prober.GetPendingProbes();
+
+  // Report failure
+  prober.OnProbeResult(4000, false);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+
+  // Wait for min time and try again — should NOT do exponential probe
+  // because initial_probing_done_ is set on failure
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  int rate = prober.GetEffectiveBitrateKbps();
+  // Should not be 15000 (3x) or 30000 (6x) — initial probing is done
+  EXPECT_EQ(rate, 5000);
+}
+
+TEST_F(BandwidthProberTest, NoProbeWhenNearMaxBitrate) {
+  prober.SetMaxBitrate(5200);
+  prober.SetEstimatedBitrate(5000);  // 5000/5200 = 96% > 95% threshold
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  int rate = prober.GetEffectiveBitrateKbps();
+
+  // Should not probe since we're already at 95%+ of max
+  EXPECT_EQ(rate, 5000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+}
+
+TEST_F(BandwidthProberTest, GetPendingProbesTransitionsState) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+
+  auto probes = prober.GetPendingProbes();
+  ASSERT_EQ(probes.size(), 1u);
+  EXPECT_EQ(probes[0].target_bitrate_kbps, 15000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kWaitingForResult);
+
+  // Second call returns empty
+  auto probes2 = prober.GetPendingProbes();
+  EXPECT_TRUE(probes2.empty());
+}

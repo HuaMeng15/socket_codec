@@ -45,7 +45,22 @@ class GccController : public CongestionController {
 
   void SetInitialBitrate(int kbps);
 
+  /**
+   * Report total packets sent in a period. Call periodically so the loss
+   * fraction can be computed correctly: loss_fraction = lost / sent.
+   * Without this, OnLossReport can only approximate.
+   */
+  void OnPacketsSent(int count);
+
+  /**
+   * Inject a fake clock for deterministic testing. When set, all internal
+   * time reads use this value instead of steady_clock. Advance it manually.
+   * Pass nullptr to revert to real clock.
+   */
+  void SetClockForTesting(int64_t* clock_ms);
+
  private:
+  int64_t NowMs() const;
   // --- Trendline estimator ---
   struct DelayPoint {
     double smoothed_delay;  // Accumulated delay (smoothed)
@@ -111,9 +126,10 @@ class GccController : public CongestionController {
   static constexpr double kLossHoldThreshold = 0.10;       // < 10%: hold
   // >= 10%: decrease by (1 - 0.5 * loss_fraction)
 
-  // Loss tracking
-  int packets_received_since_last_loss_update_;
+  // Loss tracking: separate sent and lost counters for accurate fraction
+  int packets_sent_since_last_loss_update_;
   int packets_lost_since_last_loss_update_;
+  static constexpr int kLossUpdateWindowSize = 20;
 
   // Final rate
   int target_bitrate_kbps_;
@@ -122,6 +138,9 @@ class GccController : public CongestionController {
 
   // Bandwidth probing
   BandwidthProber prober_;
+
+  // Fake clock for testing (nullptr = use real clock)
+  int64_t* fake_clock_ms_;
 };
 
 #endif  // TRANSMISSION_GCC_CONTROLLER_H

@@ -6,12 +6,13 @@
 
 #include "log_system/log_system.h"
 
-namespace {
-int64_t NowMs() {
+int64_t GccController::NowMs() const {
+  if (fake_clock_ms_) {
+    return *fake_clock_ms_;
+  }
   return std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-}  // namespace
 
 GccController::GccController()
     : accumulated_delay_(0.0),
@@ -27,11 +28,12 @@ GccController::GccController()
       delay_based_bitrate_kbps_(1000),
       last_increase_time_ms_(0),
       loss_based_bitrate_kbps_(30000),
-      packets_received_since_last_loss_update_(0),
+      packets_sent_since_last_loss_update_(0),
       packets_lost_since_last_loss_update_(0),
       target_bitrate_kbps_(1000),
       min_bitrate_kbps_(100),
-      max_bitrate_kbps_(30000) {
+      max_bitrate_kbps_(30000),
+      fake_clock_ms_(nullptr) {
   last_threshold_update_ms_ = NowMs();
   last_increase_time_ms_ = NowMs();
 }
@@ -79,20 +81,31 @@ void GccController::OnLossReport(const LossReport& report) {
 
   int lost = static_cast<int>(report.packets.size());
   packets_lost_since_last_loss_update_ += lost;
-  // Assume each loss report covers roughly lost + some delivered packets
-  // In a real system we'd track total packets sent; approximate here
-  packets_received_since_last_loss_update_ += lost;
 
-  // Update loss-based rate every ~20 packets worth of reports
-  if (packets_received_since_last_loss_update_ >= 20) {
+  // Update loss-based rate when we have enough data
+  if (packets_sent_since_last_loss_update_ >= kLossUpdateWindowSize) {
     double loss_fraction = static_cast<double>(packets_lost_since_last_loss_update_) /
-        packets_received_since_last_loss_update_;
+        packets_sent_since_last_loss_update_;
     UpdateLossBasedRate(loss_fraction);
-    packets_received_since_last_loss_update_ = 0;
+    packets_sent_since_last_loss_update_ = 0;
     packets_lost_since_last_loss_update_ = 0;
   }
 
   target_bitrate_kbps_ = ComputeFinalBitrate();
+}
+
+void GccController::OnPacketsSent(int count) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  packets_sent_since_last_loss_update_ += count;
+}
+
+void GccController::SetClockForTesting(int64_t* clock_ms) {
+  fake_clock_ms_ = clock_ms;
+  if (clock_ms) {
+    last_threshold_update_ms_ = *clock_ms;
+    last_increase_time_ms_ = *clock_ms;
+    last_overuse_time_ms_ = *clock_ms - 2000;  // allow immediate probing in tests
+  }
 }
 
 // --- Trendline estimator (WebRTC: trendline_estimator.cc) ---

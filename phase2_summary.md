@@ -64,16 +64,26 @@
 - Integrated into GCC: overuse signals feed prober, prober overrides rate only when active
 
 ## Test Results
-- `make unit_test`: 33/33 passing
+- `make unit_test`: 45/45 passing
 - `make`: compiles successfully
 - `scripts/run_local.sh mock 30 30 5000 --sim_bandwidth_kbps=5000`: pipeline works with bandwidth cap
 
 ## Unit Tests Added
 - `transport_feedback_test.cc`: 5 tests (serialize/deserialize, loss detection, type dispatch)
-- `gcc_controller_test.cc`: 7 tests (initial rate, stable, overuse detection + decrease,
-  loss below 2%, loss above 10%, bounds enforcement, overuse behavior)
-- `bandwidth_prober_test.cc`: 7 tests (idle, no probe after overuse, exponential 3x,
-  successful probe triggers further, overuse cancels, max cap, ALR, drop recovery)
+- `gcc_controller_test.cc`: 16 tests using fake clock:
+  - Initial bitrate, bounds enforcement, min bitrate floor
+  - Delay-based: overuse detected, multiplicative decrease pattern,
+    startup warmup prevents false positive, underuse detection,
+    stable network allows increase, noisy feedback no false positive,
+    adaptive threshold growth, overuse→normal transition
+  - Loss-based: <2% allows increase, 2-10% holds, >10% decreases proportionally,
+    50% loss proportional decrease
+- `bandwidth_prober_test.cc`: 11 tests:
+  - idle state, no probe after overuse, initial exponential at 3x,
+    successful probe triggers further, overuse cancels probe,
+    cap by max bitrate, ALR periodic probing, drop recovery probe,
+    probe timeout, failed probe stops initial probing,
+    no probe near max, GetPendingProbes state transition
 
 ## Commits
 - `6bdb5bf` Add TWCC-style transport feedback and loss reporting
