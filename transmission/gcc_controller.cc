@@ -129,50 +129,53 @@ void GccController::SetClockForTesting(int64_t* clock_ms) {
 }
 
 // --- Trendline estimator (WebRTC: trendline_estimator.cc) ---
+//
+// Processes each acknowledged packet using its real send and arrival
+// timestamps. The inter-packet delay variation
+//   delay_delta = (arrival[i] - arrival[i-1]) - (send[i] - send[i-1])
+// is accumulated and fed into a linear-regression window. A positive slope
+// means queuing delay is growing (potential overuse).
 
 void GccController::UpdateTrendline(const TransportFeedback& feedback) {
-  if (feedback.packets.size() < 2) {
-    return;
+  for (const auto& pkt : feedback.packets) {
+    if (pkt.send_time_us < 0) {
+      continue;
+    }
+
+    // Work in microseconds for precision (avoid truncation of sub-ms deltas)
+    int64_t send_us = pkt.send_time_us;
+    int64_t arrival_us = pkt.arrival_time_us;
+
+    if (first_arrival_ms_ == 0) {
+      first_arrival_ms_ = arrival_us;  // Reusing field name, but now stores us
+      prev_arrival_time_ms_ = arrival_us;
+      prev_send_time_ms_ = send_us;
+      continue;
+    }
+
+    // Per-packet inter-arrival and inter-send deltas (in ms, from us)
+    double arrival_delta_ms = (arrival_us - prev_arrival_time_ms_) / 1000.0;
+    double send_delta_ms = (send_us - prev_send_time_ms_) / 1000.0;
+    double delay_delta_ms = arrival_delta_ms - send_delta_ms;
+
+    prev_arrival_time_ms_ = arrival_us;
+    prev_send_time_ms_ = send_us;
+
+    // Accumulate delay in ms
+    accumulated_delay_ += delay_delta_ms;
+
+    // Smooth for noise reduction (used for logging/debug, not regression)
+    smoothed_delay_ = kTrendlineSmoothingCoeff * smoothed_delay_ +
+                      (1.0 - kTrendlineSmoothingCoeff) * accumulated_delay_;
+
+    // Add to regression window using accumulated_delay
+    double time_since_first_ms = (arrival_us - first_arrival_ms_) / 1000.0;
+    trendline_window_.push_back({accumulated_delay_, time_since_first_ms});
+    if (static_cast<int>(trendline_window_.size()) > kTrendlineWindowSize) {
+      trendline_window_.pop_front();
+    }
+    num_deltas_++;
   }
-
-  // Use the batch as a single delay sample
-  int64_t batch_arrival_ms = feedback.packets.back().arrival_time_us / 1000;
-  int64_t batch_send_time_ms = feedback.reference_time_us / 1000;
-
-  if (first_arrival_ms_ == 0) {
-    first_arrival_ms_ = batch_arrival_ms;
-    prev_arrival_time_ms_ = batch_arrival_ms;
-    prev_send_time_ms_ = batch_send_time_ms;
-    return;
-  }
-
-  // Inter-group deltas
-  double arrival_delta = static_cast<double>(batch_arrival_ms - prev_arrival_time_ms_);
-  double send_delta = static_cast<double>(batch_send_time_ms - prev_send_time_ms_);
-
-  // One-way delay variation for this group
-  double delay_delta = arrival_delta - send_delta;
-
-  prev_arrival_time_ms_ = batch_arrival_ms;
-  prev_send_time_ms_ = batch_send_time_ms;
-
-  // Accumulate delay (WebRTC: accumulated_delay_ += delay_delta)
-  accumulated_delay_ += delay_delta;
-
-  // Smooth the accumulated delay for noise reduction
-  smoothed_delay_ = kTrendlineSmoothingCoeff * smoothed_delay_ +
-                    (1.0 - kTrendlineSmoothingCoeff) * accumulated_delay_;
-
-  // Add to trendline window — use accumulated_delay directly (not smoothed)
-  // so that when delay stops growing, the window fills with a flat signal
-  // and slope goes to zero. Smoothed was causing false-positive slope
-  // during convergence after overuse ends.
-  double time_since_first = static_cast<double>(batch_arrival_ms - first_arrival_ms_);
-  trendline_window_.push_back({accumulated_delay_, time_since_first});
-  if (static_cast<int>(trendline_window_.size()) > kTrendlineWindowSize) {
-    trendline_window_.pop_front();
-  }
-  num_deltas_++;
 }
 
 double GccController::ComputeTrendlineSlope() const {

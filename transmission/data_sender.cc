@@ -84,13 +84,17 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
     return -1;
   }
 
-  // Calculate total packets considering the max payload size
+  // Calculate total packets using ceiling division per NAL, matching the
+  // send loop below exactly: each NAL emits ceil(data_size / max_payload_size)
+  // packets (an empty NAL emits zero).
   const size_t header_size = sizeof(FramePacketHeader);
   const size_t max_payload_size = max_packet_size_ - header_size;
-  uint8_t total_packets = static_cast<uint8_t>(encoded_data->data_ptrs.size()); /* nals */
+  size_t total_packets_count = 0;
   for (size_t i = 0; i < encoded_data->data_sizes.size(); i++) {
-    total_packets += static_cast<uint8_t>(encoded_data->data_sizes[i] / max_payload_size);
+    size_t nal_size = encoded_data->data_sizes[i];
+    total_packets_count += (nal_size + max_payload_size - 1) / max_payload_size;
   }
+  uint8_t total_packets = static_cast<uint8_t>(total_packets_count);
 
   uint16_t frame_sequence = encoded_data->sequence_number;
 

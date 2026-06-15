@@ -9,6 +9,7 @@
 #include "message_handler.h"
 #include "data_receiver.h"
 #include "data_sender.h"
+#include "feedback_collector.h"
 #include "codec/decoder.h"
 #include "codec/codec_factory.h"
 #include "packet_header.h"
@@ -40,6 +41,8 @@ class ReceivedFrameDataHandler : public MessageHandler {
 
   void SendFeedback(uint16_t frame_sequence, uint8_t packet_index);
 
+  void ReportFrameLoss(uint16_t frame_sequence, const FrameAssembly& assembly);
+
   void HandleCompleteFrame(uint32_t frame_sequence, const std::vector<uint8_t>& frame_data);
 
   void WriteYUVFrameToFile(YUVBuffer* yuv_buffer);
@@ -52,6 +55,7 @@ class ReceivedFrameDataHandler : public MessageHandler {
   int height_;
   DataReceiver* data_receiver_;
   DataSender feedback_sender_;
+  FeedbackCollector feedback_collector_;
   int feedback_port_;
   bool feedback_sender_initialized_;
   bool initialized_;

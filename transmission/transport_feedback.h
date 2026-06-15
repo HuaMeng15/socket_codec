@@ -54,7 +54,8 @@ struct TransportFeedback {
   struct PacketInfo {
     uint16_t frame_sequence;
     uint8_t packet_index;
-    int64_t arrival_time_us;  // Absolute arrival time (receiver clock, us)
+    int64_t send_time_us;     // Sender clock (looked up from PacketSendTimeStore)
+    int64_t arrival_time_us;  // Receiver clock (from feedback message)
   };
 
   std::vector<PacketInfo> packets;

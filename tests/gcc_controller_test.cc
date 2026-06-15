@@ -22,17 +22,30 @@ class GccControllerTest : public ::testing::Test {
   // Advance fake clock
   void AdvanceMs(int64_t ms) { clock_ms_ += ms; }
 
-  // Create feedback with uniform packet spacing within batch
-  TransportFeedback MakeFeedback(int64_t send_time_us, int64_t arrival_base_us,
-                                  int num_packets, int64_t spacing_us) {
+  // Create feedback with per-packet send and arrival times.
+  // Send times are spaced uniformly from send_base_us, arrival times from
+  // arrival_base_us, both with the given spacing.
+  TransportFeedback MakeFeedback(int64_t send_base_us, int64_t arrival_base_us,
+                                  int num_packets, int64_t send_spacing_us,
+                                  int64_t arrival_spacing_us) {
     TransportFeedback fb;
-    fb.reference_time_us = send_time_us;
+    fb.reference_time_us = 0;
     for (int i = 0; i < num_packets; i++) {
-      fb.packets.push_back({
-          static_cast<uint16_t>(i / 10), static_cast<uint8_t>(i % 10),
-          arrival_base_us + i * spacing_us});
+      TransportFeedback::PacketInfo info;
+      info.frame_sequence = static_cast<uint16_t>(i / 10);
+      info.packet_index = static_cast<uint8_t>(i % 10);
+      info.send_time_us = send_base_us + i * send_spacing_us;
+      info.arrival_time_us = arrival_base_us + i * arrival_spacing_us;
+      fb.packets.push_back(info);
     }
     return fb;
+  }
+
+  // Convenience: equal send and arrival spacing (no queuing delay change)
+  TransportFeedback MakeFeedback(int64_t send_base_us, int64_t arrival_base_us,
+                                  int num_packets, int64_t spacing_us) {
+    return MakeFeedback(send_base_us, arrival_base_us, num_packets,
+                        spacing_us, spacing_us);
   }
 
   // Feed N rounds of stable feedback (send/arrival deltas match)
@@ -46,11 +59,15 @@ class GccControllerTest : public ::testing::Test {
     }
   }
 
-  // Feed N rounds where arrival grows faster (congestion)
+  // Feed N rounds where arrival spacing exceeds send spacing (congestion)
   void FeedOveruse(int rounds, int64_t& send_time, int64_t& arrival_time,
                    int extra_per_round_us = 2000) {
     for (int i = 0; i < rounds; i++) {
-      auto fb = MakeFeedback(send_time, arrival_time, 20, 1000);
+      // Within batch: send at 1ms spacing, arrive at wider spacing
+      // (simulating packets delayed in a growing queue)
+      int64_t arrival_spacing = 1000 + extra_per_round_us / 20;
+      auto fb = MakeFeedback(send_time, arrival_time, 20,
+                              1000, arrival_spacing);
       gcc.OnTransportFeedback(fb);
       send_time += 33000;
       arrival_time += 33000 + extra_per_round_us;
@@ -58,14 +75,17 @@ class GccControllerTest : public ::testing::Test {
     }
   }
 
-  // Feed N rounds where arrival catches up (queue draining)
+  // Feed N rounds where arrival spacing is less than send spacing (queue draining)
   void FeedUnderuse(int rounds, int64_t& send_time, int64_t& arrival_time,
                     int catch_up_per_round_us = 2000) {
     for (int i = 0; i < rounds; i++) {
-      auto fb = MakeFeedback(send_time, arrival_time, 20, 1000);
+      // Within batch: arrive faster than sent (queue draining)
+      int64_t arrival_spacing = 1000 - catch_up_per_round_us / 20;
+      if (arrival_spacing < 100) arrival_spacing = 100;
+      auto fb = MakeFeedback(send_time, arrival_time, 20,
+                              1000, arrival_spacing);
       gcc.OnTransportFeedback(fb);
       send_time += 33000;
-      // Arrival gap is shorter than send gap → queue draining
       arrival_time += 33000 - catch_up_per_round_us;
       AdvanceMs(33);
     }
@@ -113,23 +133,26 @@ TEST_F(GccControllerTest, OveruseDecreasesMultiplicatively) {
   FeedOveruse(15, send, arrival);
   int after_overuse = gcc.GetTargetBitrateKbps();
 
-  // Multiple 0.85x decreases fire in 15 rounds (counter=3 per trigger).
-  // Expect 2-4 decreases: 5000*0.85^2=3612, 5000*0.85^4=2626
+  // Multiple 0.85x decreases fire. With per-packet processing (20 packets
+  // per batch × 15 batches = 300 samples), overuse triggers frequently.
   EXPECT_LT(after_overuse, 5000);
-  EXPECT_GT(after_overuse, 2500);
-  // Verify it's a multiplicative pattern (roughly 0.85^n * 5000)
+  EXPECT_GT(after_overuse, 1000);  // Not crashed to min
+  // Verify multiplicative pattern
   double ratio = after_overuse / 5000.0;
-  EXPECT_LT(ratio, 0.85);  // at least one decrease
+  EXPECT_LT(ratio, 0.85);  // at least one 0.85x decrease
 }
 
 TEST_F(GccControllerTest, StartupWarmupPreventsEarlyOveruse) {
-  // Very first few samples should not trigger overuse due to scaling
+  // The first 10 delay samples have reduced sensitivity (scaled by
+  // num_deltas/10). Feed a small batch (5 packets) with heavy overuse;
+  // should not trigger because scale factor < 1.
   int64_t send = 1000000, arrival = 1000000;
-  // Only 3 rounds of heavy overuse — not enough to build trendline
-  FeedOveruse(3, send, arrival, 10000);
+  auto fb = MakeFeedback(send, arrival, 5, 1000, 2000);  // 2x arrival spacing
+  gcc.OnTransportFeedback(fb);
 
-  // Should NOT have decreased yet (need window to fill)
+  // With only ~4 deltas, scaling reduces modified_trend significantly
   EXPECT_EQ(gcc.GetTargetBitrateKbps(), 5000);
+  EXPECT_EQ(gcc.GetOveruseCounter(), 0);
 }
 
 // --- Delay-based: underuse detection ---
@@ -137,8 +160,8 @@ TEST_F(GccControllerTest, StartupWarmupPreventsEarlyOveruse) {
 TEST_F(GccControllerTest, UnderuseDetectedOnDecreasingDelay) {
   int64_t send = 1000000, arrival = 1000000;
 
-  // First cause some delay buildup and overuse
-  FeedOveruse(20, send, arrival, 1000);
+  // First cause overuse with strong signal
+  FeedOveruse(20, send, arrival, 4000);
   int post_overuse = gcc.GetDelayBasedBitrateKbps();
   EXPECT_LT(post_overuse, 5000);  // confirm overuse happened
 

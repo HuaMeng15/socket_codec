@@ -162,13 +162,20 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
     // Handle complete frame (decode and write to file)
     HandleCompleteFrame(frame_sequence, frame_data);
 
+    // Flush any pending TWCC feedback at frame boundary to bound latency
+    feedback_collector_.Flush();
+
     // Clean up old frame assemblies (keep only recent ones)
     if (frame_sequence > last_completed_frame_) {
       last_completed_frame_ = frame_sequence;
-      // Remove frames older than 10 frames
+      // Remove frames older than 10 frames; report any still-missing packets
+      // as losses before evicting (gap-based loss detection).
       auto it = frame_assemblies_.begin();
       while (it != frame_assemblies_.end()) {
         if (it->first < frame_sequence - 10) {
+          if (!it->second.complete) {
+            ReportFrameLoss(static_cast<uint16_t>(it->first), it->second);
+          }
           it = frame_assemblies_.erase(it);
         } else {
           ++it;
@@ -178,11 +185,31 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
   }
 }
 
+void ReceivedFrameDataHandler::ReportFrameLoss(uint16_t frame_sequence,
+                                               const FrameAssembly& assembly) {
+  std::vector<bool> received_mask(assembly.total_packets, false);
+  for (uint8_t i = 0; i < assembly.total_packets && i < assembly.packets.size(); i++) {
+    received_mask[i] = !assembly.packets[i].empty();
+  }
+  auto lost = FeedbackCollector::DetectLoss(frame_sequence,
+                                            assembly.total_packets, received_mask);
+  if (!lost.empty()) {
+    feedback_collector_.SendLossReport(lost);
+    LOG(VERBOSE) << "[ReceivedFrameDataHandler] Reported " << lost.size()
+                 << " lost packets for frame " << frame_sequence;
+  }
+}
+
 void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t packet_index) {
   // Try to initialize feedback sender if not already initialized
   if (!feedback_sender_initialized_) {
     if (InitializeFeedbackSender()) {
       feedback_sender_initialized_ = true;
+      // Wire the collector to send via the feedback sender (TWCC-style)
+      feedback_collector_.SetSendCallback(
+          [this](const uint8_t* data, size_t size) {
+            feedback_sender_.SendRawFeedback(data, size);
+          });
       LOG(INFO) << "[ReceivedFrameDataHandler] Feedback sender initialized on first feedback";
     } else {
       // Still no sender info available, skip this feedback
@@ -195,12 +222,9 @@ void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t pac
     return;
   }
 
-  int ret = feedback_sender_.SendFeedback(frame_sequence, packet_index, FeedbackType::ReceiveACK);
-
-  if (ret != 0) {
-    LOG(WARNING) << "[ReceivedFrameDataHandler] Failed to send feedback for frame "
-                 << frame_sequence << " packet " << packet_index;
-  }
+  // Feed arrival into collector — it batches and sends TWCC TransportFeedback.
+  // This is what the GCC delay-based estimator consumes.
+  feedback_collector_.OnPacketReceived(frame_sequence, packet_index);
 }
 
 void ReceivedFrameDataHandler::HandleCompleteFrame(uint32_t frame_sequence,

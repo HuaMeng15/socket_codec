@@ -3,92 +3,92 @@
 ## Phase 0: Build System Refactor
 
 ### Task 0.1: Restructure x264 build integration
-- [ ] Remove pre-built `libx264.a` from link path (`./lib`)
-- [ ] Add build step for `third_party/x264`: configure + make produces `third_party/x264/libx264.a`
-- [ ] Update main Makefile: change `-L./lib` to include `-L./third_party/x264` for x264 linkage
-- [ ] Update include path to use `third_party/x264/` headers instead of `include/x264/`
-- [ ] Verify `make clean && make` compiles and links successfully on macOS
-- [ ] Git commit: "Refactor build to compile x264 from third_party source"
+- [x] Remove pre-built `libx264.a` from link path (`./lib`)
+- [x] Add build step for `third_party/x264`: configure + make produces `third_party/x264/libx264.a`
+- [x] Update main Makefile: change `-L./lib` to include `-L./third_party/x264` for x264 linkage
+- [x] Update include path to use `third_party/x264/` headers instead of `include/x264/`
+- [x] Verify `make clean && make` compiles and links successfully on macOS
+- [x] Git commit: "Refactor build to compile x264 from third_party source"
 
 ### Task 0.2: One-tap build & run scripts
-- [ ] Write `scripts/build.sh`: clean build of x264 + main project (single command)
-- [ ] Write `scripts/run_local.sh`: run sender+receiver locally without mahimahi (for macOS dev)
-- [ ] Verify both scripts work end-to-end
-- [ ] Git commit: "Add one-tap build and local run scripts"
+- [x] Write `scripts/build.sh`: clean build of x264 + main project (single command)
+- [x] Write `scripts/run_local.sh`: run sender+receiver locally without mahimahi (for macOS dev)
+- [x] Verify both scripts work end-to-end
+- [x] Git commit: "Add one-tap build and local run scripts"
 
 ### Phase 0 Completion Gate
-- [ ] `scripts/build.sh` succeeds on macOS
-- [ ] `scripts/run_local.sh` runs sender+receiver locally
-- [ ] Write `phase0_summary.md`
+- [x] `scripts/build.sh` succeeds on macOS
+- [x] `scripts/run_local.sh` runs sender+receiver locally
+- [x] Write `phase0_summary.md`
 
 ## Phase 1: Foundations
 
 ### Task 1.1: ClockThread
-- [ ] Design `ClockThread` interface (header file with public API)
-- [ ] Write unit tests for timing accuracy (frame ticks, slice deadlines)
-- [ ] Implement monotonic clock with `GetCurrentTimeUs()`
-- [ ] Implement frame-tick mechanism (`WaitForNextFrameTick()`)
-- [ ] Implement slice-deadline calculation (`GetSliceDeadline(slice_idx, total_slices)`)
-- [ ] Integrate ClockThread into existing `VideoCaptureAndSend::Run()` loop (replace `std::this_thread::sleep_for`)
-- [ ] Git commit: "Add ClockThread with frame-tick and slice-deadline support"
+- [x] Design `ClockThread` interface (header file with public API)
+- [x] Write unit tests for timing accuracy (frame ticks, slice deadlines)
+- [x] Implement monotonic clock with `GetCurrentTimeUs()`
+- [x] Implement frame-tick mechanism (`WaitForNextFrameTick()`)
+- [x] Implement slice-deadline calculation (`GetSliceDeadline(slice_idx, total_slices)`)
+- [x] Integrate ClockThread into existing `VideoCaptureAndSend::Run()` loop (replace `std::this_thread::sleep_for`)
+- [x] Git commit: "Add ClockThread with frame-tick and slice-deadline support"
 
 ### Task 1.2: NetworkSender (with NetworkSimulator)
-- [ ] Design `NetworkSimulator` interface (bandwidth cap, delay, loss, jitter)
-- [ ] Design `NetworkSender` class that wraps UDP socket + optional simulator
-- [ ] Write unit tests (verify bandwidth limiting, delay injection, packet loss)
-- [ ] Implement `NetworkSimulator`: token-bucket for bandwidth, queue + timer for delay, random drop for loss
-- [ ] Implement `NetworkSender`: transparent pass-through when simulator disabled
-- [ ] Replace `DataSender::SendPacket` internal usage with `NetworkSender`
-- [ ] Verify existing pipeline still works unchanged when simulator is disabled
-- [ ] Git commit: "Add NetworkSender with pluggable NetworkSimulator"
+- [x] Design `NetworkSimulator` interface (bandwidth cap, delay, loss, jitter)
+- [x] Design `NetworkSender` class that wraps UDP socket + optional simulator
+- [x] Write unit tests (verify bandwidth limiting, delay injection, packet loss)
+- [x] Implement `NetworkSimulator`: token-bucket for bandwidth, queue + timer for delay, random drop for loss
+- [x] Implement `NetworkSender`: transparent pass-through when simulator disabled
+- [x] Replace `DataSender::SendPacket` internal usage with `NetworkSender`
+- [x] Verify existing pipeline still works unchanged when simulator is disabled
+- [x] Git commit: "Add NetworkSender with pluggable NetworkSimulator"
 
 ### Phase 1 Completion Gate
-- [ ] `make` compiles successfully (macOS + Linux)
-- [ ] All Phase 1 unit tests pass
-- [ ] Write `phase1_summary.md`
+- [x] `make` compiles successfully (macOS + Linux)
+- [x] All Phase 1 unit tests pass
+- [x] Write `phase1_summary.md`
 
 ## Phase 2: Congestion Control
 
 ### Task 2.1: Enhanced Feedback Protocol
-- [ ] Define `TransportFeedback` struct (per-packet sequence + receive timestamp)
-- [ ] Define `LossReport` struct (list of lost frame_seq + packet_index)
-- [ ] Write tests: serialize/deserialize feedback, simulated loss detection
-- [ ] Extend receiver to collect per-packet arrival times
-- [ ] Extend receiver to detect and report losses (timeout-based)
-- [ ] Implement TWCC-style feedback sender on receiver side
-- [ ] Implement feedback parser on sender side (in `FeedbackHandler`)
-- [ ] Git commit: "Add TWCC-style transport feedback and loss reporting"
+- [x] Define `TransportFeedback` struct (per-packet sequence + receive timestamp)
+- [x] Define `LossReport` struct (list of lost frame_seq + packet_index)
+- [x] Write tests: serialize/deserialize feedback, simulated loss detection
+- [x] Extend receiver to collect per-packet arrival times
+- [x] Extend receiver to detect and report losses (timeout-based)
+- [x] Implement TWCC-style feedback sender on receiver side
+- [x] Implement feedback parser on sender side (in `FeedbackHandler`)
+- [x] Git commit: "Add TWCC-style transport feedback and loss reporting"
 
 ### Task 2.2: CongestionController Interface + GCC
-- [ ] Define `CongestionController` base class interface
-- [ ] Write tests: feed synthetic delay patterns, verify bitrate output behavior
-- [ ] Implement arrival-time delay gradient estimator (Kalman filter or linear regression)
-- [ ] Implement overuse detector with adaptive threshold
-- [ ] Implement AIMD rate controller (increase on underuse, decrease on overuse)
-- [ ] Implement loss-based bitrate reducer
-- [ ] Combine delay-based and loss-based into final `GetTargetBitrateKbps()`
-- [ ] Wire `FeedbackHandler` → `CongestionController` → Pacer + Encoder
-- [ ] Git commit: "Implement GCC congestion controller with delay+loss-based rate control"
+- [x] Define `CongestionController` base class interface
+- [x] Write tests: feed synthetic delay patterns, verify bitrate output behavior
+- [x] Implement arrival-time delay gradient estimator (Kalman filter or linear regression)
+- [x] Implement overuse detector with adaptive threshold
+- [x] Implement AIMD rate controller (increase on underuse, decrease on overuse)
+- [x] Implement loss-based bitrate reducer
+- [x] Combine delay-based and loss-based into final `GetTargetBitrateKbps()`
+- [x] Wire `FeedbackHandler` → `CongestionController` → Pacer + Encoder
+- [x] Git commit: "Implement GCC congestion controller with delay+loss-based rate control"
 
 ### Task 2.3: Bandwidth Probing
-- [ ] Design probe state machine (Idle → Probing → Evaluating → Committed/Aborted)
-- [ ] Write tests: verify probe discovers available headroom when network has spare capacity
-- [ ] Write tests: verify probe aborts and reverts when network is already saturated
-- [ ] Implement probe trigger logic (when to start a probe: stable state for N seconds, no recent overuse)
-- [ ] Implement probe execution: temporarily increase send rate to probe_rate (e.g., 1.5× current estimate)
-- [ ] Implement probe evaluation: check feedback during probe window for overuse signals
-- [ ] Implement probe result handling: commit higher rate on success, revert on overuse detection
-- [ ] Integrate probing into `CongestionController` — probe result feeds into `GetTargetBitrateKbps()`
-- [ ] Git commit: "Add bandwidth probing to congestion controller"
+- [x] Design probe state machine (Idle → Probing → Evaluating → Committed/Aborted)
+- [x] Write tests: verify probe discovers available headroom when network has spare capacity
+- [x] Write tests: verify probe aborts and reverts when network is already saturated
+- [x] Implement probe trigger logic (when to start a probe: stable state for N seconds, no recent overuse)
+- [x] Implement probe execution: temporarily increase send rate to probe_rate (e.g., 1.5× current estimate)
+- [x] Implement probe evaluation: check feedback during probe window for overuse signals
+- [x] Implement probe result handling: commit higher rate on success, revert on overuse detection
+- [x] Integrate probing into `CongestionController` — probe result feeds into `GetTargetBitrateKbps()`
+- [x] Git commit: "Add bandwidth probing to congestion controller"
 
 ### Phase 2 Completion Gate
-- [ ] `make` compiles successfully
-- [ ] All Phase 2 unit tests pass
+- [x] `make` compiles successfully
+- [x] All Phase 2 unit tests pass
 - [ ] Integration test: static 10Mbps — record target_bitrate over time, verify convergence to ~10Mbps; plot bitrate + delay curves
 - [ ] Integration test: bandwidth drop 10Mbps → 1Mbps mid-stream — verify controller reacts (bitrate decreases, delay stabilizes); plot bitrate + delay curves
 - [ ] Integration test: static 1Mbps — verify stable low-bitrate operation; plot bitrate + delay curves
 - [ ] (Use all-zero YUV frames to produce predictable encoded sizes for controlled bandwidth measurement)
-- [ ] Write `phase2_summary.md` (include plots from integration tests)
+- [x] Write `phase2_summary.md` (include plots from integration tests)
 
 ## Phase 3: Slice-Paced Encoding
 

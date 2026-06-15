@@ -66,17 +66,23 @@ int FeedbackHandler::HandleLegacyFeedback(const uint8_t* data, size_t size) {
   LOG(VERBOSE) << "[FeedbackHandler] Legacy ACK: frame=" << frame_sequence
                << " packet=" << (int)packet_index;
 
-  // Legacy behavior: compute one-way delay if stores are available, but don't
-  // adjust bitrate here anymore — that's the congestion controller's job.
-  // Just build a single-entry TransportFeedback and forward it.
+  // Legacy single-packet ACK: build a one-entry TransportFeedback with both
+  // send and arrival times. GCC needs >= 2 packets per batch for the trendline,
+  // so a lone ACK won't drive the delay estimator — it's forwarded for
+  // completeness but real delay estimation needs TWCC batches.
   if (transport_feedback_cb_ && send_time_store_) {
     auto send_time = send_time_store_->GetSendTime(frame_sequence, packet_index);
     if (send_time) {
       TransportFeedback fb;
       auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
-      fb.reference_time_us = now_us;
-      fb.packets.push_back({frame_sequence, packet_index, now_us});
+      fb.reference_time_us = 0;
+      TransportFeedback::PacketInfo info;
+      info.frame_sequence = frame_sequence;
+      info.packet_index = packet_index;
+      info.send_time_us = static_cast<int64_t>(*send_time * 1e6);
+      info.arrival_time_us = now_us;
+      fb.packets.push_back(info);
       transport_feedback_cb_(fb);
     }
   }
@@ -103,20 +109,33 @@ int FeedbackHandler::HandleTransportFeedback(const uint8_t* data, size_t size) {
   const auto* records = reinterpret_cast<const PacketArrivalRecord*>(
       data + sizeof(FeedbackMessageHeader));
 
-  // Build TransportFeedback struct
+  // Build TransportFeedback struct. The arrival_time_ms fields are offsets
+  // relative to the first packet in the batch (receiver clock). We keep them
+  // as relative arrival times; the trendline only uses inter-packet deltas.
   TransportFeedback feedback;
-  auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
-  feedback.reference_time_us = now_us;
+  feedback.reference_time_us = 0;
 
   for (uint16_t i = 0; i < record_count; i++) {
     TransportFeedback::PacketInfo info;
     info.frame_sequence = ntohs(records[i].frame_sequence);
     info.packet_index = records[i].packet_index;
-    // arrival_time_ms is relative offset within the batch
+
+    // Arrival: relative offset within batch (receiver clock), in us
     int32_t offset_ms = static_cast<int32_t>(ntohl(
         static_cast<uint32_t>(records[i].arrival_time_ms)));
-    info.arrival_time_us = now_us + static_cast<int64_t>(offset_ms) * 1000;
+    info.arrival_time_us = static_cast<int64_t>(offset_ms) * 1000;
+
+    // Send time: looked up from the send-time store (sender clock, us).
+    // Falls back to -1 if unknown so GCC can skip that packet.
+    info.send_time_us = -1;
+    if (send_time_store_) {
+      auto send_s = send_time_store_->GetSendTime(info.frame_sequence,
+                                                  info.packet_index);
+      if (send_s) {
+        info.send_time_us = static_cast<int64_t>(*send_s * 1e6);
+      }
+    }
+
     feedback.packets.push_back(info);
   }
 

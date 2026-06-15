@@ -64,9 +64,22 @@
 - Integrated into GCC: overuse signals feed prober, prober overrides rate only when active
 
 ## Test Results
-- `make unit_test`: 45/45 passing
+- `make unit_test`: 51/51 passing (~0.37s)
 - `make`: compiles successfully
-- `scripts/run_local.sh mock 30 30 5000 --sim_bandwidth_kbps=5000`: pipeline works with bandwidth cap
+- `scripts/run_local.sh mock 60 30 5000`: full TWCC feedback path works
+  end-to-end (receiver FeedbackCollector → sender FeedbackHandler → GCC)
+
+## Production Wiring (end-to-end)
+- **Receiver**: `ReceivedFrameDataHandler` feeds packet arrivals to
+  `FeedbackCollector`, which batches per-packet timestamps and sends
+  TWCC `TransportFeedback` back to the sender. Missing packets (gap detection
+  on frame eviction) produce `LossReport` messages.
+- **Sender**: `FeedbackHandler` parses TWCC feedback, looks up each packet's
+  send time from `PacketSendTimeStore`, and forwards `(send_time, arrival_time)`
+  pairs to GCC. `DataSender::PacketsSentCallback` reports actual sent packet
+  count to `gcc.OnPacketsSent()` for accurate loss-fraction denominator.
+- This is the SAME path the unit tests exercise — per-packet send/arrival
+  deltas drive the trendline estimator.
 
 ## Unit Tests Added
 - `transport_feedback_test.cc`: 5 tests (serialize/deserialize, loss detection, type dispatch)
@@ -80,11 +93,16 @@
     overuse→normal transition
   - Loss-based: <2% allows increase, 2-10% holds, >10% proportional decrease,
     50% loss proportional decrease
-- `bandwidth_prober_test.cc`: 12 tests using fake clock (0ms runtime):
-  - idle state, initial exponential at 3x, no probe after overuse,
-    successful probe triggers further, overuse cancels, cap by max,
-    no probe near max, ALR periodic, drop recovery,
+  - Per-packet trendline uses real send_time_us + arrival_time_us (microsecond
+    precision to avoid sub-ms delta truncation)
+- `bandwidth_prober_test.cc`: 13 tests using fake clock (0ms runtime):
+  - idle state, initial exponential at 3x, second exponential at 6x,
+    no probe after overuse, successful probe triggers further, overuse cancels,
+    cap by max, no probe near max, ALR periodic, drop recovery,
     probe timeout, failed probe stops initial, GetPendingProbes state
+- `data_sender_test.cc`: 5 tests for packetization (ceiling division):
+  exact-payload-multiple, one-byte-over, smaller-than-payload, multi-NAL,
+  large NAL many splits
 
 ## Commits
 - `6bdb5bf` Add TWCC-style transport feedback and loss reporting
