@@ -9,7 +9,9 @@
 #include "transmission/data_receiver.h"
 #include "transmission/received_frame_data_handler.h"
 #include "transmission/feedback_handler.h"
+#include "transmission/gcc_controller.h"
 #include "transmission/network_simulator.h"
+#include "transmission/pacer.h"
 #include "transmission/packet_send_time_store.h"
 
 /* Sender has two key components:
@@ -86,6 +88,30 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   }
   feedback_handler.SetSendTimeStore(&send_time_store);
   feedback_handler.SetEncoder(video_capture_and_send.GetEncoder());
+  feedback_handler.SetPacer(video_capture_and_send.GetPacer());
+
+  // Set up GCC congestion controller
+  GccController gcc;
+  gcc.SetInitialBitrate(5000);  // Start at 5 Mbps
+  gcc.SetBitrateRange(200, 20000);
+
+  Encoder* encoder_ptr = video_capture_and_send.GetEncoder();
+  Pacer* pacer_ptr = video_capture_and_send.GetPacer();
+  feedback_handler.SetTransportFeedbackCallback(
+      [&gcc, encoder_ptr, pacer_ptr](const TransportFeedback& fb) {
+        gcc.OnTransportFeedback(fb);
+        int target = gcc.GetTargetBitrateKbps();
+        if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);
+        if (pacer_ptr) pacer_ptr->SetTargetBitrate(target);
+      });
+  feedback_handler.SetLossReportCallback(
+      [&gcc, encoder_ptr, pacer_ptr](const LossReport& report) {
+        gcc.OnLossReport(report);
+        int target = gcc.GetTargetBitrateKbps();
+        if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);
+        if (pacer_ptr) pacer_ptr->SetTargetBitrate(target);
+      });
+
   int feedback_port = dest_port + 1;
   DataReceiver feedback_receiver;
   if (0 != feedback_receiver.Initialize(feedback_port)) {
