@@ -99,6 +99,8 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   Pacer* pacer_ptr = video_capture_and_send.GetPacer();
   feedback_handler.SetTransportFeedbackCallback(
       [&gcc, encoder_ptr, pacer_ptr](const TransportFeedback& fb) {
+        // Each feedback batch reports N received packets; count them as sent
+        gcc.OnPacketsSent(static_cast<int>(fb.packets.size()));
         gcc.OnTransportFeedback(fb);
         int target = gcc.GetTargetBitrateKbps();
         if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);

@@ -59,6 +59,12 @@ class GccController : public CongestionController {
    */
   void SetClockForTesting(int64_t* clock_ms);
 
+  // --- Test-only getters for internal state ---
+  int GetDelayBasedBitrateKbps() const;
+  int GetLossBasedBitrateKbps() const;
+  double GetAdaptiveThreshold() const;
+  int GetOveruseCounter() const;
+
  private:
   int64_t NowMs() const;
   // --- Trendline estimator ---

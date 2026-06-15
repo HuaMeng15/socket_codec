@@ -58,6 +58,26 @@ int GccController::GetTargetBitrateKbps() const {
   return target_bitrate_kbps_;
 }
 
+int GccController::GetDelayBasedBitrateKbps() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return delay_based_bitrate_kbps_;
+}
+
+int GccController::GetLossBasedBitrateKbps() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return loss_based_bitrate_kbps_;
+}
+
+double GccController::GetAdaptiveThreshold() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return adaptive_threshold_;
+}
+
+int GccController::GetOveruseCounter() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return overuse_counter_;
+}
+
 void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t now_ms = NowMs();

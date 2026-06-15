@@ -73,7 +73,11 @@ class BandwidthProber {
   /** Get pending probe clusters (for pacer to send at elevated rate). */
   std::vector<ProbeCluster> GetPendingProbes();
 
+  /** Inject fake clock for testing (nullptr = real clock). */
+  void SetClockForTesting(int64_t* clock_ms);
+
  private:
+  int64_t NowMs() const;
   void MaybeInitiateProbe();
   void InitiateExponentialProbe();
   void InitiateAlrProbe();
@@ -95,15 +99,15 @@ class BandwidthProber {
   static constexpr double kFurtherProbeThreshold = 0.7;   // Success if est > 0.7 * target
   static constexpr int kFurtherProbeMultiplier = 2;       // Next probe: 2x successful est
 
-  // Periodic ALR probing
+  // ALR periodic probing
   bool application_limited_;
-  std::chrono::steady_clock::time_point last_alr_probe_time_;
+  int64_t last_alr_probe_ms_;
   static constexpr int kAlrProbeIntervalMs = 5000;
-  static constexpr double kAlrProbeMultiplier = 1.5;  // Probe at 1.5x current in ALR
+  static constexpr double kAlrProbeMultiplier = 1.5;
 
   // Bitrate drop recovery probing
   int pre_drop_bitrate_kbps_;
-  std::chrono::steady_clock::time_point bitrate_drop_time_;
+  int64_t bitrate_drop_time_ms_;
   bool bitrate_drop_detected_;
   static constexpr double kBitrateDropThreshold = 0.66;
   static constexpr int kBitrateDropTimeoutMs = 5000;
@@ -113,12 +117,15 @@ class BandwidthProber {
   int probe_target_kbps_;
   int next_cluster_id_;
   std::vector<ProbeCluster> pending_probes_;
-  std::chrono::steady_clock::time_point probe_start_time_;
+  int64_t probe_start_ms_;
   static constexpr int kProbeTimeoutMs = 3000;
 
   // Timing
-  std::chrono::steady_clock::time_point last_overuse_time_;
+  int64_t last_overuse_time_ms_;
   static constexpr int kMinTimeBetweenProbesMs = 1000;
+
+  // Fake clock for testing
+  int64_t* fake_clock_ms_;
 };
 
 #endif  // TRANSMISSION_BANDWIDTH_PROBER_H

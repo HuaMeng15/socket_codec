@@ -1,8 +1,17 @@
 #include "bandwidth_prober.h"
 
 #include <algorithm>
+#include <chrono>
 
 #include "log_system/log_system.h"
+
+int64_t BandwidthProber::NowMs() const {
+  if (fake_clock_ms_) {
+    return *fake_clock_ms_;
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 BandwidthProber::BandwidthProber()
     : state_(State::kIdle),
@@ -11,15 +20,31 @@ BandwidthProber::BandwidthProber()
       initial_probing_done_(false),
       exponential_probe_count_(0),
       application_limited_(false),
+      last_alr_probe_ms_(0),
       pre_drop_bitrate_kbps_(0),
+      bitrate_drop_time_ms_(0),
       bitrate_drop_detected_(false),
       probe_target_kbps_(0),
-      next_cluster_id_(0) {
-  auto now = std::chrono::steady_clock::now();
-  last_alr_probe_time_ = now;
-  bitrate_drop_time_ = now;
-  probe_start_time_ = now;
-  last_overuse_time_ = now;
+      next_cluster_id_(0),
+      probe_start_ms_(0),
+      last_overuse_time_ms_(0),
+      fake_clock_ms_(nullptr) {
+  int64_t now = NowMs();
+  last_alr_probe_ms_ = now;
+  bitrate_drop_time_ms_ = now;
+  probe_start_ms_ = now;
+  last_overuse_time_ms_ = now;
+}
+
+void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
+  fake_clock_ms_ = clock_ms;
+  if (clock_ms) {
+    int64_t now = *clock_ms;
+    last_alr_probe_ms_ = now;
+    bitrate_drop_time_ms_ = now;
+    probe_start_ms_ = now;
+    last_overuse_time_ms_ = now - 2000;  // allow probing immediately in tests
+  }
 }
 
 void BandwidthProber::SetEstimatedBitrate(int bitrate_kbps) {
@@ -30,13 +55,12 @@ void BandwidthProber::SetEstimatedBitrate(int bitrate_kbps) {
     double ratio = static_cast<double>(bitrate_kbps) / pre_drop_bitrate_kbps_;
     if (ratio < kBitrateDropThreshold) {
       bitrate_drop_detected_ = true;
-      bitrate_drop_time_ = std::chrono::steady_clock::now();
+      bitrate_drop_time_ms_ = NowMs();
       LOG(INFO) << "[Prober] Bitrate drop detected: " << pre_drop_bitrate_kbps_
-                << " → " << bitrate_kbps << " kbps";
+                << " -> " << bitrate_kbps << " kbps";
     }
   }
 
-  // Track the highest stable bitrate as pre-drop reference
   if (bitrate_kbps > pre_drop_bitrate_kbps_ && !bitrate_drop_detected_) {
     pre_drop_bitrate_kbps_ = bitrate_kbps;
   }
@@ -51,17 +75,19 @@ void BandwidthProber::SetMaxBitrate(int max_kbps) {
 
 int BandwidthProber::GetEffectiveBitrateKbps() {
   std::lock_guard<std::mutex> lock(mutex_);
+  int64_t now = NowMs();
 
   if (state_ == State::kIdle) {
     MaybeInitiateProbe();
+    if (state_ == State::kProbing) {
+      return probe_target_kbps_;
+    }
+    return estimated_bitrate_kbps_;
   }
 
   // Check probe timeout
   if (state_ == State::kWaitingForResult) {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - probe_start_time_).count();
-    if (elapsed > kProbeTimeoutMs) {
+    if (now - probe_start_ms_ > kProbeTimeoutMs) {
       LOG(INFO) << "[Prober] Probe timed out";
       state_ = State::kIdle;
       return estimated_bitrate_kbps_;
@@ -88,37 +114,30 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
     LOG(INFO) << "[Prober] Probe succeeded: target=" << probe_target_kbps_
               << " estimated=" << estimated_kbps << " kbps";
 
-    // Check if further probing is warranted (WebRTC: further_probe_threshold)
     double ratio = static_cast<double>(estimated_kbps) / probe_target_kbps_;
     if (ratio >= kFurtherProbeThreshold &&
         !initial_probing_done_ &&
         estimated_kbps < max_bitrate_kbps_ * 0.95) {
-      // Initiate further probe at 2x the successful estimate
       probe_target_kbps_ = std::min(
           estimated_kbps * kFurtherProbeMultiplier, max_bitrate_kbps_);
       state_ = State::kProbing;
-      probe_start_time_ = std::chrono::steady_clock::now();
+      probe_start_ms_ = NowMs();
       pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
       LOG(INFO) << "[Prober] Further probe at " << probe_target_kbps_ << " kbps";
     }
 
-    // Reset drop state on successful probe
     bitrate_drop_detected_ = false;
     pre_drop_bitrate_kbps_ = estimated_kbps;
   } else {
     LOG(INFO) << "[Prober] Probe failed or no improvement: target="
               << probe_target_kbps_ << " estimated=" << estimated_kbps;
-    // Done with initial probing if a probe fails
     initial_probing_done_ = true;
   }
 }
 
 void BandwidthProber::OnOveruseDetected() {
   std::lock_guard<std::mutex> lock(mutex_);
-  last_overuse_time_ = std::chrono::steady_clock::now();
-
-  // Overuse means network can't handle current rate — cancel any probe
-  // and mark initial probing done
+  last_overuse_time_ms_ = NowMs();
   initial_probing_done_ = true;
 
   if (state_ != State::kIdle) {
@@ -143,10 +162,7 @@ std::vector<BandwidthProber::ProbeCluster> BandwidthProber::GetPendingProbes() {
   auto probes = std::move(pending_probes_);
   pending_probes_.clear();
 
-  // Transition from probing to waiting for result
-  if (state_ == State::kProbing && probes.empty()) {
-    state_ = State::kWaitingForResult;
-  } else if (state_ == State::kProbing) {
+  if (state_ == State::kProbing) {
     state_ = State::kWaitingForResult;
   }
 
@@ -154,39 +170,31 @@ std::vector<BandwidthProber::ProbeCluster> BandwidthProber::GetPendingProbes() {
 }
 
 void BandwidthProber::MaybeInitiateProbe() {
-  auto now = std::chrono::steady_clock::now();
+  int64_t now = NowMs();
 
-  // Respect minimum time between probes
-  auto since_overuse = std::chrono::duration_cast<std::chrono::milliseconds>(
-      now - last_overuse_time_).count();
-  if (since_overuse < kMinTimeBetweenProbesMs) {
+  if (now - last_overuse_time_ms_ < kMinTimeBetweenProbesMs) {
     return;
   }
 
-  // 1. Initial exponential probing (startup)
+  // 1. Initial exponential probing
   if (!initial_probing_done_) {
     InitiateExponentialProbe();
     return;
   }
 
-  // 2. Bitrate drop recovery probe
+  // 2. Bitrate drop recovery
   if (bitrate_drop_detected_) {
-    auto since_drop = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - bitrate_drop_time_).count();
-    if (since_drop < kBitrateDropTimeoutMs) {
+    if (now - bitrate_drop_time_ms_ < kBitrateDropTimeoutMs) {
       InitiateDropRecoveryProbe();
       return;
     } else {
-      // Timeout — give up on recovery
       bitrate_drop_detected_ = false;
     }
   }
 
   // 3. ALR periodic probing
   if (application_limited_) {
-    auto since_last_alr = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - last_alr_probe_time_).count();
-    if (since_last_alr >= kAlrProbeIntervalMs) {
+    if (now - last_alr_probe_ms_ >= kAlrProbeIntervalMs) {
       InitiateAlrProbe();
       return;
     }
@@ -201,7 +209,6 @@ void BandwidthProber::InitiateExponentialProbe() {
   probe_target_kbps_ = std::min(
       estimated_bitrate_kbps_ * multiplier, max_bitrate_kbps_);
 
-  // Don't probe if we're already near max
   if (estimated_bitrate_kbps_ >= max_bitrate_kbps_ * 0.95) {
     initial_probing_done_ = true;
     return;
@@ -213,7 +220,7 @@ void BandwidthProber::InitiateExponentialProbe() {
   }
 
   state_ = State::kProbing;
-  probe_start_time_ = std::chrono::steady_clock::now();
+  probe_start_ms_ = NowMs();
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
 
   LOG(INFO) << "[Prober] Exponential probe #" << exponential_probe_count_
@@ -227,12 +234,12 @@ void BandwidthProber::InitiateAlrProbe() {
       max_bitrate_kbps_);
 
   if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
-    return;  // No headroom to probe
+    return;
   }
 
   state_ = State::kProbing;
-  probe_start_time_ = std::chrono::steady_clock::now();
-  last_alr_probe_time_ = probe_start_time_;
+  probe_start_ms_ = NowMs();
+  last_alr_probe_ms_ = probe_start_ms_;
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
   application_limited_ = false;
 
@@ -241,18 +248,17 @@ void BandwidthProber::InitiateAlrProbe() {
 }
 
 void BandwidthProber::InitiateDropRecoveryProbe() {
-  // Probe at kProbeFractionAfterDrop of the pre-drop bitrate
   probe_target_kbps_ = std::min(
       static_cast<int>(pre_drop_bitrate_kbps_ * kProbeFractionAfterDrop),
       max_bitrate_kbps_);
 
   if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
     bitrate_drop_detected_ = false;
-    return;  // Already recovered
+    return;
   }
 
   state_ = State::kProbing;
-  probe_start_time_ = std::chrono::steady_clock::now();
+  probe_start_ms_ = NowMs();
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
   bitrate_drop_detected_ = false;
 

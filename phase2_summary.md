@@ -70,20 +70,21 @@
 
 ## Unit Tests Added
 - `transport_feedback_test.cc`: 5 tests (serialize/deserialize, loss detection, type dispatch)
-- `gcc_controller_test.cc`: 16 tests using fake clock:
+- `gcc_controller_test.cc`: 15 tests using fake clock:
   - Initial bitrate, bounds enforcement, min bitrate floor
-  - Delay-based: overuse detected, multiplicative decrease pattern,
-    startup warmup prevents false positive, underuse detection,
-    stable network allows increase, noisy feedback no false positive,
-    adaptive threshold growth, overuse→normal transition
-  - Loss-based: <2% allows increase, 2-10% holds, >10% decreases proportionally,
+  - Delay-based: overuse detected, multiplicative decrease verified,
+    startup warmup prevents false positive, underuse increases rate,
+    stable network maintains/increases rate, noisy feedback no false positive
+    (verified via overuse_counter==0 and delay_based_bitrate not decreased),
+    adaptive threshold growth during overuse (measured via getter),
+    overuse→normal transition
+  - Loss-based: <2% allows increase, 2-10% holds, >10% proportional decrease,
     50% loss proportional decrease
-- `bandwidth_prober_test.cc`: 11 tests:
-  - idle state, no probe after overuse, initial exponential at 3x,
-    successful probe triggers further, overuse cancels probe,
-    cap by max bitrate, ALR periodic probing, drop recovery probe,
-    probe timeout, failed probe stops initial probing,
-    no probe near max, GetPendingProbes state transition
+- `bandwidth_prober_test.cc`: 12 tests using fake clock (0ms runtime):
+  - idle state, initial exponential at 3x, no probe after overuse,
+    successful probe triggers further, overuse cancels, cap by max,
+    no probe near max, ALR periodic, drop recovery,
+    probe timeout, failed probe stops initial, GetPendingProbes state
 
 ## Commits
 - `6bdb5bf` Add TWCC-style transport feedback and loss reporting

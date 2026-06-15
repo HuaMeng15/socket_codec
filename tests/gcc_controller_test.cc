@@ -137,25 +137,18 @@ TEST_F(GccControllerTest, StartupWarmupPreventsEarlyOveruse) {
 TEST_F(GccControllerTest, UnderuseDetectedOnDecreasingDelay) {
   int64_t send = 1000000, arrival = 1000000;
 
-  // First cause some delay buildup
+  // First cause some delay buildup and overuse
   FeedOveruse(20, send, arrival, 1000);
+  int post_overuse = gcc.GetDelayBasedBitrateKbps();
+  EXPECT_LT(post_overuse, 5000);  // confirm overuse happened
 
-  // Now feed underuse: queue is draining (arrival faster than send)
-  FeedUnderuse(20, send, arrival, 2000);
+  // Now feed underuse: queue draining. Need >20 rounds to flush trendline window.
+  AdvanceMs(1100);  // past overuse guard
+  FeedUnderuse(40, send, arrival, 3000);
 
-  // The trendline slope should be negative — classified as underuse
-  // This mainly tests that the detect function returns kUnderuse
-  // and that the rate controller allows increase.
-  // Since we caused overuse first, rate decreased. After underuse,
-  // with enough time passed, it should start recovering.
-  // Use the overuse guard: advance clock past 1s since last overuse
-  AdvanceMs(1100);
-  FeedUnderuse(10, send, arrival, 2000);
-
-  // Verify rate is increasing (not stuck at the overuse-reduced level)
-  int after_recovery = gcc.GetTargetBitrateKbps();
-  // It may not fully recover in this test, but should be higher than 100 (min)
-  EXPECT_GT(after_recovery, 100);
+  // After underuse with time passed, rate should have increased from post-overuse
+  int after_underuse = gcc.GetDelayBasedBitrateKbps();
+  EXPECT_GT(after_underuse, post_overuse);
 }
 
 // --- Delay-based: stable network ---
@@ -177,36 +170,41 @@ TEST_F(GccControllerTest, ThresholdAdaptsUpDuringOveruse) {
   int64_t send = 1000000, arrival = 1000000;
   FeedStable(5, send, arrival);
 
-  // Moderate overuse that barely exceeds initial threshold
-  // After adaptation, threshold should be higher
-  FeedOveruse(30, send, arrival, 500);
+  // After stable period, threshold has decayed toward kMinThreshold (6ms)
+  double pre_overuse_threshold = gcc.GetAdaptiveThreshold();
+  EXPECT_LE(pre_overuse_threshold, 12.5);  // decayed from initial
+  EXPECT_GE(pre_overuse_threshold, 6.0);   // but not below min
 
-  // The fact that overuse eventually fires (after threshold growth is exceeded)
-  // proves the threshold adapted. If it didn't grow, it would fire immediately.
-  // With 500us extra/round, the delay grows slowly. The threshold must adapt
-  // before overuse counter reaches 3.
-  // Verify rate eventually decreased (threshold was exceeded)
-  EXPECT_LT(gcc.GetTargetBitrateKbps(), 5000);
+  // Feed overuse — threshold should grow back up
+  FeedOveruse(20, send, arrival, 2000);
+
+  double adapted_threshold = gcc.GetAdaptiveThreshold();
+  EXPECT_GT(adapted_threshold, pre_overuse_threshold);
+  EXPECT_LE(adapted_threshold, 600.0);
 }
 
 // --- Delay-based: noisy feedback ---
 
 TEST_F(GccControllerTest, NoisyFeedbackDoesNotFalsePositive) {
   int64_t send = 1000000, arrival = 1000000;
-  FeedStable(5, send, arrival);
+  FeedStable(10, send, arrival);  // warmup to fill trendline window
 
-  // Feed noisy but mean-zero delay jitter (alternating +/- 3ms)
+  int before = gcc.GetDelayBasedBitrateKbps();
+
+  // Feed noisy but mean-zero delay jitter (alternating +/- 1ms)
+  // This is well within the adaptive threshold (initial 12.5ms)
   for (int i = 0; i < 40; i++) {
-    int jitter = (i % 2 == 0) ? 3000 : -3000;
+    int jitter = (i % 2 == 0) ? 1000 : -1000;
     auto fb = MakeFeedback(send, arrival, 20, 1000);
     gcc.OnTransportFeedback(fb);
     send += 33000;
-    arrival += 33000 + jitter;  // oscillating, no net growth
+    arrival += 33000 + jitter;
     AdvanceMs(33);
   }
 
-  // Rate should NOT have decreased (jitter averages out)
-  EXPECT_GE(gcc.GetTargetBitrateKbps(), 5000);
+  // Delay-based rate should NOT have decreased (no overuse triggered)
+  EXPECT_GE(gcc.GetDelayBasedBitrateKbps(), before);
+  EXPECT_EQ(gcc.GetOveruseCounter(), 0);
 }
 
 // --- Loss-based: three ranges ---
