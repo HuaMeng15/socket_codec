@@ -27,12 +27,14 @@ void GccController::SetInitialBitrate(int kbps) {
   delay_based_bitrate_kbps_ = kbps;
   loss_based_bitrate_kbps_ = kbps;
   target_bitrate_kbps_ = kbps;
+  prober_.SetEstimatedBitrate(kbps);
 }
 
 void GccController::SetBitrateRange(int min_kbps, int max_kbps) {
   std::lock_guard<std::mutex> lock(mutex_);
   min_bitrate_kbps_ = min_kbps;
   max_bitrate_kbps_ = max_kbps;
+  prober_.SetMaxBitrate(max_kbps);
 }
 
 int GccController::GetTargetBitrateKbps() const {
@@ -49,10 +51,8 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   // Feed signals to prober
   if (usage == BandwidthUsage::kOveruse) {
     prober_.OnOveruseDetected();
-  } else {
-    prober_.OnStableSignal();
   }
-  prober_.SetCurrentBitrate(delay_based_bitrate_kbps_);
+  prober_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
 
   target_bitrate_kbps_ = ComputeFinalBitrate();
 }
@@ -221,8 +221,13 @@ void GccController::UpdateLossBasedRate(int packets_lost, int packets_total) {
 
 int GccController::ComputeFinalBitrate() const {
   int base_kbps = std::min(delay_based_bitrate_kbps_, loss_based_bitrate_kbps_);
-  // Let the prober override if it's actively probing
-  int effective_kbps = const_cast<BandwidthProber&>(prober_).GetEffectiveBitrateKbps();
-  int final_kbps = std::max(base_kbps, effective_kbps);
-  return std::clamp(final_kbps, min_bitrate_kbps_, max_bitrate_kbps_);
+  // Only let the prober override when it's actively probing
+  auto& prober_ref = const_cast<BandwidthProber&>(prober_);
+  if (prober_ref.GetState() != BandwidthProber::State::kIdle) {
+    int probe_kbps = prober_ref.GetEffectiveBitrateKbps();
+    if (probe_kbps > base_kbps) {
+      base_kbps = probe_kbps;
+    }
+  }
+  return std::clamp(base_kbps, min_bitrate_kbps_, max_bitrate_kbps_);
 }

@@ -9,10 +9,8 @@ class BandwidthProberTest : public ::testing::Test {
   BandwidthProber prober;
 
   void SetUp() override {
-    prober.SetCurrentBitrate(5000);
-    prober.SetStableTimeBeforeProbeMs(100);  // fast for tests
-    prober.SetProbeDurationMs(100);
-    prober.SetEvalDurationMs(100);
+    prober.SetEstimatedBitrate(5000);
+    prober.SetMaxBitrate(30000);
   }
 };
 
@@ -20,74 +18,98 @@ TEST_F(BandwidthProberTest, StartsIdle) {
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
+TEST_F(BandwidthProberTest, InitialExponentialProbeAt3x) {
+  // First call should trigger initial exponential probe at 3x
+  // Need to wait past kMinTimeBetweenProbesMs (1000ms) since construction
+  // sets last_overuse_time_ to now. Let's trigger overuse reset.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  int rate = prober.GetEffectiveBitrateKbps();
+  // Should probe at 3x = 15000 kbps
+  EXPECT_EQ(rate, 15000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+}
+
 TEST_F(BandwidthProberTest, DoesNotProbeAfterRecentOveruse) {
   prober.OnOveruseDetected();
 
-  // Immediately after overuse — should stay idle
+  // Should not probe within kMinTimeBetweenProbesMs
   int rate = prober.GetEffectiveBitrateKbps();
   EXPECT_EQ(rate, 5000);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
-TEST_F(BandwidthProberTest, StartsProbeAfterStablePeriod) {
-  // Wait for stable_time_before_probe_ms (100ms in test)
-  std::this_thread::sleep_for(std::chrono::milliseconds(110));
+TEST_F(BandwidthProberTest, SuccessfulProbeTriggersFewerProbes) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 
+  // First probe at 3x
   int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(rate, 15000);
+
+  // Get probe clusters
+  auto probes = prober.GetPendingProbes();
+  ASSERT_EQ(probes.size(), 1u);
+  EXPECT_EQ(probes[0].target_bitrate_kbps, 15000);
+
+  // Report success — estimated 12000 from the probe
+  // 12000/15000 = 0.8 > kFurtherProbeThreshold (0.7), so further probe
+  prober.OnProbeResult(12000, true);
+
+  // Should have initiated a further probe (but initial_probing_done_ is now true
+  // since we used 2 exponential probes limit already reached after 1st...
+  // Actually exponential_probe_count_ was 1 after first probe,
+  // and kMaxExponentialProbes is 2, so initial_probing_done_ is false.
+  // further probe should be initiated at 2x * 12000 = 24000 (capped by max)
+  // The state should now be probing again
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-  EXPECT_EQ(rate, 7500);  // 5000 * 1.5
 }
 
-TEST_F(BandwidthProberTest, ProbeCommitsOnSuccess) {
-  // Wait for probe to start
-  std::this_thread::sleep_for(std::chrono::milliseconds(110));
-  prober.GetEffectiveBitrateKbps();  // triggers start
+TEST_F(BandwidthProberTest, OveruseCancelsProbe) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  prober.GetEffectiveBitrateKbps();  // starts probe
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
 
-  // Wait for probe duration to elapse
-  std::this_thread::sleep_for(std::chrono::milliseconds(110));
-  prober.GetEffectiveBitrateKbps();  // transitions to evaluating
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kEvaluating);
+  prober.OnOveruseDetected();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+}
 
-  // Send stable signals
-  prober.OnStableSignal();
-  prober.OnStableSignal();
+TEST_F(BandwidthProberTest, ProbeTargetCappedByMaxBitrate) {
+  prober.SetMaxBitrate(10000);
+  prober.SetEstimatedBitrate(5000);
 
-  // Wait for eval duration
-  std::this_thread::sleep_for(std::chrono::milliseconds(110));
-  int rate = prober.GetEffectiveBitrateKbps();  // triggers evaluation decision
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 
-  // Should have committed or transitioned
-  // On next call it settles to committed rate
-  rate = prober.GetEffectiveBitrateKbps();
+  int rate = prober.GetEffectiveBitrateKbps();
+  // 3x would be 15000, but capped at 10000
+  EXPECT_EQ(rate, 10000);
+}
+
+TEST_F(BandwidthProberTest, AlrProbingAfterInterval) {
+  // Complete initial probing first
+  prober.OnOveruseDetected();  // marks initial probing done
+
+  // Signal ALR
+  prober.OnApplicationLimited();
+
+  // Wait for ALR interval + min between probes
+  std::this_thread::sleep_for(std::chrono::milliseconds(5100));
+
+  int rate = prober.GetEffectiveBitrateKbps();
+  // ALR probe at 1.5x = 7500
   EXPECT_EQ(rate, 7500);
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
-TEST_F(BandwidthProberTest, ProbeAbortsOnOveruse) {
-  // Start probe
-  std::this_thread::sleep_for(std::chrono::milliseconds(110));
-  prober.GetEffectiveBitrateKbps();
+TEST_F(BandwidthProberTest, DropRecoveryProbe) {
+  // Complete initial probing
+  prober.OnOveruseDetected();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+  // Simulate a big drop: was 5000, drops to 1500 (< 0.66 * 5000 = 3300)
+  prober.SetEstimatedBitrate(1500);
+
+  // Should trigger drop recovery probe at 0.85 * 5000 = 4250
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(rate, 4250);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-
-  // Overuse detected during probe
-  prober.OnOveruseDetected();
-  prober.OnOveruseDetected();
-
-  // Should abort
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kAborted);
-
-  // Rate reverts on next call
-  int rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 5000);  // back to pre-probe
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
-}
-
-TEST_F(BandwidthProberTest, ProbeRateUsesMultiplier) {
-  prober.SetProbeMultiplier(2.0);
-  prober.SetCurrentBitrate(3000);
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(110));
-  int rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 6000);  // 3000 * 2.0
 }
