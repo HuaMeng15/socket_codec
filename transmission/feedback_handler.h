@@ -2,16 +2,29 @@
 #define TRANSMISSION_FEEDBACK_HANDLER_H
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <deque>
 #include "codec/encoder.h"
 #include "transmission/message_handler.h"
 #include "transmission/packet_header.h"
+#include "transmission/transport_feedback.h"
 
 class PacketSendTimeStore;
+class Pacer;
 
+/**
+ * FeedbackHandler: lives on the sender side. Receives feedback messages
+ * from the receiver (legacy ACKs, TransportFeedback, LossReports) and
+ * dispatches them to the congestion controller.
+ *
+ * Callback-based: register handlers for transport feedback and loss reports.
+ */
 class FeedbackHandler : public MessageHandler {
  public:
+  using TransportFeedbackCallback = std::function<void(const TransportFeedback&)>;
+  using LossReportCallback = std::function<void(const LossReport&)>;
+
   FeedbackHandler();
   ~FeedbackHandler();
 
@@ -20,31 +33,33 @@ class FeedbackHandler : public MessageHandler {
   int HandlePacketMessage(const uint8_t* packet_data,
                           size_t packet_size) override;
 
-  // Get statistics (optional, for monitoring)
   uint32_t GetFeedbackCount() const { return feedback_count_; }
 
-  /** Set store to look up packet send times (for latency). */
   void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
-  /** Set encoder to adjust bitrate when latency slope is high. */
   void SetEncoder(Encoder* encoder) { encoder_ = encoder; }
+  void SetPacer(Pacer* pacer) { pacer_ = pacer; }
+
+  /** Register callback for TWCC transport feedback. */
+  void SetTransportFeedbackCallback(TransportFeedbackCallback cb) {
+    transport_feedback_cb_ = std::move(cb);
+  }
+  /** Register callback for loss reports. */
+  void SetLossReportCallback(LossReportCallback cb) {
+    loss_report_cb_ = std::move(cb);
+  }
 
  private:
-  // Handle a feedback message (internal method)
-  // feedback_data: raw feedback packet data
-  // feedback_size: size of the feedback data in bytes
-  int HandleFeedback(const uint8_t* feedback_data, size_t feedback_size);
+  int HandleLegacyFeedback(const uint8_t* data, size_t size);
+  int HandleTransportFeedback(const uint8_t* data, size_t size);
+  int HandleLossReport(const uint8_t* data, size_t size);
 
- private:
   bool initialized_;
   uint32_t feedback_count_;
   PacketSendTimeStore* send_time_store_ = nullptr;
   Encoder* encoder_ = nullptr;
-  std::deque<double> last_latencies_ms_;
-  static constexpr size_t kLatencyWindowSize = 10;
-  /** Trigger bitrate reduction when current latency > (avg of previous 10 packets) + this (ms). */
-  static constexpr double kLatencyAboveAvgThresholdMs = 10.0;
-  static constexpr int kLowBitrateKbps = 1000;
+  Pacer* pacer_ = nullptr;
+  TransportFeedbackCallback transport_feedback_cb_;
+  LossReportCallback loss_report_cb_;
 };
 
 #endif  // TRANSMISSION_FEEDBACK_HANDLER_H
-

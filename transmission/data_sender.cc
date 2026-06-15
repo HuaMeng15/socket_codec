@@ -189,6 +189,13 @@ int DataSender::SendPacket(const uint8_t* packet_data, size_t packet_size) {
   return 0;
 }
 
+int DataSender::SendRawFeedback(const uint8_t* data, size_t size) {
+  if (!initialized_ || socket_fd_ < 0) {
+    return -1;
+  }
+  return SendPacket(data, size);
+}
+
 void DataSender::SetSimulator(NetworkSimulator* simulator) {
   network_sender_.SetSimulator(simulator);
 }

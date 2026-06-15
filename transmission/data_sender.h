@@ -30,8 +30,11 @@ class DataSender {
   // Automatically splits large data into multiple packets with FramePacketHeader
   int SendFrame(const EncodedData* encoded_data);
 
-  // Send feedback data
+  // Send feedback data (legacy per-packet ACK)
   int SendFeedback(uint16_t frame_sequence, uint8_t packet_index, FeedbackType feedback_type);
+
+  // Send raw feedback bytes (for TWCC-style transport feedback / loss reports)
+  int SendRawFeedback(const uint8_t* data, size_t size);
 
   void Close();
 
