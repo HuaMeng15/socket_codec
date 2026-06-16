@@ -1,69 +1,97 @@
 #ifndef TRANSMISSION_NETWORK_SIMULATOR_H
 #define TRANSMISSION_NETWORK_SIMULATOR_H
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <queue>
 #include <random>
+#include <thread>
+#include <vector>
 
 /**
- * NetworkSimulator: applies bandwidth cap, propagation delay, and random
- * packet loss to outgoing packets. Sits between DataSender and the actual
- * socket send() call.
+ * NetworkSimulator: models a single bottleneck link as an ASYNCHRONOUS queue.
  *
- * When disabled or not attached, packets pass through with zero overhead.
+ * Unlike a synchronous throttle (which would block the sender and couple
+ * send timestamps to the bottleneck rate), this enqueues each packet without
+ * blocking the caller and delivers it later on a background thread. This is
+ * what makes congestion control observable: the sender injects packets at its
+ * own paced (target) rate, packets queue at the bottleneck, and their arrival
+ * is progressively delayed when target > capacity — producing the growing
+ * one-way delay that the delay-based estimator detects.
  *
- * Bandwidth model: token-bucket. Each send consumes tokens proportional to
- * packet size; if insufficient tokens, the caller blocks until enough
- * accumulate (simulating link capacity).
+ * Per-packet delivery model (single FIFO bottleneck):
+ *   serialization = packet_size / bandwidth          (link transmit time)
+ *   departure     = max(now, link_free_time) + serialization
+ *   arrival       = departure + propagation_delay (+ jitter)
+ * Packets whose queuing delay would exceed max_queue_ms are dropped (the
+ * bottleneck buffer overflowed) — this is congestion loss.
  *
- * Delay model: caller sleeps for propagation_delay before the packet is sent.
- * (This is a simplification — real delay would queue + release later, but for
- * an experimental project this is sufficient.)
+ * Random loss is applied independently at enqueue time.
  *
- * Loss model: uniform random drop with configurable probability.
+ * When no simulator is attached, NetworkSender sends directly (zero overhead).
  */
 class NetworkSimulator {
  public:
   struct Config {
-    int bandwidth_kbps = 0;        // 0 = unlimited
-    int propagation_delay_ms = 0;  // one-way delay in ms
-    double loss_rate = 0.0;        // [0.0, 1.0]
-    int jitter_ms = 0;             // random +/- jitter on delay
+    int bandwidth_kbps = 0;        // 0 = unlimited (no queuing)
+    int propagation_delay_ms = 0;  // constant one-way base delay
+    double loss_rate = 0.0;        // [0.0, 1.0] random loss
+    int jitter_ms = 0;             // random +/- jitter on delivery
+    int max_queue_ms = 1000;       // drop when queuing delay exceeds this
   };
 
+  // Callback that performs the actual delivery (e.g. socket send()).
+  using DeliverFn = std::function<void(const uint8_t* data, size_t size)>;
+
   NetworkSimulator();
-  ~NetworkSimulator() = default;
+  ~NetworkSimulator();
 
-  /** Configure simulator parameters. Can be changed at runtime. */
   void SetConfig(const Config& config);
-
-  /** Get current config. */
   Config GetConfig() const;
-
-  /**
-   * Process a packet before sending. May block (bandwidth), may drop (loss).
-   * Returns true if the packet should be sent, false if it was "lost."
-   */
-  bool ProcessPacket(size_t packet_size_bytes);
-
-  /** Update bandwidth dynamically (e.g. for step-change tests). */
   void SetBandwidthKbps(int bandwidth_kbps);
 
+  /** Set the delivery callback (invoked from the background thread). */
+  void SetDeliverCallback(DeliverFn fn);
+
+  /** Start the delivery thread. Idempotent. */
+  void Start();
+  /** Stop the delivery thread and drain. Idempotent. */
+  void Stop();
+
+  /**
+   * Enqueue a packet for (delayed) delivery. Non-blocking.
+   * Returns true if accepted, false if dropped (random loss or queue overflow).
+   */
+  bool Enqueue(const uint8_t* data, size_t size);
+
  private:
+  using Clock = std::chrono::steady_clock;
+
+  struct QueuedPacket {
+    std::vector<uint8_t> data;
+    Clock::time_point deliver_time;
+  };
+
+  void DeliveryLoop();
+
   mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<QueuedPacket> queue_;
   Config config_;
 
-  // Token bucket state for bandwidth limiting
-  double tokens_;  // in bytes
-  std::chrono::steady_clock::time_point last_refill_time_;
-  bool bucket_initialized_;
+  Clock::time_point link_free_time_;  // when the link can next transmit
+  bool link_free_init_;
 
-  // Random state for loss + jitter
+  std::thread delivery_thread_;
+  std::atomic<bool> running_;
+  DeliverFn deliver_;
+
   std::mt19937 rng_;
-
-  void RefillTokens();
 };
 
 #endif  // TRANSMISSION_NETWORK_SIMULATOR_H

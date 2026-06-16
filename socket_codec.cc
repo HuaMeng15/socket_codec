@@ -1,6 +1,9 @@
 #include <unistd.h>
 #include <thread>
+#include <atomic>
 #include <chrono>
+#include <sstream>
+#include <vector>
 
 #include "codec/codec_factory.h"
 #include "video_capture_and_send.h"
@@ -13,6 +16,23 @@
 #include "transmission/network_simulator.h"
 #include "transmission/pacer.h"
 #include "transmission/packet_send_time_store.h"
+
+// Parse "t_sec:kbps,t_sec:kbps,..." into sorted (time_ms, kbps) steps.
+static std::vector<std::pair<int64_t, int>> ParseBandwidthSchedule(
+    const std::string& spec) {
+  std::vector<std::pair<int64_t, int>> steps;
+  std::stringstream ss(spec);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    auto colon = token.find(':');
+    if (colon == std::string::npos) continue;
+    double t_sec = std::stod(token.substr(0, colon));
+    int kbps = std::stoi(token.substr(colon + 1));
+    steps.emplace_back(static_cast<int64_t>(t_sec * 1000), kbps);
+  }
+  return steps;
+}
+
 
 /* Sender has two key components:
 *  1. Video Capture and Send (frame capture + encoding + sending in one thread)
@@ -44,12 +64,19 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   // Set up network simulator if any sim flags are non-zero
   NetworkSimulator simulator;
   NetworkSimulator* sim_ptr = nullptr;
+  std::string bw_schedule_spec = parser.GetFlag<std::string>("sim_bandwidth_schedule");
+  auto bw_schedule = ParseBandwidthSchedule(bw_schedule_spec);
   {
     int sim_bw = parser.GetFlag<int>("sim_bandwidth_kbps");
     int sim_delay = parser.GetFlag<int>("sim_delay_ms");
     int sim_loss = parser.GetFlag<int>("sim_loss_percent");
     int sim_jitter = parser.GetFlag<int>("sim_jitter_ms");
-    if (sim_bw > 0 || sim_delay > 0 || sim_loss > 0 || sim_jitter > 0) {
+    // Schedule's first step (t=0) sets the initial bandwidth if present.
+    if (!bw_schedule.empty() && sim_bw == 0) {
+      sim_bw = bw_schedule.front().second;
+    }
+    if (sim_bw > 0 || sim_delay > 0 || sim_loss > 0 || sim_jitter > 0 ||
+        !bw_schedule.empty()) {
       NetworkSimulator::Config sim_config;
       sim_config.bandwidth_kbps = sim_bw;
       sim_config.propagation_delay_ms = sim_delay;
@@ -59,8 +86,30 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
       sim_ptr = &simulator;
       LOG(INFO) << "[socket_codec_main] Network simulator enabled: bw="
                 << sim_bw << "kbps delay=" << sim_delay << "ms loss="
-                << sim_loss << "% jitter=" << sim_jitter << "ms";
+                << sim_loss << "% jitter=" << sim_jitter << "ms"
+                << (bw_schedule.empty() ? "" : " (scheduled)");
     }
+  }
+
+  // Background thread applies the bandwidth schedule at the given times.
+  std::atomic<bool> schedule_stop{false};
+  std::thread schedule_thread;
+  if (sim_ptr && !bw_schedule.empty()) {
+    schedule_thread = std::thread([&]() {
+      auto start = std::chrono::steady_clock::now();
+      for (const auto& [t_ms, kbps] : bw_schedule) {
+        while (!schedule_stop.load()) {
+          auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - start).count();
+          if (elapsed >= t_ms) break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (schedule_stop.load()) break;
+        simulator.SetBandwidthKbps(kbps);
+        LOG(INFO) << "[socket_codec_main] [SCHEDULE] t=" << t_ms
+                  << "ms set bandwidth to " << kbps << " kbps";
+      }
+    });
   }
 
   VideoCaptureAndSend video_capture_and_send;
@@ -142,6 +191,12 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   /* Stop and cleanup */
   feedback_receiver.Stop();
   feedback_receiver_thread.Join();
+
+  // Stop the bandwidth schedule thread
+  schedule_stop.store(true);
+  if (schedule_thread.joinable()) {
+    schedule_thread.join();
+  }
 
   LOG(INFO) << "[socket_codec_main] All threads finished";
 

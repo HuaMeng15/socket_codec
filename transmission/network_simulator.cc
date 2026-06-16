@@ -1,18 +1,19 @@
 #include "network_simulator.h"
 
 #include <algorithm>
-#include <thread>
+
+#include "log_system/log_system.h"
 
 NetworkSimulator::NetworkSimulator()
-    : tokens_(0.0),
-      bucket_initialized_(false),
-      rng_(std::random_device{}()) {
-}
+    : link_free_init_(false),
+      running_(false),
+      rng_(std::random_device{}()) {}
+
+NetworkSimulator::~NetworkSimulator() { Stop(); }
 
 void NetworkSimulator::SetConfig(const Config& config) {
   std::lock_guard<std::mutex> lock(mutex_);
   config_ = config;
-  bucket_initialized_ = false;  // reset token bucket on config change
 }
 
 NetworkSimulator::Config NetworkSimulator::GetConfig() const {
@@ -25,69 +26,103 @@ void NetworkSimulator::SetBandwidthKbps(int bandwidth_kbps) {
   config_.bandwidth_kbps = bandwidth_kbps;
 }
 
-void NetworkSimulator::RefillTokens() {
-  auto now = std::chrono::steady_clock::now();
-  if (!bucket_initialized_) {
-    last_refill_time_ = now;
-    tokens_ = 0.0;
-    bucket_initialized_ = true;
-    return;
-  }
+void NetworkSimulator::SetDeliverCallback(DeliverFn fn) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  deliver_ = std::move(fn);
+}
 
-  auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-      now - last_refill_time_).count();
-  last_refill_time_ = now;
+void NetworkSimulator::Start() {
+  if (running_.exchange(true)) return;
+  delivery_thread_ = std::thread([this]() { DeliveryLoop(); });
+}
 
-  if (config_.bandwidth_kbps > 0 && elapsed_us > 0) {
-    // bytes per microsecond = (kbps * 1000) / (8 * 1000000) = kbps / 8000
-    double bytes_per_us = config_.bandwidth_kbps / 8000.0;
-    tokens_ += bytes_per_us * elapsed_us;
-    // Cap bucket at 2x max packet size to avoid huge bursts after idle
-    double max_tokens = 2.0 * 1500.0;
-    tokens_ = std::min(tokens_, max_tokens);
+void NetworkSimulator::Stop() {
+  if (!running_.exchange(false)) return;
+  cv_.notify_all();
+  if (delivery_thread_.joinable()) {
+    delivery_thread_.join();
   }
 }
 
-bool NetworkSimulator::ProcessPacket(size_t packet_size_bytes) {
+bool NetworkSimulator::Enqueue(const uint8_t* data, size_t size) {
   std::unique_lock<std::mutex> lock(mutex_);
 
-  // Loss check
+  // Random loss at ingress
   if (config_.loss_rate > 0.0) {
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     if (dist(rng_) < config_.loss_rate) {
-      return false;  // packet dropped
+      return false;
     }
   }
 
-  // Bandwidth limiting (token bucket)
+  auto now = Clock::now();
+
+  // Serialization (transmit) time for this packet at current bandwidth.
+  // bytes / (kbps * 1000 / 8) seconds = bytes * 8000 / kbps microseconds.
+  int64_t serialize_us = 0;
   if (config_.bandwidth_kbps > 0) {
-    RefillTokens();
-    double needed = static_cast<double>(packet_size_bytes);
-    while (tokens_ < needed) {
-      // Calculate wait time for needed tokens
-      double deficit = needed - tokens_;
-      double bytes_per_us = config_.bandwidth_kbps / 8000.0;
-      int64_t wait_us = static_cast<int64_t>(deficit / bytes_per_us) + 1;
-      lock.unlock();
-      std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
-      lock.lock();
-      RefillTokens();
-    }
-    tokens_ -= needed;
+    serialize_us = static_cast<int64_t>(size) * 8000 / config_.bandwidth_kbps;
   }
 
-  // Delay + jitter
-  int delay_ms = config_.propagation_delay_ms;
+  if (!link_free_init_) {
+    link_free_time_ = now;
+    link_free_init_ = true;
+  }
+  // The link is busy until link_free_time_; new packet waits behind it.
+  auto base = std::max(now, link_free_time_);
+  auto departure = base + std::chrono::microseconds(serialize_us);
+  link_free_time_ = departure;
+
+  // Queuing delay = how long this packet waited before its transmission ended,
+  // beyond its own serialization. Drop if the buffer overflowed.
+  int64_t queue_delay_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(departure - now)
+          .count();
+  if (config_.max_queue_ms > 0 && queue_delay_ms > config_.max_queue_ms) {
+    // Bottleneck buffer overflow → congestion drop. Roll back link time so the
+    // dropped packet doesn't consume capacity.
+    link_free_time_ = base;
+    return false;
+  }
+
+  // Propagation delay + optional jitter.
+  int prop_ms = config_.propagation_delay_ms;
   if (config_.jitter_ms > 0) {
-    std::uniform_int_distribution<int> jitter_dist(-config_.jitter_ms, config_.jitter_ms);
-    delay_ms += jitter_dist(rng_);
-    delay_ms = std::max(0, delay_ms);
+    std::uniform_int_distribution<int> jd(-config_.jitter_ms, config_.jitter_ms);
+    prop_ms = std::max(0, prop_ms + jd(rng_));
   }
+  auto arrival = departure + std::chrono::milliseconds(prop_ms);
 
-  if (delay_ms > 0) {
+  QueuedPacket qp;
+  qp.data.assign(data, data + size);
+  qp.deliver_time = arrival;
+  queue_.push(std::move(qp));
+  cv_.notify_one();
+  return true;
+}
+
+void NetworkSimulator::DeliveryLoop() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  while (running_.load()) {
+    if (queue_.empty()) {
+      cv_.wait_for(lock, std::chrono::milliseconds(50));
+      continue;
+    }
+    auto& front = queue_.front();
+    auto deliver_time = front.deliver_time;
+    auto now = Clock::now();
+    if (now < deliver_time) {
+      cv_.wait_until(lock, deliver_time);
+      continue;
+    }
+    // Time to deliver this packet.
+    QueuedPacket qp = std::move(queue_.front());
+    queue_.pop();
+    DeliverFn fn = deliver_;
     lock.unlock();
-    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    if (fn) {
+      fn(qp.data.data(), qp.data.size());
+    }
+    lock.lock();
   }
-
-  return true;  // packet passes
 }

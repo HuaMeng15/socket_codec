@@ -1,100 +1,172 @@
 #include <gtest/gtest.h>
+#include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include "transmission/network_simulator.h"
 
-class NetworkSimulatorTest : public ::testing::Test {
- protected:
-  NetworkSimulator simulator;
+// Helper: collect delivered packets with their delivery timestamps.
+class Collector {
+ public:
+  void OnDeliver(const uint8_t*, size_t size) {
+    std::lock_guard<std::mutex> lock(m_);
+    times_.push_back(std::chrono::steady_clock::now());
+    sizes_.push_back(size);
+  }
+  size_t count() {
+    std::lock_guard<std::mutex> lock(m_);
+    return times_.size();
+  }
+  std::vector<std::chrono::steady_clock::time_point> times() {
+    std::lock_guard<std::mutex> lock(m_);
+    return times_;
+  }
+ private:
+  std::mutex m_;
+  std::vector<std::chrono::steady_clock::time_point> times_;
+  std::vector<size_t> sizes_;
 };
 
-TEST_F(NetworkSimulatorTest, NoConfigPassesAll) {
-  // Default config: no bandwidth limit, no delay, no loss
-  for (int i = 0; i < 100; i++) {
-    EXPECT_TRUE(simulator.ProcessPacket(1400));
+class NetworkSimulatorTest : public ::testing::Test {
+ protected:
+  NetworkSimulator sim;
+  Collector collector;
+
+  void SetUp() override {
+    sim.SetDeliverCallback(
+        [this](const uint8_t* d, size_t s) { collector.OnDeliver(d, s); });
   }
+  void TearDown() override { sim.Stop(); }
+
+  void EnqueueN(int n, size_t size) {
+    std::vector<uint8_t> buf(size, 0xAB);
+    for (int i = 0; i < n; i++) sim.Enqueue(buf.data(), size);
+  }
+};
+
+TEST_F(NetworkSimulatorTest, NoBandwidthDeliversAllQuickly) {
+  // Default config: no bandwidth limit, no delay. All packets pass.
+  sim.Start();
+  EnqueueN(100, 1400);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(collector.count(), 100u);
 }
 
 TEST_F(NetworkSimulatorTest, FullLossDropsAll) {
-  NetworkSimulator::Config config;
-  config.loss_rate = 1.0;
-  simulator.SetConfig(config);
-
-  int passed = 0;
-  for (int i = 0; i < 100; i++) {
-    if (simulator.ProcessPacket(1400)) passed++;
-  }
-  EXPECT_EQ(passed, 0);
+  NetworkSimulator::Config cfg;
+  cfg.loss_rate = 1.0;
+  sim.SetConfig(cfg);
+  sim.Start();
+  EnqueueN(100, 1400);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(collector.count(), 0u);
 }
 
 TEST_F(NetworkSimulatorTest, PartialLossDropsSome) {
-  NetworkSimulator::Config config;
-  config.loss_rate = 0.5;
-  simulator.SetConfig(config);
+  NetworkSimulator::Config cfg;
+  cfg.loss_rate = 0.5;
+  sim.SetConfig(cfg);
+  sim.Start();
 
-  int passed = 0;
+  // Enqueue returns false on loss; count accepted directly.
+  std::vector<uint8_t> buf(1400, 0xAB);
+  int accepted = 0;
   for (int i = 0; i < 1000; i++) {
-    if (simulator.ProcessPacket(1400)) passed++;
+    if (sim.Enqueue(buf.data(), buf.size())) accepted++;
   }
-  // With 50% loss over 1000 packets, expect 400-600 to pass
-  EXPECT_GT(passed, 350);
-  EXPECT_LT(passed, 650);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // ~50% accepted
+  EXPECT_GT(accepted, 350);
+  EXPECT_LT(accepted, 650);
 }
 
-TEST_F(NetworkSimulatorTest, BandwidthLimitSlowsDown) {
-  NetworkSimulator::Config config;
-  config.bandwidth_kbps = 1000;  // 1 Mbps = 125 KB/s
-  simulator.SetConfig(config);
+TEST_F(NetworkSimulatorTest, PropagationDelayShiftsDelivery) {
+  NetworkSimulator::Config cfg;
+  cfg.propagation_delay_ms = 50;
+  sim.SetConfig(cfg);
+  sim.Start();
 
-  // Send 10 packets of 1250 bytes = 12500 bytes
-  // At 125 KB/s, should take ~100ms
-  auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < 10; i++) {
-    simulator.ProcessPacket(1250);
+  auto t0 = std::chrono::steady_clock::now();
+  std::vector<uint8_t> buf(100, 0xAB);
+  sim.Enqueue(buf.data(), buf.size());
+
+  // Wait for delivery
+  for (int i = 0; i < 50 && collector.count() == 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - start).count();
-
-  // Should take at least ~80ms (allowing tolerance for first packet being free)
-  EXPECT_GE(elapsed_ms, 60);
-  // But not more than 200ms
-  EXPECT_LE(elapsed_ms, 200);
+  ASSERT_EQ(collector.count(), 1u);
+  auto delivered = collector.times()[0];
+  auto delay_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      delivered - t0).count();
+  EXPECT_GE(delay_ms, 45);
+  EXPECT_LE(delay_ms, 90);
 }
 
-TEST_F(NetworkSimulatorTest, DelayAddsLatency) {
-  NetworkSimulator::Config config;
-  config.propagation_delay_ms = 50;
-  simulator.SetConfig(config);
+TEST_F(NetworkSimulatorTest, BandwidthQueuesPacketsWithoutBlockingSender) {
+  // 1 Mbps link. Enqueue 10 packets of 1250 bytes = 12500 bytes = 100ms
+  // of transmit time. Sender (Enqueue) must NOT block — it returns fast.
+  NetworkSimulator::Config cfg;
+  cfg.bandwidth_kbps = 1000;
+  cfg.max_queue_ms = 5000;
+  sim.SetConfig(cfg);
+  sim.Start();
 
-  auto start = std::chrono::steady_clock::now();
-  simulator.ProcessPacket(100);
-  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - start).count();
+  auto t0 = std::chrono::steady_clock::now();
+  EnqueueN(10, 1250);
+  auto enqueue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  // Enqueue is non-blocking → returns almost immediately
+  EXPECT_LT(enqueue_ms, 30);
 
-  EXPECT_GE(elapsed_ms, 40);
-  EXPECT_LE(elapsed_ms, 80);
+  // But delivery is paced by bandwidth: ~100ms for all 10
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  EXPECT_EQ(collector.count(), 10u);
+
+  // Last packet should arrive ~100ms after first (serialization)
+  auto times = collector.times();
+  ASSERT_EQ(times.size(), 10u);
+  auto spread_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      times.back() - times.front()).count();
+  EXPECT_GE(spread_ms, 70);
+}
+
+TEST_F(NetworkSimulatorTest, QueueOverflowDropsPackets) {
+  // Tiny queue limit. Oversubscribe: enqueue many packets faster than the
+  // link can drain → some dropped by overflow.
+  NetworkSimulator::Config cfg;
+  cfg.bandwidth_kbps = 1000;   // 125 KB/s
+  cfg.max_queue_ms = 100;      // only 100ms of buffering
+  sim.SetConfig(cfg);
+  sim.Start();
+
+  std::vector<uint8_t> buf(1250, 0xAB);
+  int accepted = 0;
+  for (int i = 0; i < 50; i++) {
+    if (sim.Enqueue(buf.data(), buf.size())) accepted++;
+  }
+  // 50 packets * 1250 bytes = 62500 bytes = 500ms transmit, but only 100ms
+  // buffer → many dropped.
+  EXPECT_LT(accepted, 50);
+  EXPECT_GT(accepted, 0);
 }
 
 TEST_F(NetworkSimulatorTest, DynamicBandwidthChange) {
-  NetworkSimulator::Config config;
-  config.bandwidth_kbps = 10000;  // 10 Mbps — fast
-  simulator.SetConfig(config);
+  NetworkSimulator::Config cfg;
+  cfg.bandwidth_kbps = 10000;  // fast
+  cfg.max_queue_ms = 5000;
+  sim.SetConfig(cfg);
+  sim.Start();
 
-  // First packet should be nearly instant
-  auto start = std::chrono::steady_clock::now();
-  simulator.ProcessPacket(1400);
-  auto fast_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - start).count();
-  EXPECT_LE(fast_ms, 10);
+  EnqueueN(5, 1250);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  size_t after_fast = collector.count();
+  EXPECT_EQ(after_fast, 5u);
 
-  // Drop to 100 kbps
-  simulator.SetBandwidthKbps(100);
-
-  // 1400 bytes at 100kbps (12.5 KB/s) should take ~112ms
-  start = std::chrono::steady_clock::now();
-  simulator.ProcessPacket(1400);
-  auto slow_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - start).count();
-  EXPECT_GE(slow_ms, 80);
+  // Drop to slow
+  sim.SetBandwidthKbps(500);
+  EnqueueN(5, 1250);
+  // 5 * 1250 = 6250 bytes at 500kbps = 100ms; give it time
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(collector.count(), 10u);
 }

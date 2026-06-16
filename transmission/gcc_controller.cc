@@ -94,6 +94,25 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   prober_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
 
   target_bitrate_kbps_ = ComputeFinalBitrate();
+
+  // Queuing-delay signal for plotting: the per-batch change in accumulated
+  // delay (ms). Absolute one-way delay is NOT meaningful here because send
+  // timestamps (sender clock) and arrival timestamps (receiver clock) have
+  // different origins — only deltas within each domain are valid, which is
+  // exactly what the trendline uses. We expose accumulated_delay (the
+  // integrated queuing delay) as the delay signal.
+  double queuing_delay_ms = accumulated_delay_;
+
+  // Structured state line for offline analysis / plotting.
+  const char* usage_str = usage == BandwidthUsage::kOveruse ? "overuse"
+                        : usage == BandwidthUsage::kUnderuse ? "underuse" : "normal";
+  LOG(INFO) << "[GCC_STATE] target=" << target_bitrate_kbps_
+            << " delay_based=" << delay_based_bitrate_kbps_
+            << " loss_based=" << loss_based_bitrate_kbps_
+            << " slope=" << slope
+            << " threshold=" << adaptive_threshold_
+            << " usage=" << usage_str
+            << " queuing_delay_ms=" << queuing_delay_ms;
 }
 
 void GccController::OnLossReport(const LossReport& report) {

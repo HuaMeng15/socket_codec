@@ -75,8 +75,10 @@ void FeedbackCollector::SendTransportFeedback() {
   auto* records = reinterpret_cast<PacketArrivalRecord*>(
       buffer.data() + sizeof(FeedbackMessageHeader));
 
-  auto reference_time = pending_entries_[0].arrival_time;
-
+  // Encode arrival offsets relative to the persistent epoch (first packet
+  // ever received), NOT per-batch. This keeps inter-packet arrival deltas
+  // consistent across batch boundaries so the sender's trendline estimator
+  // sees a continuous arrival-time series.
   for (size_t i = 0; i < record_count; i++) {
     const auto& entry = pending_entries_[i];
     records[i].frame_sequence = htons(entry.frame_sequence);
@@ -84,7 +86,7 @@ void FeedbackCollector::SendTransportFeedback() {
     records[i].padding = 0;
 
     auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
-        entry.arrival_time - reference_time);
+        entry.arrival_time - epoch_);
     records[i].arrival_time_ms = htonl(static_cast<int32_t>(delta.count()));
   }
 

@@ -63,6 +63,9 @@ class ReceivedFrameDataHandler : public MessageHandler {
   // Frame assembly map: frame_sequence -> FrameAssembly
   std::map<uint32_t, FrameAssembly> frame_assemblies_;
   uint32_t last_completed_frame_;
+  // Frames older than (highest_seen - kFrameLookback) are evicted; if still
+  // incomplete, their missing packets are reported as lost.
+  static constexpr uint16_t kFrameLookback = 10;
 
   // Output file for writing decoded frames
   std::string output_file_;

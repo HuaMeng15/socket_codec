@@ -35,4 +35,7 @@ void InitializeFlags() {
                     "simulated packet loss percentage (0 = none)");
   parser.AddIntFlag("sim_jitter_ms", 0,
                     "simulated jitter in ms (0 = none)");
+  parser.AddStringFlag("sim_bandwidth_schedule", "",
+                       "time-based bandwidth steps as 't_sec:kbps,...' "
+                       "e.g. '0:10000,10:1000' (overrides sim_bandwidth_kbps)");
 }

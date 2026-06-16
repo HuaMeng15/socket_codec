@@ -165,21 +165,28 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
     // Flush any pending TWCC feedback at frame boundary to bound latency
     feedback_collector_.Flush();
 
-    // Clean up old frame assemblies (keep only recent ones)
     if (frame_sequence > last_completed_frame_) {
       last_completed_frame_ = frame_sequence;
-      // Remove frames older than 10 frames; report any still-missing packets
-      // as losses before evicting (gap-based loss detection).
-      auto it = frame_assemblies_.begin();
-      while (it != frame_assemblies_.end()) {
-        if (it->first < frame_sequence - 10) {
-          if (!it->second.complete) {
-            ReportFrameLoss(static_cast<uint16_t>(it->first), it->second);
-          }
-          it = frame_assemblies_.erase(it);
-        } else {
-          ++it;
+    }
+  }
+
+  // Eviction-based loss detection runs on EVERY packet (not only on frame
+  // completion) so that under heavy congestion — where few frames complete —
+  // we still detect and report the packets dropped by the bottleneck queue.
+  // Any assembly older than (highest_seen - kFrameLookback) that is still
+  // incomplete has permanently lost its missing packets.
+  uint16_t highest_seen = std::max<uint16_t>(frame_sequence, last_completed_frame_);
+  if (highest_seen >= kFrameLookback) {
+    uint16_t evict_before = highest_seen - kFrameLookback;
+    auto it = frame_assemblies_.begin();
+    while (it != frame_assemblies_.end()) {
+      if (it->first < evict_before) {
+        if (!it->second.complete) {
+          ReportFrameLoss(static_cast<uint16_t>(it->first), it->second);
         }
+        it = frame_assemblies_.erase(it);
+      } else {
+        ++it;
       }
     }
   }
