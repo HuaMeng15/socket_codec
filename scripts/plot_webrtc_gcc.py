@@ -47,12 +47,17 @@ def main():
     # Link capacity reference (static 10 Mbps)
     ax1.axhline(10000, color="black", linestyle="--", linewidth=2,
                 label="Link capacity (10 Mbps)")
-    ax1.plot(wt, [r["target_kbps"] for r in wrows], color="C0",
-             label="WebRTC target", linewidth=1.5)
+    # NOTE: in real WebRTC the loss-based estimator is seeded with the
+    # delay-based estimate, so target/delay-based/loss-based coincide ~99.7%
+    # of the time. Draw them with distinct styles + widths so overlapping
+    # lines remain individually visible (otherwise the last-drawn line hides
+    # the others).
     ax1.plot(wt, [r["delay_based_kbps"] for r in wrows], color="C1",
-             alpha=0.5, label="WebRTC delay-based")
+             linewidth=4, alpha=0.5, label="WebRTC delay-based")
     ax1.plot(wt, [r["loss_based_kbps"] for r in wrows], color="C2",
-             alpha=0.5, label="WebRTC loss-based")
+             linewidth=2.2, alpha=0.8, label="WebRTC loss-based")
+    ax1.plot(wt, [r["target_kbps"] for r in wrows], color="C0",
+             linewidth=1.0, linestyle=":", label="WebRTC target")
     if our_rows:
         ot = [r["t_sec"] for r in our_rows]
         ax1.plot(ot, [r["target_kbps"] for r in our_rows], color="C3",
