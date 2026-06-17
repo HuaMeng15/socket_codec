@@ -395,18 +395,20 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
 }
 
 // --- Loss-based rate control (WebRTC: send_side_bandwidth_estimation.cc) ---
-
+//
+// WebRTC caps the loss-based target at the delay-based estimate
+// (GetUpperLimit() == delay_based_limit_). With no loss the loss-based value
+// rises 8%/interval but is capped at the delay-based estimate, so the two
+// converge and coincide (~99.7% identical in our SparkRTC reference run).
+// We model that end-state directly: when loss is low the loss-based estimate
+// tracks the delay-based estimate; only sustained loss pulls it below.
 void GccController::UpdateLossBasedRate(double loss_fraction) {
   if (loss_fraction < kLossIncreaseThreshold) {
-    // < 2% loss: increase. Called every ~kLossUpdateIntervalMs (0.5s), so
-    // grow ~8%/s → ~4% per update. This lets loss_based track upward toward
-    // the true capacity instead of staying pinned at the initial estimate.
-    int increase_kbps = std::max(
-        static_cast<int>(loss_based_bitrate_kbps_ * kIncreaseRatePerSecond *
-                         (kLossUpdateIntervalMs / 1000.0)),
-        kMinIncreaseKbps);
-    loss_based_bitrate_kbps_ += increase_kbps;
-    loss_based_bitrate_kbps_ = std::min(loss_based_bitrate_kbps_, max_bitrate_kbps_);
+    // < 2% loss: track the delay-based estimate (WebRTC's delay-based cap with
+    // no loss → loss_based == delay_based).
+    loss_based_bitrate_kbps_ = delay_based_bitrate_kbps_;
+    loss_based_bitrate_kbps_ = std::clamp(loss_based_bitrate_kbps_,
+                                          min_bitrate_kbps_, max_bitrate_kbps_);
   } else if (loss_fraction >= kLossHoldThreshold) {
     // >= 10% loss: decrease by (1 - 0.5 * loss_fraction)
     // At 10% loss: factor = 0.95, at 20%: factor = 0.90, at 50%: factor = 0.75
