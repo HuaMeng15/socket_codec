@@ -57,13 +57,14 @@ def main():
             "queuing_delay": float(m.group(8)),
         })
 
-    # SCHEDULE lines (link capacity ground truth)
+    # SCHEDULE lines (link capacity ground truth).
+    # Groups: 1=timestamp, 2=schedule time (t=Nms), 3=bandwidth kbps.
     re_sched = re.compile(
         r"\[" + _TS + r"\].*\[SCHEDULE\] t=(\d+)ms set bandwidth to (\d+) kbps"
     )
     sched = []
     for m in re_sched.finditer(text):
-        sched.append({"ts": parse_ts(m.group(1)), "kbps": int(m.group(2))})
+        sched.append({"ts": parse_ts(m.group(1)), "kbps": int(m.group(3))})
 
     # Initial bandwidth from the "Network simulator enabled: bw=NNNNkbps"
     re_init_bw = re.search(r"Network simulator enabled: bw=(\d+)kbps", text)
