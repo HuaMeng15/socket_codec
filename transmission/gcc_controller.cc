@@ -29,6 +29,7 @@ GccController::GccController()
       prev_trend_(0.0),
       delay_based_bitrate_kbps_(1000),
       last_increase_time_ms_(0),
+      acked_bitrate_kbps_(0.0),
       loss_based_bitrate_kbps_(30000),
       packets_sent_since_last_loss_update_(0),
       packets_lost_since_last_loss_update_(0),
@@ -85,11 +86,18 @@ int GccController::GetOveruseCounter() const {
   return overuse_counter_;
 }
 
+void GccController::SetAckedBitrateForTesting(double kbps) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  acked_bitrate_kbps_ = kbps;
+  acked_frozen_for_testing_ = true;
+}
+
 void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t now_ms = NowMs();
 
   BandwidthUsage usage = UpdateTrendline(feedback);
+  UpdateAckedBitrate(feedback);
   UpdateDelayBasedRate(usage, now_ms);
 
   // Periodically re-evaluate the loss-based estimate. Without this, loss_based
@@ -201,6 +209,40 @@ void GccController::SetClockForTesting(int64_t* clock_ms) {
   }
 }
 
+// --- Acknowledged throughput estimate ---
+//
+// Estimate the rate actually getting through from a feedback batch: the
+// packets in the batch arrived over a span, so received_rate = bytes / span.
+// Packets are ~MTU; we approximate payload as kPayloadBytesPerPacket. The
+// result is EWMA-smoothed. AimdRateControl uses this to cap the increase
+// (<= 1.5x acked) and to snap the decrease to measured throughput.
+void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
+  if (acked_frozen_for_testing_) {
+    return;  // unit tests pin the acked estimate
+  }
+  if (feedback.packets.size() < 2) {
+    return;
+  }
+  int64_t first_us = feedback.packets.front().arrival_time_us;
+  int64_t last_us = feedback.packets.back().arrival_time_us;
+  double span_s = (last_us - first_us) / 1e6;
+  if (span_s <= 0) {
+    return;
+  }
+  // Bytes received in the batch (exclude the first packet: rate is over the
+  // gaps between arrivals).
+  double bytes = (feedback.packets.size() - 1) *
+                 static_cast<double>(kPayloadBytesPerPacket);
+  double sample_kbps = bytes * 8.0 / 1000.0 / span_s;
+
+  if (acked_bitrate_kbps_ <= 0.0) {
+    acked_bitrate_kbps_ = sample_kbps;
+  } else {
+    acked_bitrate_kbps_ = kAckedSmoothingCoeff * acked_bitrate_kbps_ +
+                          (1.0 - kAckedSmoothingCoeff) * sample_kbps;
+  }
+}
+
 // --- Trendline estimator (faithful to WebRTC trendline_estimator.cc) ---
 //
 // For each acknowledged packet we compute the one-way delay variation
@@ -213,7 +255,6 @@ void GccController::SetClockForTesting(int64_t* clock_ms) {
 GccController::BandwidthUsage GccController::UpdateTrendline(
     const TransportFeedback& feedback) {
   BandwidthUsage usage = BandwidthUsage::kNormal;
-
   for (const auto& pkt : feedback.packets) {
     if (pkt.send_time_us < 0) {
       continue;
@@ -363,26 +404,32 @@ void GccController::UpdateAdaptiveThreshold(double modified_trend,
 void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
   switch (usage) {
     case BandwidthUsage::kOveruse: {
-      // Multiplicative decrease: new_rate = 0.85 * estimated_throughput
-      // WebRTC uses the estimated throughput from acknowledged bitrate,
-      // but we approximate with current delay-based rate
-      delay_based_bitrate_kbps_ = static_cast<int>(
-          delay_based_bitrate_kbps_ * kMultiplicativeDecrease);
-      delay_based_bitrate_kbps_ = std::max(delay_based_bitrate_kbps_, min_bitrate_kbps_);
+      // WebRTC AimdRateControl decrease: snap to beta * measured throughput
+      // (not beta * current estimate). This drains the self-induced queue and
+      // lands the estimate right at ~capacity instead of just shaving the
+      // (possibly inflated) current value.
+      int target = delay_based_bitrate_kbps_;
+      if (acked_bitrate_kbps_ > 0.0) {
+        int from_acked = static_cast<int>(acked_bitrate_kbps_ * kMultiplicativeDecrease);
+        // Only decrease (never raise on overuse).
+        target = std::min(delay_based_bitrate_kbps_, from_acked);
+      } else {
+        target = static_cast<int>(delay_based_bitrate_kbps_ * kMultiplicativeDecrease);
+      }
+      delay_based_bitrate_kbps_ = std::max(target, min_bitrate_kbps_);
       overuse_counter_ = 0;
       last_overuse_time_ms_ = now_ms;
-      LOG(INFO) << "[GCC] Overuse → decrease to " << delay_based_bitrate_kbps_ << " kbps";
+      LOG(INFO) << "[GCC] Overuse → decrease to " << delay_based_bitrate_kbps_
+                << " kbps (acked=" << static_cast<int>(acked_bitrate_kbps_) << ")";
       break;
     }
     case BandwidthUsage::kUnderuse:
     case BandwidthUsage::kNormal: {
-      // Additive increase: ~8% of current rate per second
-      // WebRTC: increase = max(1000, beta * rate) per second
-      // where beta ≈ 0.08
+      // Additive increase: ~8% of current rate per second.
       int64_t time_since_last_ms = now_ms - last_increase_time_ms_;
       if (time_since_last_ms <= 0) break;
 
-      // Don't increase too soon after overuse (WebRTC: wait ~1s)
+      // Don't increase too soon after overuse (WebRTC: wait ~1s).
       if (now_ms - last_overuse_time_ms_ < 1000) break;
 
       double seconds = time_since_last_ms / 1000.0;
@@ -390,8 +437,20 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
           delay_based_bitrate_kbps_ * kIncreaseRatePerSecond * seconds);
       increase_kbps = std::max(increase_kbps, static_cast<int>(kMinIncreaseKbps * seconds));
 
-      delay_based_bitrate_kbps_ += increase_kbps;
-      delay_based_bitrate_kbps_ = std::min(delay_based_bitrate_kbps_, max_bitrate_kbps_);
+      int new_rate = delay_based_bitrate_kbps_ + increase_kbps;
+
+      // WebRTC AimdRateControl: never increase beyond 1.5x the acknowledged
+      // throughput (+ a small slack). This is what stops the estimate from
+      // ramping far past a saturated link — the acked rate plateaus at
+      // capacity, capping the increase near capacity instead of running away.
+      if (acked_bitrate_kbps_ > 0.0) {
+        int increase_limit = static_cast<int>(1.5 * acked_bitrate_kbps_) + 10;
+        new_rate = std::min(new_rate, increase_limit);
+        // Don't let the cap force a decrease here.
+        new_rate = std::max(new_rate, delay_based_bitrate_kbps_);
+      }
+
+      delay_based_bitrate_kbps_ = std::min(new_rate, max_bitrate_kbps_);
       last_increase_time_ms_ = now_ms;
       break;
     }

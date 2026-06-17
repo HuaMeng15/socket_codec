@@ -71,6 +71,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
     int sim_delay = parser.GetFlag<int>("sim_delay_ms");
     int sim_loss = parser.GetFlag<int>("sim_loss_percent");
     int sim_jitter = parser.GetFlag<int>("sim_jitter_ms");
+    int sim_max_queue = parser.GetFlag<int>("sim_max_queue_ms");
     // Schedule's first step (t=0) sets the initial bandwidth if present.
     if (!bw_schedule.empty() && sim_bw == 0) {
       sim_bw = bw_schedule.front().second;
@@ -79,6 +80,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
         !bw_schedule.empty()) {
       NetworkSimulator::Config sim_config;
       sim_config.bandwidth_kbps = sim_bw;
+      sim_config.max_queue_ms = sim_max_queue;
       sim_config.propagation_delay_ms = sim_delay;
       sim_config.loss_rate = sim_loss / 100.0;
       sim_config.jitter_ms = sim_jitter;

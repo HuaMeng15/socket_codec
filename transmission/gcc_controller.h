@@ -66,6 +66,9 @@ class GccController : public CongestionController {
   int GetLossBasedBitrateKbps() const;
   double GetAdaptiveThreshold() const;
   int GetOveruseCounter() const;
+  // Override the acknowledged-throughput estimate for deterministic
+  // delay-based unit tests (decouples them from synthetic acked estimation).
+  void SetAckedBitrateForTesting(double kbps);
 
  private:
   int64_t NowMs() const;
@@ -142,6 +145,15 @@ class GccController : public CongestionController {
   // Increase: ~8% of current bitrate per second
   static constexpr double kIncreaseRatePerSecond = 0.08;
   static constexpr int kMinIncreaseKbps = 50;  // Floor for additive increase
+
+  // Acknowledged throughput estimate (WebRTC AimdRateControl uses this to cap
+  // the increase at 1.5x and to snap the decrease to measured throughput).
+  // Estimated from feedback: total acked payload bytes over the arrival span.
+  void UpdateAckedBitrate(const TransportFeedback& feedback);
+  double acked_bitrate_kbps_;
+  bool acked_frozen_for_testing_ = false;  // pin acked in detector unit tests
+  static constexpr double kAckedSmoothingCoeff = 0.95;  // EWMA on acked rate
+  static constexpr int kPayloadBytesPerPacket = 1454;   // MTU payload estimate
 
   // Loss-based rate control (WebRTC send_side_bandwidth_estimation)
   int loss_based_bitrate_kbps_;

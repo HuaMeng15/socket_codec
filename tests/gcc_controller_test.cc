@@ -17,6 +17,10 @@ class GccControllerTest : public ::testing::Test {
     gcc.SetClockForTesting(&clock_ms_);
     gcc.SetInitialBitrate(5000);
     gcc.SetBitrateRange(100, 30000);
+    // Default: high acked throughput so the AIMD increase cap (1.5x acked)
+    // doesn't bind during ramp/stable tests. Overuse tests override this with
+    // a low value to model a saturated bottleneck (acked below the estimate).
+    gcc.SetAckedBitrateForTesting(30000);
   }
 
   // Advance fake clock
@@ -59,12 +63,18 @@ class GccControllerTest : public ::testing::Test {
     }
   }
 
-  // Feed N rounds where arrival spacing exceeds send spacing (congestion)
+  // Feed N rounds modelling a saturated bottleneck: arrival spacing exceeds
+  // send spacing (queue building → growing one-way delay), and is wide enough
+  // that the acknowledged throughput is below the current estimate — so the
+  // AIMD decrease (beta * acked) actually lowers the rate, as on a real
+  // congested link. spacing chosen so acked ~ a few Mbps.
   void FeedOveruse(int rounds, int64_t& send_time, int64_t& arrival_time,
                    int extra_per_round_us = 2000) {
+    // A saturated bottleneck means the acknowledged throughput sits below the
+    // current estimate; pin it low so the AIMD decrease (beta * acked) lowers
+    // the rate, as WebRTC does on real congestion.
+    gcc.SetAckedBitrateForTesting(2000);
     for (int i = 0; i < rounds; i++) {
-      // Within batch: send at 1ms spacing, arrive at wider spacing
-      // (simulating packets delayed in a growing queue)
       int64_t arrival_spacing = 1000 + extra_per_round_us / 20;
       auto fb = MakeFeedback(send_time, arrival_time, 20,
                               1000, arrival_spacing);
@@ -170,8 +180,10 @@ TEST_F(GccControllerTest, UnderuseDetectedOnDecreasingDelay) {
   int post_overuse = gcc.GetDelayBasedBitrateKbps();
   EXPECT_LT(post_overuse, 5000);  // confirm overuse happened
 
-  // Now feed underuse: queue draining. Need enough rounds to flush the window.
+  // Now feed underuse: queue draining. Throughput has recovered, so the acked
+  // estimate is high again (no longer capping the increase).
   AdvanceMs(1100);  // past overuse guard
+  gcc.SetAckedBitrateForTesting(30000);
   FeedUnderuse(40, send, arrival, 3000);
 
   // After underuse with time passed, rate should have increased from post-overuse
