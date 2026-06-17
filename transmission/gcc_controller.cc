@@ -18,16 +18,15 @@ GccController::GccController()
     : accumulated_delay_(0.0),
       smoothed_delay_(0.0),
       first_arrival_ms_(0),
-      prev_send_time_ms_(0),
-      prev_arrival_time_ms_(0),
+      prev_send_ms_d_(0.0),
+      prev_arrival_ms_d_(0.0),
       num_deltas_(0),
       adaptive_threshold_(kInitialThreshold),
       last_threshold_update_ms_(0),
       overuse_counter_(0),
       last_overuse_time_ms_(0),
-      time_over_using_ms_(0.0),
-      prev_modified_trend_(0.0),
-      last_detect_ms_(0),
+      time_over_using_ms_(-1.0),
+      prev_trend_(0.0),
       delay_based_bitrate_kbps_(1000),
       last_increase_time_ms_(0),
       loss_based_bitrate_kbps_(30000),
@@ -90,9 +89,7 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t now_ms = NowMs();
 
-  UpdateTrendline(feedback);
-  double slope = ComputeTrendlineSlope();
-  BandwidthUsage usage = Detect(slope);
+  BandwidthUsage usage = UpdateTrendline(feedback);
   UpdateDelayBasedRate(usage, now_ms);
 
   // Periodically re-evaluate the loss-based estimate. Without this, loss_based
@@ -153,7 +150,7 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   LOG(INFO) << "[GCC_STATE] target=" << target_bitrate_kbps_
             << " delay_based=" << delay_based_bitrate_kbps_
             << " loss_based=" << loss_based_bitrate_kbps_
-            << " slope=" << slope
+            << " slope=" << prev_trend_
             << " threshold=" << adaptive_threshold_
             << " usage=" << usage_str
             << " queuing_delay_ms=" << queuing_delay_ms;
@@ -204,154 +201,161 @@ void GccController::SetClockForTesting(int64_t* clock_ms) {
   }
 }
 
-// --- Trendline estimator (WebRTC: trendline_estimator.cc) ---
+// --- Trendline estimator (faithful to WebRTC trendline_estimator.cc) ---
 //
-// Processes each acknowledged packet using its real send and arrival
-// timestamps. The inter-packet delay variation
-//   delay_delta = (arrival[i] - arrival[i-1]) - (send[i] - send[i-1])
-// is accumulated and fed into a linear-regression window. A positive slope
-// means queuing delay is growing (potential overuse).
+// For each acknowledged packet we compute the one-way delay variation
+//   delta = recv_delta - send_delta
+// accumulate it, EWMA-smooth it, and keep a duration-based window
+// (<= kTrendlineWindowMs of arrival span). When the window is trimmed we refit
+// a least-squares line; its slope is the trend fed to Detect(). All times are
+// in milliseconds, matching WebRTC.
 
-void GccController::UpdateTrendline(const TransportFeedback& feedback) {
+GccController::BandwidthUsage GccController::UpdateTrendline(
+    const TransportFeedback& feedback) {
+  BandwidthUsage usage = BandwidthUsage::kNormal;
+
   for (const auto& pkt : feedback.packets) {
     if (pkt.send_time_us < 0) {
       continue;
     }
 
-    // Work in microseconds for precision (avoid truncation of sub-ms deltas)
-    int64_t send_us = pkt.send_time_us;
-    int64_t arrival_us = pkt.arrival_time_us;
+    double send_ms = pkt.send_time_us / 1000.0;
+    double arrival_ms = pkt.arrival_time_us / 1000.0;
 
     if (first_arrival_ms_ == 0) {
-      first_arrival_ms_ = arrival_us;  // Reusing field name, but now stores us
-      prev_arrival_time_ms_ = arrival_us;
-      prev_send_time_ms_ = send_us;
+      first_arrival_ms_ = static_cast<int64_t>(arrival_ms);
+      // Need a previous packet to form a delta; record and continue.
+      prev_arrival_ms_d_ = arrival_ms;
+      prev_send_ms_d_ = send_ms;
       continue;
     }
 
-    // Per-packet inter-arrival and inter-send deltas (in ms, from us)
-    double arrival_delta_ms = (arrival_us - prev_arrival_time_ms_) / 1000.0;
-    double send_delta_ms = (send_us - prev_send_time_ms_) / 1000.0;
-    double delay_delta_ms = arrival_delta_ms - send_delta_ms;
+    double recv_delta_ms = arrival_ms - prev_arrival_ms_d_;
+    double send_delta_ms = send_ms - prev_send_ms_d_;
+    double delta_ms = recv_delta_ms - send_delta_ms;
+    prev_arrival_ms_d_ = arrival_ms;
+    prev_send_ms_d_ = send_ms;
 
-    prev_arrival_time_ms_ = arrival_us;
-    prev_send_time_ms_ = send_us;
+    num_deltas_++;
+    if (num_deltas_ > kDeltaCounterMax) num_deltas_ = kDeltaCounterMax;
 
-    // Accumulate delay in ms
-    accumulated_delay_ += delay_delta_ms;
-
-    // EWMA-smooth the accumulated delay (WebRTC smoothing_coef_ = 0.9). The
-    // smoothed value is what feeds the regression window — it suppresses the
-    // per-packet scheduling jitter that would otherwise produce spurious
-    // positive slopes (false overuse) on an uncongested link. Under real
-    // congestion the accumulated delay grows monotonically, so the smoothed
-    // signal still tracks it and the slope goes clearly positive.
+    // Exponential backoff filter.
+    accumulated_delay_ += delta_ms;
     smoothed_delay_ = kTrendlineSmoothingCoeff * smoothed_delay_ +
                       (1.0 - kTrendlineSmoothingCoeff) * accumulated_delay_;
 
-    double time_since_first_ms = (arrival_us - first_arrival_ms_) / 1000.0;
-    trendline_window_.push_back({smoothed_delay_, time_since_first_ms});
-    if (static_cast<int>(trendline_window_.size()) > kTrendlineWindowSize) {
+    double rel_arrival_ms = arrival_ms - first_arrival_ms_;
+    trendline_window_.push_back({rel_arrival_ms, smoothed_delay_});
+
+    // Maintain a duration-based window: pop until span <= kTrendlineWindowMs.
+    double trend = prev_trend_;
+    bool dofit = false;
+    double duration = trendline_window_.back().arrival_time_ms -
+                      trendline_window_.front().arrival_time_ms;
+    while (duration > kTrendlineWindowMs && trendline_window_.size() > 2) {
+      dofit = true;
       trendline_window_.pop_front();
+      duration = trendline_window_.back().arrival_time_ms -
+                 trendline_window_.front().arrival_time_ms;
     }
-    num_deltas_++;
+    if (dofit) {
+      trend = ComputeTrendlineSlope();
+    }
+
+    usage = Detect(trend, send_delta_ms, static_cast<int64_t>(arrival_ms));
   }
+
+  return usage;
 }
 
 double GccController::ComputeTrendlineSlope() const {
-  if (trendline_window_.size() < 4) {
-    return 0.0;
+  if (trendline_window_.size() < 2) {
+    return prev_trend_;
   }
-
-  // Linear least-squares regression: y = smoothed_delay, x = time
-  int n = static_cast<int>(trendline_window_.size());
-  double sum_x = 0, sum_y = 0, sum_xy = 0, sum_xx = 0;
-
-  // Normalize x values to [0, 1] for numerical stability
-  double x_base = trendline_window_.front().arrival_time_ms;
-  double x_range = trendline_window_.back().arrival_time_ms - x_base;
-  if (x_range <= 0) return 0.0;
-
-  for (const auto& point : trendline_window_) {
-    double x = (point.arrival_time_ms - x_base) / x_range;
-    double y = point.smoothed_delay;
-    sum_x += x;
-    sum_y += y;
-    sum_xy += x * y;
-    sum_xx += x * x;
+  // Least-squares slope of (arrival_time_ms, smoothed_delay), centered.
+  double sum_x = 0, sum_y = 0;
+  for (const auto& p : trendline_window_) {
+    sum_x += p.arrival_time_ms;
+    sum_y += p.smoothed_delay;
   }
-
-  double denom = n * sum_xx - sum_x * sum_x;
-  if (std::abs(denom) < 1e-9) return 0.0;
-
-  double slope = (n * sum_xy - sum_x * sum_y) / denom;
-  return slope;
+  double x_avg = sum_x / trendline_window_.size();
+  double y_avg = sum_y / trendline_window_.size();
+  double num = 0, den = 0;
+  for (const auto& p : trendline_window_) {
+    double dx = p.arrival_time_ms - x_avg;
+    num += dx * (p.smoothed_delay - y_avg);
+    den += dx * dx;
+  }
+  if (den == 0) return prev_trend_;
+  return num / den;
 }
 
-// --- Overuse detector (WebRTC: trendline_estimator.cc Detect()) ---
+// --- Overuse detector (faithful to TrendlineEstimator::Detect) ---
 
-GccController::BandwidthUsage GccController::Detect(double trendline_slope) {
-  int64_t now_ms = NowMs();
-
-  // Modified trend = slope * threshold_gain
-  double modified_trend = trendline_slope * kThresholdGain;
-  // Scale by number of deltas to reduce sensitivity at startup
-  if (num_deltas_ < 10) {
-    modified_trend *= static_cast<double>(num_deltas_) / 10.0;
+GccController::BandwidthUsage GccController::Detect(double trend,
+                                                   double ts_delta_ms,
+                                                   int64_t now_ms) {
+  if (num_deltas_ < 2) {
+    return BandwidthUsage::kNormal;
   }
 
-  int64_t dt_ms = (last_detect_ms_ == 0) ? 0 : (now_ms - last_detect_ms_);
-  last_detect_ms_ = now_ms;
+  // modified_trend = min(num_deltas, kMinNumDeltas) * trend * gain
+  const double modified_trend =
+      std::min(num_deltas_, kMinNumDeltas) * trend * kThresholdGain;
 
   BandwidthUsage result = BandwidthUsage::kNormal;
 
   if (modified_trend > adaptive_threshold_) {
-    // Accumulate the time spent over-using. Only declare overuse once that
-    // time exceeds kOverusingTimeThresholdMs AND the trend is not shrinking
-    // (WebRTC OveruseDetector). This rejects isolated noise spikes.
-    time_over_using_ms_ += static_cast<double>(dt_ms);
+    if (time_over_using_ms_ < 0) {
+      // Initialize: assume over-using half the time since the previous sample.
+      time_over_using_ms_ = ts_delta_ms / 2.0;
+    } else {
+      time_over_using_ms_ += ts_delta_ms;
+    }
     overuse_counter_++;
     if (time_over_using_ms_ > kOverusingTimeThresholdMs &&
-        overuse_counter_ >= kOveruseCountThreshold &&
-        modified_trend >= prev_modified_trend_) {
-      time_over_using_ms_ = 0.0;
-      overuse_counter_ = 0;
-      result = BandwidthUsage::kOveruse;
+        overuse_counter_ > 1) {
+      if (trend >= prev_trend_) {
+        time_over_using_ms_ = 0;
+        overuse_counter_ = 0;
+        result = BandwidthUsage::kOveruse;
+      }
     }
   } else if (modified_trend < -adaptive_threshold_) {
-    time_over_using_ms_ = 0.0;
+    time_over_using_ms_ = -1;
     overuse_counter_ = 0;
     result = BandwidthUsage::kUnderuse;
   } else {
-    time_over_using_ms_ = 0.0;
+    time_over_using_ms_ = -1;
     overuse_counter_ = 0;
     result = BandwidthUsage::kNormal;
   }
 
-  prev_modified_trend_ = modified_trend;
+  prev_trend_ = trend;
   UpdateAdaptiveThreshold(modified_trend, now_ms);
   return result;
 }
 
-void GccController::UpdateAdaptiveThreshold(double modified_trend, int64_t now_ms) {
-  // WebRTC adaptive threshold logic:
-  // If |modified_trend| > threshold: threshold increases at k_up rate
-  // Otherwise: threshold decreases at k_down rate toward kMinThreshold
-  int64_t time_delta_ms = now_ms - last_threshold_update_ms_;
-  if (time_delta_ms <= 0) return;
-  last_threshold_update_ms_ = now_ms;
-
-  double abs_trend = std::abs(modified_trend);
-  if (abs_trend > adaptive_threshold_) {
-    // Increase threshold: adaptive_threshold += k_up * (abs_trend - threshold) * dt
-    adaptive_threshold_ += kThresholdUp * (abs_trend - adaptive_threshold_) *
-                           static_cast<double>(time_delta_ms);
-  } else {
-    // Decrease threshold toward kMinThreshold
-    adaptive_threshold_ += kThresholdDown * (kMinThreshold - adaptive_threshold_) *
-                           static_cast<double>(time_delta_ms);
+void GccController::UpdateAdaptiveThreshold(double modified_trend,
+                                            int64_t now_ms) {
+  if (last_threshold_update_ms_ == 0) {
+    last_threshold_update_ms_ = now_ms;
   }
+  // Avoid adapting the threshold to big spikes (e.g. sudden capacity drop).
+  if (std::abs(modified_trend) > adaptive_threshold_ + kMaxAdaptOffsetMs) {
+    last_threshold_update_ms_ = now_ms;
+    return;
+  }
+  double k = std::abs(modified_trend) < adaptive_threshold_ ? kThresholdDown
+                                                            : kThresholdUp;
+  const int64_t kMaxTimeDeltaMs = 100;
+  int64_t time_delta_ms =
+      std::min(now_ms - last_threshold_update_ms_, kMaxTimeDeltaMs);
+  if (time_delta_ms < 0) time_delta_ms = 0;
+  adaptive_threshold_ +=
+      k * (std::abs(modified_trend) - adaptive_threshold_) * time_delta_ms;
   adaptive_threshold_ = std::clamp(adaptive_threshold_, kMinThreshold, kMaxThreshold);
+  last_threshold_update_ms_ = now_ms;
 }
 
 // --- Rate controller (WebRTC: AIMD) ---

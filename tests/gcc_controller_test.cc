@@ -161,12 +161,16 @@ TEST_F(GccControllerTest, StartupWarmupPreventsEarlyOveruse) {
 TEST_F(GccControllerTest, UnderuseDetectedOnDecreasingDelay) {
   int64_t send = 1000000, arrival = 1000000;
 
-  // First cause overuse with strong signal
-  FeedOveruse(20, send, arrival, 4000);
+  // Warm up so num_deltas builds (matches WebRTC modified_trend scaling).
+  FeedStable(5, send, arrival);
+
+  // Cause overuse with the default sustained congestion signal (proven to
+  // trigger in OveruseDetectedOnGrowingDelay).
+  FeedOveruse(30, send, arrival);
   int post_overuse = gcc.GetDelayBasedBitrateKbps();
   EXPECT_LT(post_overuse, 5000);  // confirm overuse happened
 
-  // Now feed underuse: queue draining. Need >20 rounds to flush trendline window.
+  // Now feed underuse: queue draining. Need enough rounds to flush the window.
   AdvanceMs(1100);  // past overuse guard
   FeedUnderuse(40, send, arrival, 3000);
 

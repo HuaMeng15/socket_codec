@@ -14,11 +14,13 @@
  * GccController: Google Congestion Control aligned with WebRTC implementation.
  *
  * Delay-based component (references: trendline_estimator.cc, delay_based_bwe.cc):
- *   - Inter-arrival delta computation between packet groups
- *   - Accumulated delay tracked per sample
- *   - Trendline estimator: linear least-squares over a sliding window
- *     (kTrendlineWindowSize = 20 samples)
- *   - Overuse detection: trendline * kThresholdGain (4.0) vs adaptive threshold
+ *   - Per-packet inter-arrival delta (recv_delta - send_delta), accumulated
+ *     and EWMA-smoothed (coeff 0.9)
+ *   - Trendline estimator: least-squares slope over a duration-based window
+ *     (<= kTrendlineWindowMs of arrival span), refit when the window is trimmed
+ *   - Overuse detection: modified_trend = min(num_deltas, 60) * slope * gain(4)
+ *     vs adaptive threshold; requires sustained over-use (time_over_using >
+ *     10ms), overuse_counter > 1, and trend non-decreasing
  *   - Adaptive threshold: grows at k_up (0.0087) during overuse,
  *     decays at k_down (0.039) otherwise, clamped to [6, 600] ms
  *   - Rate control: AIMD
@@ -67,18 +69,21 @@ class GccController : public CongestionController {
 
  private:
   int64_t NowMs() const;
-  // --- Trendline estimator ---
+  // --- Trendline estimator (WebRTC trendline_estimator.cc) ---
   struct DelayPoint {
-    double smoothed_delay;  // Accumulated delay (smoothed)
-    double arrival_time_ms;
+    double arrival_time_ms;   // arrival time relative to first sample (ms)
+    double smoothed_delay;    // EWMA-smoothed accumulated delay (ms)
   };
 
-  void UpdateTrendline(const TransportFeedback& feedback);
+  // Process all packets in a feedback batch; returns the latest bandwidth-usage
+  // hypothesis (matches WebRTC, which calls Detect per packet).
+  enum class BandwidthUsage { kUnderuse, kNormal, kOveruse };
+  BandwidthUsage UpdateTrendline(const TransportFeedback& feedback);
   double ComputeTrendlineSlope() const;
 
   // --- Overuse detector ---
-  enum class BandwidthUsage { kUnderuse, kNormal, kOveruse };
-  BandwidthUsage Detect(double trendline_slope);
+  BandwidthUsage Detect(double trendline_slope, double ts_delta_ms,
+                        int64_t now_ms);
   void UpdateAdaptiveThreshold(double modified_trend, int64_t now_ms);
 
   // --- Rate controller ---
@@ -97,14 +102,17 @@ class GccController : public CongestionController {
   double accumulated_delay_;
   double smoothed_delay_;
   int64_t first_arrival_ms_;
-  int64_t prev_send_time_ms_;
-  int64_t prev_arrival_time_ms_;
+  double prev_send_ms_d_;       // previous packet send time (ms)
+  double prev_arrival_ms_d_;    // previous packet arrival time (ms)
   int num_deltas_;
 
-  // WebRTC trendline constants
-  static constexpr int kTrendlineWindowSize = 20;
+  // WebRTC trendline constants (trendline_estimator.cc)
   static constexpr double kTrendlineSmoothingCoeff = 0.9;
   static constexpr double kThresholdGain = 4.0;
+  static constexpr int kMinNumDeltas = 60;       // modified_trend scale cap
+  static constexpr int kDeltaCounterMax = 1000;  // num_deltas saturation
+  static constexpr double kTrendlineWindowMs = 100.0;  // duration-based window
+  static constexpr double kMaxAdaptOffsetMs = 15.0;    // threshold spike guard
 
   // Adaptive threshold state
   double adaptive_threshold_;
@@ -113,20 +121,18 @@ class GccController : public CongestionController {
   static constexpr double kMinThreshold = 6.0;
   static constexpr double kMaxThreshold = 600.0;
   // Threshold adaptation rates (per ms)
-  static constexpr double kThresholdUp = 0.0087;    // ~k_u in WebRTC
-  static constexpr double kThresholdDown = 0.039;   // ~k_d in WebRTC
+  static constexpr double kThresholdUp = 0.0087;    // k_up in WebRTC
+  static constexpr double kThresholdDown = 0.039;   // k_down in WebRTC
 
-  // Overuse detection (WebRTC OveruseDetector). Overuse is only signaled when
-  // the modified trend stays above threshold for a sustained time
-  // (kOverusingTimeThresholdMs) AND the trend is not decreasing — this rejects
-  // brief noise spikes that would otherwise cap the rate on an idle link.
+  // Overuse detection (WebRTC OveruseDetector / TrendlineEstimator::Detect).
+  // Overuse is signaled only when the modified trend stays above threshold for
+  // a sustained time (overusing_time_threshold) AND the trend is not
+  // decreasing (trend >= prev_trend) AND it has occurred more than once.
   int overuse_counter_;
-  static constexpr int kOveruseCountThreshold = 3;
   int64_t last_overuse_time_ms_;
-  double time_over_using_ms_;     // accumulated time spent above threshold
-  double prev_modified_trend_;    // previous modified trend (monotonicity guard)
-  int64_t last_detect_ms_;        // timestamp of previous Detect() call
-  static constexpr double kOverusingTimeThresholdMs = 100.0;
+  double time_over_using_ms_;     // accumulated time over threshold (-1 = reset)
+  double prev_trend_;             // previous raw trendline slope
+  static constexpr double kOverusingTimeThresholdMs = 10.0;  // WebRTC default
 
   // Delay-based rate control
   int delay_based_bitrate_kbps_;
