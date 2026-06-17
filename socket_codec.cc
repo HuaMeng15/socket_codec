@@ -143,7 +143,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
 
   // Set up GCC congestion controller
   GccController gcc;
-  gcc.SetInitialBitrate(5000);  // Start at 5 Mbps
+  gcc.SetInitialBitrate(500);  // Start at 500 kbps; ramp/probe up to capacity
   gcc.SetBitrateRange(200, 20000);
 
   // Wire actual sent packet count from DataSender into GCC

@@ -135,8 +135,23 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
       prober_.OnProbeResult(delay_based_bitrate_kbps_, /*success=*/false);
       probe_active_ = false;
     } else if (now_ms - probe_started_ms_ > kProbeEvalWindowMs) {
-      prober_.OnProbeResult(prober_.GetEffectiveBitrateKbps(), /*success=*/true);
+      // Probe window elapsed. The probe's true result is the throughput that
+      // actually got through at the elevated rate (WebRTC ProbeBitrateEstimator
+      // measures received rate, not the send rate). If the link couldn't carry
+      // the probe rate, acked < probe_target and we commit only the measured
+      // capacity — this prevents "succeeding" at an over-capacity send rate.
+      int probe_target = prober_.GetEffectiveBitrateKbps();
+      int measured = (acked_bitrate_kbps_ > 0)
+                         ? static_cast<int>(acked_bitrate_kbps_)
+                         : probe_target;
+      int probed = std::min(probe_target, measured);
+      bool real_gain = probed > delay_based_bitrate_kbps_;
+      prober_.OnProbeResult(probed, /*success=*/real_gain);
       probe_active_ = false;
+      if (real_gain) {
+        delay_based_bitrate_kbps_ = std::min(probed, max_bitrate_kbps_);
+        last_increase_time_ms_ = now_ms;  // reset AIMD pacing from new base
+      }
     }
   } else if (!probing) {
     probe_active_ = false;

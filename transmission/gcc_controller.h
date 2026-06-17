@@ -186,7 +186,7 @@ class GccController : public CongestionController {
   int64_t probe_started_ms_;
   int probe_floor_kbps_;
   static constexpr double kProbeAbortDelayMs = 80.0;  // abort if queue grows past this
-  static constexpr int kProbeEvalWindowMs = 1000;     // commit after this if clean
+  static constexpr int kProbeEvalWindowMs = 300;      // resolve probe after this
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;
