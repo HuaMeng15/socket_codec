@@ -109,9 +109,9 @@ int FeedbackHandler::HandleTransportFeedback(const uint8_t* data, size_t size) {
   const auto* records = reinterpret_cast<const PacketArrivalRecord*>(
       data + sizeof(FeedbackMessageHeader));
 
-  // Build TransportFeedback struct. The arrival_time_ms fields are offsets
-  // relative to the first packet in the batch (receiver clock). We keep them
-  // as relative arrival times; the trendline only uses inter-packet deltas.
+  // Build TransportFeedback struct. The arrival_time_us fields are offsets
+  // (microseconds) relative to the receiver's epoch. The trendline only uses
+  // inter-packet arrival deltas, so the absolute origin doesn't matter.
   TransportFeedback feedback;
   feedback.reference_time_us = 0;
 
@@ -120,10 +120,10 @@ int FeedbackHandler::HandleTransportFeedback(const uint8_t* data, size_t size) {
     info.frame_sequence = ntohs(records[i].frame_sequence);
     info.packet_index = records[i].packet_index;
 
-    // Arrival: relative offset within batch (receiver clock), in us
-    int32_t offset_ms = static_cast<int32_t>(ntohl(
-        static_cast<uint32_t>(records[i].arrival_time_ms)));
-    info.arrival_time_us = static_cast<int64_t>(offset_ms) * 1000;
+    // Arrival: receiver-clock offset in microseconds.
+    int32_t offset_us = static_cast<int32_t>(ntohl(
+        static_cast<uint32_t>(records[i].arrival_time_us)));
+    info.arrival_time_us = static_cast<int64_t>(offset_us);
 
     // Send time: looked up from the send-time store (sender clock, us).
     // Falls back to -1 if unknown so GCC can skip that packet.

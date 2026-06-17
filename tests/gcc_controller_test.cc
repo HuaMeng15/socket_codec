@@ -108,6 +108,7 @@ TEST_F(GccControllerTest, BitrateStaysWithinBounds) {
   for (int i = 0; i < 50; i++) {
     report.packets.push_back({static_cast<uint16_t>(i), 0});
   }
+  AdvanceMs(600);
   gcc.OnLossReport(report);
 
   EXPECT_GE(gcc.GetTargetBitrateKbps(), 500);
@@ -237,6 +238,7 @@ TEST_F(GccControllerTest, LossBelow2PercentAllowsIncrease) {
   gcc.OnPacketsSent(100);
   LossReport report;
   report.packets.push_back({0, 0});
+  AdvanceMs(600);  // pass the periodic loss-update interval (500ms)
   gcc.OnLossReport(report);
 
   // After update: loss = 1/100 = 1% < 2% → increase allowed
@@ -254,6 +256,7 @@ TEST_F(GccControllerTest, LossBetween2And10PercentHolds) {
   for (int i = 0; i < 5; i++) {
     report.packets.push_back({static_cast<uint16_t>(i), 0});
   }
+  AdvanceMs(600);
   gcc.OnLossReport(report);
 
   // 5% is in hold range [2%, 10%): no change
@@ -269,6 +272,7 @@ TEST_F(GccControllerTest, LossAbove10PercentDecreases) {
   for (int i = 0; i < 20; i++) {
     report.packets.push_back({static_cast<uint16_t>(i), 0});
   }
+  AdvanceMs(600);
   gcc.OnLossReport(report);
 
   // 20% loss → factor = 1 - 0.5*0.2 = 0.9 → ~4500 kbps
@@ -285,6 +289,7 @@ TEST_F(GccControllerTest, HighLossDecreasesProportionally) {
   for (int i = 0; i < 50; i++) {
     report.packets.push_back({static_cast<uint16_t>(i), 0});
   }
+  AdvanceMs(600);
   gcc.OnLossReport(report);
 
   int after = gcc.GetTargetBitrateKbps();

@@ -104,7 +104,10 @@ int BandwidthProber::GetEffectiveBitrateKbps() {
 void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (state_ != State::kWaitingForResult) {
+  // Accept results while actively probing OR awaiting the cluster result. The
+  // pacer-driven kWaitingForResult transition is optional; controllers that
+  // resolve probes directly from feedback call this straight from kProbing.
+  if (state_ != State::kProbing && state_ != State::kWaitingForResult) {
     return;
   }
 

@@ -25,17 +25,25 @@ GccController::GccController()
       last_threshold_update_ms_(0),
       overuse_counter_(0),
       last_overuse_time_ms_(0),
+      time_over_using_ms_(0.0),
+      prev_modified_trend_(0.0),
+      last_detect_ms_(0),
       delay_based_bitrate_kbps_(1000),
       last_increase_time_ms_(0),
       loss_based_bitrate_kbps_(30000),
       packets_sent_since_last_loss_update_(0),
       packets_lost_since_last_loss_update_(0),
+      last_loss_update_ms_(0),
       target_bitrate_kbps_(1000),
       min_bitrate_kbps_(100),
       max_bitrate_kbps_(30000),
+      probe_active_(false),
+      probe_started_ms_(0),
+      probe_floor_kbps_(0),
       fake_clock_ms_(nullptr) {
   last_threshold_update_ms_ = NowMs();
   last_increase_time_ms_ = NowMs();
+  last_loss_update_ms_ = NowMs();
 }
 
 void GccController::SetInitialBitrate(int kbps) {
@@ -87,11 +95,47 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   BandwidthUsage usage = Detect(slope);
   UpdateDelayBasedRate(usage, now_ms);
 
+  // Periodically re-evaluate the loss-based estimate. Without this, loss_based
+  // only ever changed on a loss report and stayed frozen during loss-free
+  // operation — capping the target below the true capacity.
+  MaybeUpdateLossRate(now_ms);
+
   // Feed signals to prober
   if (usage == BandwidthUsage::kOveruse) {
     prober_.OnOveruseDetected();
   }
   prober_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
+
+  // --- Probe lifecycle management ---
+  // The prober raises the send rate to test for headroom; we must resolve the
+  // probe. Detect a freshly-started probe, then on each subsequent feedback
+  // decide: ABORT if the elevated rate induced congestion (overuse, queue
+  // growth past kProbeAbortDelayMs, or loss-based estimate collapsing below
+  // the pre-probe floor); COMMIT if the eval window elapsed with delay low.
+  bool probing = prober_.GetState() == BandwidthProber::State::kProbing ||
+                 prober_.GetState() == BandwidthProber::State::kWaitingForResult;
+  if (probing && !probe_active_) {
+    // New probe just started — snapshot start time and floor.
+    probe_active_ = true;
+    probe_started_ms_ = now_ms;
+    probe_floor_kbps_ = loss_based_bitrate_kbps_;
+    // Reset the queue-delay integrator so the probe's effect is measured fresh.
+    accumulated_delay_ = 0.0;
+    smoothed_delay_ = 0.0;
+  } else if (probing && probe_active_) {
+    bool congested = (usage == BandwidthUsage::kOveruse) ||
+                     (accumulated_delay_ > kProbeAbortDelayMs) ||
+                     (loss_based_bitrate_kbps_ < probe_floor_kbps_ / 2);
+    if (congested) {
+      prober_.OnProbeResult(delay_based_bitrate_kbps_, /*success=*/false);
+      probe_active_ = false;
+    } else if (now_ms - probe_started_ms_ > kProbeEvalWindowMs) {
+      prober_.OnProbeResult(prober_.GetEffectiveBitrateKbps(), /*success=*/true);
+      probe_active_ = false;
+    }
+  } else if (!probing) {
+    probe_active_ = false;
+  }
 
   target_bitrate_kbps_ = ComputeFinalBitrate();
 
@@ -118,18 +162,11 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
 void GccController::OnLossReport(const LossReport& report) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  int lost = static_cast<int>(report.packets.size());
-  packets_lost_since_last_loss_update_ += lost;
+  // Just accumulate lost packets; the periodic MaybeUpdateLossRate (driven
+  // from the feedback path) recomputes the loss fraction over the window.
+  packets_lost_since_last_loss_update_ += static_cast<int>(report.packets.size());
 
-  // Update loss-based rate when we have enough data
-  if (packets_sent_since_last_loss_update_ >= kLossUpdateWindowSize) {
-    double loss_fraction = static_cast<double>(packets_lost_since_last_loss_update_) /
-        packets_sent_since_last_loss_update_;
-    UpdateLossBasedRate(loss_fraction);
-    packets_sent_since_last_loss_update_ = 0;
-    packets_lost_since_last_loss_update_ = 0;
-  }
-
+  MaybeUpdateLossRate(NowMs());
   target_bitrate_kbps_ = ComputeFinalBitrate();
 }
 
@@ -138,11 +175,31 @@ void GccController::OnPacketsSent(int count) {
   packets_sent_since_last_loss_update_ += count;
 }
 
+void GccController::MaybeUpdateLossRate(int64_t now_ms) {
+  // Re-evaluate loss-based estimate at most every kLossUpdateIntervalMs, once
+  // we have observed at least kLossUpdateMinPackets sends in the window.
+  if (now_ms - last_loss_update_ms_ < kLossUpdateIntervalMs) {
+    return;
+  }
+  if (packets_sent_since_last_loss_update_ < kLossUpdateMinPackets) {
+    return;
+  }
+
+  double loss_fraction = static_cast<double>(packets_lost_since_last_loss_update_) /
+      packets_sent_since_last_loss_update_;
+  UpdateLossBasedRate(loss_fraction);
+
+  last_loss_update_ms_ = now_ms;
+  packets_sent_since_last_loss_update_ = 0;
+  packets_lost_since_last_loss_update_ = 0;
+}
+
 void GccController::SetClockForTesting(int64_t* clock_ms) {
   fake_clock_ms_ = clock_ms;
   if (clock_ms) {
     last_threshold_update_ms_ = *clock_ms;
     last_increase_time_ms_ = *clock_ms;
+    last_loss_update_ms_ = *clock_ms;
     last_overuse_time_ms_ = *clock_ms - 2000;  // allow immediate probing in tests
   }
 }
@@ -183,13 +240,17 @@ void GccController::UpdateTrendline(const TransportFeedback& feedback) {
     // Accumulate delay in ms
     accumulated_delay_ += delay_delta_ms;
 
-    // Smooth for noise reduction (used for logging/debug, not regression)
+    // EWMA-smooth the accumulated delay (WebRTC smoothing_coef_ = 0.9). The
+    // smoothed value is what feeds the regression window — it suppresses the
+    // per-packet scheduling jitter that would otherwise produce spurious
+    // positive slopes (false overuse) on an uncongested link. Under real
+    // congestion the accumulated delay grows monotonically, so the smoothed
+    // signal still tracks it and the slope goes clearly positive.
     smoothed_delay_ = kTrendlineSmoothingCoeff * smoothed_delay_ +
                       (1.0 - kTrendlineSmoothingCoeff) * accumulated_delay_;
 
-    // Add to regression window using accumulated_delay
     double time_since_first_ms = (arrival_us - first_arrival_ms_) / 1000.0;
-    trendline_window_.push_back({accumulated_delay_, time_since_first_ms});
+    trendline_window_.push_back({smoothed_delay_, time_since_first_ms});
     if (static_cast<int>(trendline_window_.size()) > kTrendlineWindowSize) {
       trendline_window_.pop_front();
     }
@@ -239,22 +300,37 @@ GccController::BandwidthUsage GccController::Detect(double trendline_slope) {
     modified_trend *= static_cast<double>(num_deltas_) / 10.0;
   }
 
+  int64_t dt_ms = (last_detect_ms_ == 0) ? 0 : (now_ms - last_detect_ms_);
+  last_detect_ms_ = now_ms;
+
+  BandwidthUsage result = BandwidthUsage::kNormal;
+
   if (modified_trend > adaptive_threshold_) {
+    // Accumulate the time spent over-using. Only declare overuse once that
+    // time exceeds kOverusingTimeThresholdMs AND the trend is not shrinking
+    // (WebRTC OveruseDetector). This rejects isolated noise spikes.
+    time_over_using_ms_ += static_cast<double>(dt_ms);
     overuse_counter_++;
-    UpdateAdaptiveThreshold(modified_trend, now_ms);
-    if (overuse_counter_ >= kOveruseCountThreshold) {
-      return BandwidthUsage::kOveruse;
+    if (time_over_using_ms_ > kOverusingTimeThresholdMs &&
+        overuse_counter_ >= kOveruseCountThreshold &&
+        modified_trend >= prev_modified_trend_) {
+      time_over_using_ms_ = 0.0;
+      overuse_counter_ = 0;
+      result = BandwidthUsage::kOveruse;
     }
-    return BandwidthUsage::kNormal;
   } else if (modified_trend < -adaptive_threshold_) {
+    time_over_using_ms_ = 0.0;
     overuse_counter_ = 0;
-    UpdateAdaptiveThreshold(modified_trend, now_ms);
-    return BandwidthUsage::kUnderuse;
+    result = BandwidthUsage::kUnderuse;
   } else {
+    time_over_using_ms_ = 0.0;
     overuse_counter_ = 0;
-    UpdateAdaptiveThreshold(modified_trend, now_ms);
-    return BandwidthUsage::kNormal;
+    result = BandwidthUsage::kNormal;
   }
+
+  prev_modified_trend_ = modified_trend;
+  UpdateAdaptiveThreshold(modified_trend, now_ms);
+  return result;
 }
 
 void GccController::UpdateAdaptiveThreshold(double modified_trend, int64_t now_ms) {
@@ -322,9 +398,12 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
 
 void GccController::UpdateLossBasedRate(double loss_fraction) {
   if (loss_fraction < kLossIncreaseThreshold) {
-    // < 2% loss: can increase (additive, same rate as delay-based)
+    // < 2% loss: increase. Called every ~kLossUpdateIntervalMs (0.5s), so
+    // grow ~8%/s → ~4% per update. This lets loss_based track upward toward
+    // the true capacity instead of staying pinned at the initial estimate.
     int increase_kbps = std::max(
-        static_cast<int>(loss_based_bitrate_kbps_ * kIncreaseRatePerSecond * 0.2),
+        static_cast<int>(loss_based_bitrate_kbps_ * kIncreaseRatePerSecond *
+                         (kLossUpdateIntervalMs / 1000.0)),
         kMinIncreaseKbps);
     loss_based_bitrate_kbps_ += increase_kbps;
     loss_based_bitrate_kbps_ = std::min(loss_based_bitrate_kbps_, max_bitrate_kbps_);
@@ -343,13 +422,14 @@ void GccController::UpdateLossBasedRate(double loss_fraction) {
 
 int GccController::ComputeFinalBitrate() const {
   int base_kbps = std::min(delay_based_bitrate_kbps_, loss_based_bitrate_kbps_);
-  // Only let prober override when actively probing
+  // Always consult the prober so it can advance its state machine (initiate
+  // probes when idle, run/finish active probes). When it is probing, its
+  // effective rate may exceed the base estimate to actively test for headroom.
   auto& prober_ref = const_cast<BandwidthProber&>(prober_);
-  if (prober_ref.GetState() != BandwidthProber::State::kIdle) {
-    int probe_kbps = prober_ref.GetEffectiveBitrateKbps();
-    if (probe_kbps > base_kbps) {
-      base_kbps = probe_kbps;
-    }
+  int probe_kbps = prober_ref.GetEffectiveBitrateKbps();
+  if (prober_ref.GetState() != BandwidthProber::State::kIdle &&
+      probe_kbps > base_kbps) {
+    base_kbps = probe_kbps;
   }
   return std::clamp(base_kbps, min_bitrate_kbps_, max_bitrate_kbps_);
 }

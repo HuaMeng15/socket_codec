@@ -90,15 +90,29 @@ def main():
         print("No data to plot", file=sys.stderr)
         sys.exit(1)
     t0 = min(all_ts)
+    t_end = max(all_ts) - t0
 
-    # Build link-capacity step function over time
+    # Build link-capacity step function over time. Start at t=0 with the
+    # initial bandwidth (or the first scheduled value), apply each scheduled
+    # step at its time, and extend the final level out to t_end so the last
+    # segment is drawn as a horizontal line (not a single point).
     cap_t, cap_v = [], []
     if init_bw is not None:
         cap_t.append(0.0)
         cap_v.append(init_bw)
     for s in sched:
-        cap_t.append(s["ts"] - t0)
-        cap_v.append(s["kbps"])
+        st = s["ts"] - t0
+        # Avoid a duplicate point at t=0 (schedule's first step often coincides
+        # with the initial bandwidth) which would collapse into a vertical line.
+        if cap_t and abs(st - cap_t[-1]) < 1e-6:
+            cap_v[-1] = s["kbps"]
+        else:
+            cap_t.append(st)
+            cap_v.append(s["kbps"])
+    # Extend the last level to the end of the run.
+    if cap_t and cap_t[-1] < t_end:
+        cap_t.append(t_end)
+        cap_v.append(cap_v[-1])
 
     # Achieved send bitrate: sliding window over frames (kbps)
     # group sends into ~0.5s bins

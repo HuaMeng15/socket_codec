@@ -85,9 +85,9 @@ void FeedbackCollector::SendTransportFeedback() {
     records[i].packet_index = entry.packet_index;
     records[i].padding = 0;
 
-    auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
+    auto delta = std::chrono::duration_cast<std::chrono::microseconds>(
         entry.arrival_time - epoch_);
-    records[i].arrival_time_ms = htonl(static_cast<int32_t>(delta.count()));
+    records[i].arrival_time_us = htonl(static_cast<int32_t>(delta.count()));
   }
 
   send_cb_(buffer.data(), buffer.size());

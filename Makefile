@@ -107,14 +107,19 @@ UNIT_TEST_OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(UNIT_TEST_SRCS)) \
 $(UNIT_TEST_TARGET): $(UNIT_TEST_OBJS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(GTEST_INCLUDE) -o $@ $^ $(GTEST_LDFLAGS) $(GTEST_LDLIBS)
 
-# Pattern rules: test sources need gtest includes, placed before generic rule
+# Pattern rules: test sources need gtest includes, placed before generic rule.
+# -MMD -MP generates .d dependency files so objects rebuild when headers change
+# (prevents stale-object ABI mismatches after editing a header).
 $(BUILD_DIR)/tests/%.o: tests/%.cc
 	mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(GTEST_INCLUDE) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(GTEST_INCLUDE) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cc
 	mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -MMD -MP -c $< -o $@
+
+# Include all generated dependency files.
+-include $(shell find $(BUILD_DIR) -name '*.d' 2>/dev/null)
 
 clean:
 	rm -rf $(BUILD_DIR)

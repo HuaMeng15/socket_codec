@@ -36,7 +36,11 @@ struct PacketArrivalRecord {
   uint16_t frame_sequence;   // Frame this packet belongs to
   uint8_t packet_index;      // Packet index within frame
   uint8_t padding;
-  int32_t arrival_time_ms;   // Arrival time relative to first packet in this batch (ms)
+  int32_t arrival_time_us;   // Arrival time relative to the receiver's epoch,
+                             // in microseconds (int32 → ±~35 min range).
+                             // Microsecond resolution avoids the quantization
+                             // noise that ms rounding injected into the
+                             // delay-based trendline at high bitrates.
 };
 
 // Per-packet loss record in LossReport

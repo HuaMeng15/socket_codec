@@ -133,7 +133,7 @@ TEST(TransportFeedbackTest, FeedbackHandlerDistinguishesMessageTypes) {
     auto* r = reinterpret_cast<PacketArrivalRecord*>(buf.data() + sizeof(FeedbackMessageHeader));
     r->frame_sequence = htons(1);
     r->packet_index = 0;
-    r->arrival_time_ms = htonl(0);
+    r->arrival_time_us = htonl(0);
     handler.HandlePacketMessage(buf.data(), buf.size());
   }
 

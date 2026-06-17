@@ -84,6 +84,10 @@ class GccController : public CongestionController {
   // --- Rate controller ---
   void UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms);
   void UpdateLossBasedRate(double loss_fraction);
+  // Periodically (time-based) recompute the loss-based estimate over the
+  // accumulated window. Called from the feedback path so the estimate tracks
+  // upward when loss is low and downward when loss is high.
+  void MaybeUpdateLossRate(int64_t now_ms);
   int ComputeFinalBitrate() const;
 
   mutable std::mutex mutex_;
@@ -112,10 +116,17 @@ class GccController : public CongestionController {
   static constexpr double kThresholdUp = 0.0087;    // ~k_u in WebRTC
   static constexpr double kThresholdDown = 0.039;   // ~k_d in WebRTC
 
-  // Overuse detection
+  // Overuse detection (WebRTC OveruseDetector). Overuse is only signaled when
+  // the modified trend stays above threshold for a sustained time
+  // (kOverusingTimeThresholdMs) AND the trend is not decreasing — this rejects
+  // brief noise spikes that would otherwise cap the rate on an idle link.
   int overuse_counter_;
   static constexpr int kOveruseCountThreshold = 3;
   int64_t last_overuse_time_ms_;
+  double time_over_using_ms_;     // accumulated time spent above threshold
+  double prev_modified_trend_;    // previous modified trend (monotonicity guard)
+  int64_t last_detect_ms_;        // timestamp of previous Detect() call
+  static constexpr double kOverusingTimeThresholdMs = 100.0;
 
   // Delay-based rate control
   int delay_based_bitrate_kbps_;
@@ -132,10 +143,16 @@ class GccController : public CongestionController {
   static constexpr double kLossHoldThreshold = 0.10;       // < 10%: hold
   // >= 10%: decrease by (1 - 0.5 * loss_fraction)
 
-  // Loss tracking: separate sent and lost counters for accurate fraction
+  // Loss tracking: separate sent and lost counters for accurate fraction.
+  // The loss-based estimate is re-evaluated periodically (every
+  // kLossUpdateIntervalMs) over the accumulated window, so it can INCREASE
+  // during loss-free periods (matching WebRTC's periodic update), not only
+  // decrease when a loss report happens to arrive.
   int packets_sent_since_last_loss_update_;
   int packets_lost_since_last_loss_update_;
-  static constexpr int kLossUpdateWindowSize = 20;
+  int64_t last_loss_update_ms_;
+  static constexpr int kLossUpdateIntervalMs = 500;
+  static constexpr int kLossUpdateMinPackets = 20;
 
   // Final rate
   int target_bitrate_kbps_;
@@ -144,6 +161,14 @@ class GccController : public CongestionController {
 
   // Bandwidth probing
   BandwidthProber prober_;
+  // Probe resolution bookkeeping (GCC side). When a probe is in progress we
+  // track when it started and a "floor" (loss estimate just before the probe)
+  // so we can abort if the probe rate induces congestion.
+  bool probe_active_;
+  int64_t probe_started_ms_;
+  int probe_floor_kbps_;
+  static constexpr double kProbeAbortDelayMs = 80.0;  // abort if queue grows past this
+  static constexpr int kProbeEvalWindowMs = 1000;     // commit after this if clean
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;
