@@ -75,10 +75,39 @@ def main():
         r"\[" + _TS + r"\].*\[DataSender\] Sending frame (\d+) size=(\d+) bytes"
     )
     sends = []
+    send_ts_by_frame = {}
     for m in re_send.finditer(text):
-        sends.append({"ts": parse_ts(m.group(1)),
-                      "frame": int(m.group(2)),
-                      "bytes": int(m.group(3))})
+        ts = parse_ts(m.group(1))
+        frame = int(m.group(2))
+        sends.append({"ts": ts, "frame": frame, "bytes": int(m.group(3))})
+        # First time we see this frame's send (the send-start timestamp).
+        send_ts_by_frame.setdefault(frame, ts)
+
+    # Real one-way latency from the receiver log: for each frame, the time the
+    # last packet completed it (decode), minus the frame's send time. Sender and
+    # receiver share the wall clock (localhost / same host), so this is a true
+    # latency — not the trendline's accumulated delay-variation signal.
+    recv_log = result_dir / "recv.log"
+    latency_pts = []  # (send_ts, latency_ms)
+    if recv_log.exists():
+        rtext = recv_log.read_text()
+        re_decode = re.compile(
+            r"\[" + _TS + r"\].*Successfully decoded frame (\d+)")
+        # Fallback: last received packet for a frame, if no decode line.
+        re_rpkt = re.compile(
+            r"\[" + _TS + r"\].*Received packet \d+ for frame (\d+)")
+        recv_done = {}
+        for m in re_decode.finditer(rtext):
+            recv_done[int(m.group(2))] = parse_ts(m.group(1))
+        if not recv_done:
+            for m in re_rpkt.finditer(rtext):
+                # keep the latest timestamp seen per frame
+                recv_done[int(m.group(2))] = parse_ts(m.group(1))
+        for frame, rts in recv_done.items():
+            sts = send_ts_by_frame.get(frame)
+            if sts is not None:
+                latency_pts.append((sts, (rts - sts) * 1000.0))
+        latency_pts.sort()
 
     if not gcc_rows:
         print("No [GCC_STATE] lines found — did the run receive feedback?",
@@ -176,19 +205,21 @@ def main():
     ax1.legend(loc="upper right")
     ax1.grid(True, alpha=0.3)
 
-    # Panel 2: queuing delay (integrated trendline signal)
-    if gcc_rows:
-        ax2.plot(gt, [r["queuing_delay"] for r in gcc_rows],
-                 label="Queuing delay (accumulated)", color="C5")
-        # Mark overuse events
+    # Panel 2: real per-frame one-way latency (recv_done - send), from logs.
+    if latency_pts:
+        lt = [(ts - t0) for ts, _ in latency_pts]
+        lv = [lat for _, lat in latency_pts]
+        ax2.plot(lt, lv, label="Frame latency (recv - send)", color="C5")
+        # Mark overuse events from the GCC state stream.
         ovr_t = [r["ts"] - t0 for r in gcc_rows if r["usage"] == "overuse"]
         for t in ovr_t:
             ax2.axvline(t, color="red", alpha=0.1)
-    ax2.set_ylabel("Queuing delay (ms)")
+    ax2.set_ylabel("Latency (ms)")
     ax2.set_xlabel("Time (s)")
-    ax2.set_title("Integrated queuing delay (red lines = overuse events)")
+    ax2.set_title("Real one-way frame latency (red lines = overuse events)")
     ax2.legend(loc="upper right")
     ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(bottom=0)
 
     fig.tight_layout()
     out = fig_dir / "gcc_behavior.png"
