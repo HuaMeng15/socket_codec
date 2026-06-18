@@ -143,8 +143,11 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
 
   // Set up GCC congestion controller
   GccController gcc;
-  gcc.SetInitialBitrate(500);  // Start at 500 kbps; ramp/probe up to capacity
-  gcc.SetBitrateRange(200, 20000);
+  int cc_initial = parser.GetFlag<int>("cc_initial_bitrate_kbps");
+  int cc_min = parser.GetFlag<int>("cc_min_bitrate_kbps");
+  int cc_max = parser.GetFlag<int>("cc_max_bitrate_kbps");
+  gcc.SetBitrateRange(cc_min, cc_max);
+  gcc.SetInitialBitrate(cc_initial);  // ramp/probe up to capacity
 
   // Wire actual sent packet count from DataSender into GCC
   DataSender* data_sender_ptr = video_capture_and_send.GetDataSender();

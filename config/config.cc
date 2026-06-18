@@ -41,4 +41,13 @@ void InitializeFlags() {
   parser.AddStringFlag("sim_bandwidth_schedule", "",
                        "time-based bandwidth steps as 't_sec:kbps,...' "
                        "e.g. '0:10000,10:1000' (overrides sim_bandwidth_kbps)");
+
+  // GCC congestion controller bitrate bounds (kbps)
+  parser.AddIntFlag("cc_initial_bitrate_kbps", 500,
+                    "initial GCC target bitrate in kbps (ramps/probes up)");
+  parser.AddIntFlag("cc_min_bitrate_kbps", 200,
+                    "minimum GCC target bitrate in kbps (floor)");
+  parser.AddIntFlag("cc_max_bitrate_kbps", 20000,
+                    "maximum GCC target bitrate in kbps (ceiling; also caps "
+                    "probe targets)");
 }
