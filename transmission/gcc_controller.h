@@ -179,14 +179,23 @@ class GccController : public CongestionController {
 
   // Bandwidth probing
   BandwidthProber prober_;
-  // Probe resolution bookkeeping (GCC side). When a probe is in progress we
-  // track when it started and a "floor" (loss estimate just before the probe)
-  // so we can abort if the probe rate induces congestion.
+  // Probe resolution bookkeeping (GCC side). WebRTC's ProbeBitrateEstimator
+  // commits a probe the moment it has a *received-rate* sample for the probe
+  // traffic — it does not wait a fixed time. We mirror that: on the first
+  // feedback batch after a probe starts we measure the batch's received rate
+  // and commit immediately. The received rate is self-limiting (if the probe
+  // exceeds capacity, packets queue and arrive at the bottleneck rate), so we
+  // commit measured capacity rather than the over-target send rate — which is
+  // exactly what avoids overshoot and converges fast.
   bool probe_active_;
-  int64_t probe_started_ms_;
   int probe_floor_kbps_;
+  // Per-batch received rate from the most recent feedback (kbps), the raw
+  // (un-smoothed) sample used to resolve a probe. 0 if not yet measured.
+  double last_received_rate_kbps_;
+  // WebRTC kTargetUtilizationFraction: when the link is saturated by the probe,
+  // commit slightly below the measured receive rate to avoid immediate overuse.
+  static constexpr double kProbeUtilizationFraction = 0.95;
   static constexpr double kProbeAbortDelayMs = 80.0;  // abort if queue grows past this
-  static constexpr int kProbeEvalWindowMs = 300;      // resolve probe after this
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;

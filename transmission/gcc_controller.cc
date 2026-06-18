@@ -38,8 +38,8 @@ GccController::GccController()
       min_bitrate_kbps_(100),
       max_bitrate_kbps_(30000),
       probe_active_(false),
-      probe_started_ms_(0),
       probe_floor_kbps_(0),
+      last_received_rate_kbps_(0.0),
       fake_clock_ms_(nullptr) {
   last_threshold_update_ms_ = NowMs();
   last_increase_time_ms_ = NowMs();
@@ -114,40 +114,49 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   }
   prober_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
 
-  // --- Probe lifecycle management ---
-  // The prober raises the send rate to test for headroom; we must resolve the
-  // probe. Detect a freshly-started probe, then on each subsequent feedback
-  // decide: ABORT if the elevated rate induced congestion (overuse, queue
-  // growth past kProbeAbortDelayMs, or loss-based estimate collapsing below
-  // the pre-probe floor); COMMIT if the eval window elapsed with delay low.
+  // --- Probe lifecycle management (WebRTC ProbeBitrateEstimator semantics) ---
+  // The prober raises the send rate to test for headroom. WebRTC resolves a
+  // probe the moment it has a received-rate sample for the probe traffic — it
+  // does NOT wait a fixed time window. We mirror that: the first feedback batch
+  // after a probe starts carries the probe traffic's received rate, so we
+  // commit immediately from that measurement.
+  //
+  // The received rate is self-limiting: if the probe target exceeds capacity,
+  // those packets queue at the bottleneck and arrive at ~capacity, so we
+  // measure capacity directly and commit to it — never to the over-target send
+  // rate. This is what avoids overshoot and converges quickly.
   bool probing = prober_.GetState() == BandwidthProber::State::kProbing ||
                  prober_.GetState() == BandwidthProber::State::kWaitingForResult;
   if (probing && !probe_active_) {
-    // New probe just started — snapshot start time and floor.
+    // New probe just started — snapshot the floor and reset the delay
+    // integrator so the probe's effect is measured fresh. We do NOT commit on
+    // this batch: the probe traffic hasn't been acknowledged yet.
     probe_active_ = true;
-    probe_started_ms_ = now_ms;
     probe_floor_kbps_ = loss_based_bitrate_kbps_;
-    // Reset the queue-delay integrator so the probe's effect is measured fresh.
     accumulated_delay_ = 0.0;
     smoothed_delay_ = 0.0;
   } else if (probing && probe_active_) {
+    // Abort if the elevated rate already induced congestion.
     bool congested = (usage == BandwidthUsage::kOveruse) ||
                      (accumulated_delay_ > kProbeAbortDelayMs) ||
                      (loss_based_bitrate_kbps_ < probe_floor_kbps_ / 2);
     if (congested) {
       prober_.OnProbeResult(delay_based_bitrate_kbps_, /*success=*/false);
       probe_active_ = false;
-    } else if (now_ms - probe_started_ms_ > kProbeEvalWindowMs) {
-      // Probe window elapsed. The probe's true result is the throughput that
-      // actually got through at the elevated rate (WebRTC ProbeBitrateEstimator
-      // measures received rate, not the send rate). If the link couldn't carry
-      // the probe rate, acked < probe_target and we commit only the measured
-      // capacity — this prevents "succeeding" at an over-capacity send rate.
+    } else if (last_received_rate_kbps_ > 0.0) {
+      // We have a received-rate sample for the probe traffic — resolve now.
       int probe_target = prober_.GetEffectiveBitrateKbps();
-      int measured = (acked_bitrate_kbps_ > 0)
-                         ? static_cast<int>(acked_bitrate_kbps_)
-                         : probe_target;
-      int probed = std::min(probe_target, measured);
+      int received = static_cast<int>(last_received_rate_kbps_);
+      // WebRTC commits min(send_rate, receive_rate); the probe target bounds the
+      // send rate, so the result is min(target, received). When the link is
+      // saturated (received well below the probe target), back off to
+      // kProbeUtilizationFraction × received to avoid immediate overuse.
+      int probed;
+      if (received < probe_target) {
+        probed = static_cast<int>(kProbeUtilizationFraction * received);
+      } else {
+        probed = probe_target;
+      }
       bool real_gain = probed > delay_based_bitrate_kbps_;
       prober_.OnProbeResult(probed, /*success=*/real_gain);
       probe_active_ = false;
@@ -219,6 +228,9 @@ void GccController::MaybeUpdateLossRate(int64_t now_ms) {
 
 void GccController::SetClockForTesting(int64_t* clock_ms) {
   fake_clock_ms_ = clock_ms;
+  // Forward the same fake clock to the embedded prober, otherwise it reads the
+  // real steady_clock and its inter-probe timing gates fight the fake clock.
+  prober_.SetClockForTesting(clock_ms);
   if (clock_ms) {
     last_threshold_update_ms_ = *clock_ms;
     last_increase_time_ms_ = *clock_ms;
@@ -236,7 +248,10 @@ void GccController::SetClockForTesting(int64_t* clock_ms) {
 // (<= 1.5x acked) and to snap the decrease to measured throughput.
 void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
   if (acked_frozen_for_testing_) {
-    return;  // unit tests pin the acked estimate
+    // Tests pin the smoothed acked estimate; mirror it as the raw per-batch
+    // received-rate sample so probe-commit logic is exercisable in unit tests.
+    last_received_rate_kbps_ = acked_bitrate_kbps_;
+    return;
   }
   if (feedback.packets.size() < 2) {
     return;
@@ -252,6 +267,10 @@ void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
   double bytes = (feedback.packets.size() - 1) *
                  static_cast<double>(kPayloadBytesPerPacket);
   double sample_kbps = bytes * 8.0 / 1000.0 / span_s;
+
+  // Keep the raw per-batch sample for probe resolution (WebRTC resolves probes
+  // from the measured received rate, not the EWMA-smoothed estimate).
+  last_received_rate_kbps_ = sample_kbps;
 
   if (acked_bitrate_kbps_ <= 0.0) {
     acked_bitrate_kbps_ = sample_kbps;

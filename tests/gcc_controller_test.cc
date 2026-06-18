@@ -161,8 +161,10 @@ TEST_F(GccControllerTest, StartupWarmupPreventsEarlyOveruse) {
   auto fb = MakeFeedback(send, arrival, 5, 1000, 2000);  // 2x arrival spacing
   gcc.OnTransportFeedback(fb);
 
-  // With only ~4 deltas, scaling reduces modified_trend significantly
-  EXPECT_EQ(gcc.GetTargetBitrateKbps(), 5000);
+  // With only ~4 deltas, scaling reduces modified_trend significantly, so no
+  // overuse fires. Assert on the delay-based component (the startup prober may
+  // raise the combined target independently of overuse detection).
+  EXPECT_EQ(gcc.GetDelayBasedBitrateKbps(), 5000);
   EXPECT_EQ(gcc.GetOveruseCounter(), 0);
 }
 
@@ -257,14 +259,14 @@ TEST_F(GccControllerTest, LossBelow2PercentAllowsIncrease) {
   AdvanceMs(600);  // pass the periodic loss-update interval (500ms)
   gcc.OnLossReport(report);
 
-  // After update: loss = 1/100 = 1% < 2% → increase allowed
-  // The loss_based_bitrate should have increased
-  // Combined with delay_based (both start at 5000), target should be >= 5000
-  EXPECT_GE(gcc.GetTargetBitrateKbps(), 5000);
+  // After update: loss = 1/100 = 1% < 2% → loss-based tracks delay-based.
+  // Assert on the loss-based component (the combined target may be raised by
+  // the startup prober independently of the loss path).
+  EXPECT_GE(gcc.GetLossBasedBitrateKbps(), 5000);
 }
 
 TEST_F(GccControllerTest, LossBetween2And10PercentHolds) {
-  int initial = gcc.GetTargetBitrateKbps();
+  int initial = gcc.GetLossBasedBitrateKbps();
 
   // Simulate 5% loss: 5 lost out of 100 sent
   gcc.OnPacketsSent(100);
@@ -275,12 +277,12 @@ TEST_F(GccControllerTest, LossBetween2And10PercentHolds) {
   AdvanceMs(600);
   gcc.OnLossReport(report);
 
-  // 5% is in hold range [2%, 10%): no change
-  EXPECT_EQ(gcc.GetTargetBitrateKbps(), initial);
+  // 5% is in hold range [2%, 10%): loss-based unchanged.
+  EXPECT_EQ(gcc.GetLossBasedBitrateKbps(), initial);
 }
 
 TEST_F(GccControllerTest, LossAbove10PercentDecreases) {
-  int initial = gcc.GetTargetBitrateKbps();
+  int initial = gcc.GetLossBasedBitrateKbps();
 
   // Simulate 20% loss: 20 lost out of 100 sent
   gcc.OnPacketsSent(100);
@@ -292,7 +294,7 @@ TEST_F(GccControllerTest, LossAbove10PercentDecreases) {
   gcc.OnLossReport(report);
 
   // 20% loss → factor = 1 - 0.5*0.2 = 0.9 → ~4500 kbps
-  int after = gcc.GetTargetBitrateKbps();
+  int after = gcc.GetLossBasedBitrateKbps();
   EXPECT_LT(after, initial);
   EXPECT_GE(after, 4400);
   EXPECT_LE(after, 4600);
@@ -308,7 +310,7 @@ TEST_F(GccControllerTest, HighLossDecreasesProportionally) {
   AdvanceMs(600);
   gcc.OnLossReport(report);
 
-  int after = gcc.GetTargetBitrateKbps();
+  int after = gcc.GetLossBasedBitrateKbps();
   // 5000 * 0.75 = 3750
   EXPECT_GE(after, 3600);
   EXPECT_LE(after, 3900);
@@ -352,4 +354,41 @@ TEST_F(GccControllerTest, MinBitrateIsRespected) {
   FeedOveruse(100, send, arrival, 5000);
 
   EXPECT_GE(gcc.GetTargetBitrateKbps(), 500);
+}
+
+// --- Probe resolution (WebRTC: commit from received rate, no fixed window) ---
+
+TEST_F(GccControllerTest, ProbeCommitsFromReceivedRateWithoutWaiting) {
+  gcc.SetInitialBitrate(1000);
+  gcc.SetBitrateRange(100, 30000);
+  // Received rate well above the probe target → the link can carry the probe,
+  // so it should commit at the full probe target (3x = 3000).
+  gcc.SetAckedBitrateForTesting(30000);
+
+  int before = gcc.GetDelayBasedBitrateKbps();  // 1000
+
+  // Probe initiates on batch 1, registers on batch 2, commits on batch 3 —
+  // 3 batches × 33ms = 99ms, far under the old 300ms fixed window. The point:
+  // commit is event-driven (first received-rate sample), not time-driven.
+  int64_t send = 1000000, arrival = 1000000;
+  FeedStable(3, send, arrival);
+
+  EXPECT_GT(gcc.GetDelayBasedBitrateKbps(), before);
+}
+
+TEST_F(GccControllerTest, ProbeCommitsCapacityWhenLinkSaturated) {
+  gcc.SetInitialBitrate(1000);
+  gcc.SetBitrateRange(100, 30000);
+  // Received rate BELOW the 3x probe target (3000): the link is saturated by
+  // the probe. We should commit ~0.95 × received (≈ 1900), i.e. measured
+  // capacity backed off slightly — never the over-target 3000 send rate.
+  gcc.SetAckedBitrateForTesting(2000);
+
+  int64_t send = 1000000, arrival = 1000000;
+  FeedStable(3, send, arrival);
+
+  int committed = gcc.GetDelayBasedBitrateKbps();
+  EXPECT_GT(committed, 1000);   // a real gain over the start
+  EXPECT_LE(committed, 2000);   // capped at measured capacity, not 3000
+  EXPECT_GE(committed, 1800);   // ≈ 0.95 × 2000
 }
