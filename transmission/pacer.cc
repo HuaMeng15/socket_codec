@@ -3,9 +3,12 @@
 #include <chrono>
 #include <thread>
 
+#include "config/config.h"
 #include "log_system/log_system.h"
 
-static const int kDefaultBitrateKbps = 10000;
+// Startup default; overridden by SetTargetBitrate(cc_initial) before the first
+// packet. Aligned with the GCC/encoder startup rate.
+static const int kDefaultBitrateKbps = kDefaultInitialBitrateKbps;
 
 Pacer::Pacer()
     : bitrate_kbps_(kDefaultBitrateKbps) {}

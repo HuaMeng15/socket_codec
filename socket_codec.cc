@@ -159,6 +159,15 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
 
   Encoder* encoder_ptr = video_capture_and_send.GetEncoder();
   Pacer* pacer_ptr = video_capture_and_send.GetPacer();
+
+  // Align the encoder and pacer to the GCC initial target BEFORE the first
+  // frame is encoded. cc_initial is the single source of truth for the startup
+  // rate; without this the encoder/pacer use their own hardcoded defaults
+  // (much higher), so the first frames are oversized and stall in the pacer
+  // until the first feedback arrives — a large startup latency spike.
+  if (encoder_ptr) encoder_ptr->SetTargetBitrate(cc_initial);
+  if (pacer_ptr) pacer_ptr->SetTargetBitrate(cc_initial);
+
   feedback_handler.SetTransportFeedbackCallback(
       [&gcc, encoder_ptr, pacer_ptr](const TransportFeedback& fb) {
         gcc.OnTransportFeedback(fb);

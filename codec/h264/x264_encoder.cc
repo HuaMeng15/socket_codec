@@ -3,9 +3,12 @@
 #include <chrono>
 #include <cstring>
 
+#include "config/config.h"
 #include "log_system/log_system.h"
 
-static const int INITIAL_BITRATE = 10000;  // 10M
+// Startup default; overridden by SetTargetBitrate(cc_initial) before the first
+// frame. Aligned with the GCC/pacer startup rate.
+static const int INITIAL_BITRATE = kDefaultInitialBitrateKbps;
 static const int SLICE_MAX_SIZE = 0;
 static const double BANDWIDTH_UTILIZATION = 0.9;
 static const double VBV_NORMAL_RATIO = 0.5;   // normal: vbv_buffer = this * bitrate (kbits)

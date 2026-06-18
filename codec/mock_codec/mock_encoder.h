@@ -2,6 +2,7 @@
 #define CODEC_MOCK_ENCODER_H
 
 #include "../encoder.h"
+#include "config/config.h"
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -31,7 +32,9 @@ class MockEncoder : public Encoder {
   int target_bitrate_kbps_;
   size_t bytes_per_frame_;  // target_bitrate / (8 * fps)
 
-  static const int kDefaultTargetBitrateKbps = 9000;  // 9 Mbps
+  // Startup default; overridden by SetTargetBitrate(cc_initial) before the
+  // first frame. Aligned with the GCC/pacer startup rate.
+  static const int kDefaultTargetBitrateKbps = kDefaultInitialBitrateKbps;
 };
 
 #endif  // CODEC_MOCK_ENCODER_H

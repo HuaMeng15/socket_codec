@@ -43,7 +43,7 @@ void InitializeFlags() {
                        "e.g. '0:10000,10:1000' (overrides sim_bandwidth_kbps)");
 
   // GCC congestion controller bitrate bounds (kbps)
-  parser.AddIntFlag("cc_initial_bitrate_kbps", 500,
+  parser.AddIntFlag("cc_initial_bitrate_kbps", kDefaultInitialBitrateKbps,
                     "initial GCC target bitrate in kbps (ramps/probes up)");
   parser.AddIntFlag("cc_min_bitrate_kbps", 200,
                     "minimum GCC target bitrate in kbps (floor)");
