@@ -64,6 +64,13 @@ class BandwidthProber {
   /** Report overuse signal — cancels active probe. */
   void OnOveruseDetected();
 
+  /**
+   * Report underuse signal — the delay-based estimator sees the queue
+   * draining. Drop-recovery probing is only permitted shortly after underuse,
+   * so we never probe back into a still-congested link.
+   */
+  void OnUnderuseDetected();
+
   /** Report that application is below estimated rate (ALR condition). */
   void OnApplicationLimited();
 
@@ -112,6 +119,12 @@ class BandwidthProber {
   static constexpr double kBitrateDropThreshold = 0.66;
   static constexpr int kBitrateDropTimeoutMs = 5000;
   static constexpr double kProbeFractionAfterDrop = 0.85;
+  // Drop-recovery probing is only allowed within this window after an underuse
+  // signal (queue draining). Mirrors WebRTC's in_alr / alr_ended_recently gate
+  // in ProbeController::RequestProbe — probe only when the link is no longer
+  // congested, never straight back into a full queue.
+  int64_t last_underuse_time_ms_;
+  static constexpr int kUnderuseRecencyMs = 3000;
 
   // Current probe state
   int probe_target_kbps_;

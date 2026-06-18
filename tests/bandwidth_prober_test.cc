@@ -138,9 +138,26 @@ TEST_F(BandwidthProberTest, DropRecoveryProbe) {
   // Simulate drop: was 5000, now 1500 (< 0.66*5000=3300)
   prober.SetEstimatedBitrate(1500);
 
+  // The queue must be draining (underuse) before we dare probe back up —
+  // otherwise we'd re-probe into a still-congested link.
+  prober.OnUnderuseDetected();
+
   int rate = prober.GetEffectiveBitrateKbps();
   EXPECT_EQ(rate, 4250);  // 0.85 * 5000
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+}
+
+TEST_F(BandwidthProberTest, NoDropRecoveryProbeWhileStillCongested) {
+  prober.OnOveruseDetected();
+  AdvanceMs(1100);
+
+  // Bitrate dropped sharply, but no underuse signal — the link is still
+  // congested (queue not draining). Probing now would worsen congestion.
+  prober.SetEstimatedBitrate(1500);
+
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(rate, 1500);  // no probe — just track the estimate
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
 TEST_F(BandwidthProberTest, ProbeTimesOut) {

@@ -28,12 +28,16 @@ BandwidthProber::BandwidthProber()
       next_cluster_id_(0),
       probe_start_ms_(0),
       last_overuse_time_ms_(0),
+      last_underuse_time_ms_(0),
       fake_clock_ms_(nullptr) {
   int64_t now = NowMs();
   last_alr_probe_ms_ = now;
   bitrate_drop_time_ms_ = now;
   probe_start_ms_ = now;
   last_overuse_time_ms_ = now;
+  // Far enough in the past that drop-recovery is gated off until a real
+  // underuse signal arrives.
+  last_underuse_time_ms_ = now - kUnderuseRecencyMs - 1;
 }
 
 void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
@@ -44,6 +48,7 @@ void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
     bitrate_drop_time_ms_ = now;
     probe_start_ms_ = now;
     last_overuse_time_ms_ = now - 2000;  // allow probing immediately in tests
+    last_underuse_time_ms_ = now - kUnderuseRecencyMs - 1;  // gated off by default
   }
 }
 
@@ -150,6 +155,11 @@ void BandwidthProber::OnOveruseDetected() {
   }
 }
 
+void BandwidthProber::OnUnderuseDetected() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  last_underuse_time_ms_ = NowMs();
+}
+
 void BandwidthProber::OnApplicationLimited() {
   std::lock_guard<std::mutex> lock(mutex_);
   application_limited_ = true;
@@ -185,11 +195,19 @@ void BandwidthProber::MaybeInitiateProbe() {
     return;
   }
 
-  // 2. Bitrate drop recovery
+  // 2. Bitrate drop recovery — only if the queue is draining (recent underuse).
+  //    A bitrate drop is itself a congestion symptom; probing back up while the
+  //    link is still congested deepens the congestion. Require a recent
+  //    underuse signal, mirroring WebRTC's in_alr / alr_ended_recently gate.
   if (bitrate_drop_detected_) {
+    bool queue_draining =
+        now - last_underuse_time_ms_ < kUnderuseRecencyMs;
     if (now - bitrate_drop_time_ms_ < kBitrateDropTimeoutMs) {
-      InitiateDropRecoveryProbe();
-      return;
+      if (queue_draining) {
+        InitiateDropRecoveryProbe();
+        return;
+      }
+      // Still congested — hold the drop flag and wait for the link to drain.
     } else {
       bitrate_drop_detected_ = false;
     }

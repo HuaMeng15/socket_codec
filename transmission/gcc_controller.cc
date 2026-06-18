@@ -108,6 +108,9 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   // Feed signals to prober
   if (usage == BandwidthUsage::kOveruse) {
     prober_.OnOveruseDetected();
+  } else if (usage == BandwidthUsage::kUnderuse) {
+    // Queue draining — permits drop-recovery probing (see BandwidthProber).
+    prober_.OnUnderuseDetected();
   }
   prober_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
 
