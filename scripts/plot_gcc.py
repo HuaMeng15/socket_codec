@@ -144,21 +144,22 @@ def main():
         cap_t.append(t_end)
         cap_v.append(cap_v[-1])
 
-    # Achieved send bitrate: sliding window over frames (kbps)
-    # group sends into ~0.5s bins
+    # Achieved send bitrate, per frame: treat the mock encoder like a real one
+    # and translate each frame's encoded size into an instantaneous bitrate.
+    # rate = frame_bytes * 8 / frame_interval, where the interval is the time to
+    # the next frame's send (last frame reuses the previous interval).
     achieved_t, achieved_v = [], []
-    if sends:
-        bin_s = 0.5
-        bin_start = sends[0]["ts"]
-        acc_bytes = 0
-        for s in sends:
-            if s["ts"] - bin_start >= bin_s:
-                kbps = acc_bytes * 8 / 1000.0 / (s["ts"] - bin_start)
-                achieved_t.append(bin_start - t0)
-                achieved_v.append(kbps)
-                bin_start = s["ts"]
-                acc_bytes = 0
-            acc_bytes += s["bytes"]
+    if len(sends) >= 2:
+        for i, s in enumerate(sends):
+            if i + 1 < len(sends):
+                dt = sends[i + 1]["ts"] - s["ts"]
+            else:
+                dt = s["ts"] - sends[i - 1]["ts"]
+            if dt <= 0:
+                continue
+            kbps = s["bytes"] * 8 / 1000.0 / dt
+            achieved_t.append(s["ts"] - t0)
+            achieved_v.append(kbps)
 
     # Write CSV for reference
     csv_path = result_dir / "gcc_state.csv"
@@ -198,7 +199,7 @@ def main():
         ax1.plot(gt, [r["loss_based"] for r in gcc_rows], label="Loss-based",
                  color="C2", alpha=0.7)
     if achieved_t:
-        ax1.plot(achieved_t, achieved_v, label="Achieved send rate",
+        ax1.plot(achieved_t, achieved_v, label="Achieved send rate (per frame)",
                  color="C3", alpha=0.6, linestyle=":")
     ax1.set_ylabel("Bitrate (kbps)")
     ax1.set_title("GCC Congestion Control: Bitrate vs Link Capacity")

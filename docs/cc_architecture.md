@@ -421,7 +421,7 @@ raising the rate to test for headroom.
 | **GCC target** | `[GCC_STATE] target=` | The controller's final decision — what the encoder/pacer is told to use. This is `ComputeFinalBitrate()`. |
 | **Delay-based** | `[GCC_STATE] delay_based=` | The AIMD delay estimate alone (§3). |
 | **Loss-based** | `[GCC_STATE] loss_based=` | The loss estimate alone (§4). Sits on top of delay-based when loss is low. |
-| **Achieved send rate** | `[DataSender] Sending frame` bytes, binned ~0.5 s | The rate actually put on the wire. Compared against *GCC target* it shows how well the encoder tracked the command, and against *link capacity* it shows utilization. |
+| **Achieved send rate** | `[DataSender] Sending frame` bytes, per frame | The rate actually put on the wire: each frame's encoded size ÷ the interval to the next frame. Compared against *GCC target* it shows how well the encoder tracked the command, and against *link capacity* it shows utilization. The mock encoder targets the full allocation (no headroom factor), so this tracks the target closely. |
 
 A healthy run has GCC target tracking just under link capacity and achieved send
 rate hugging the target. Target above capacity with rising latency = overshoot

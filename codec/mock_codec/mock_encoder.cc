@@ -4,8 +4,6 @@
 
 #include "log_system/log_system.h"
 
-static const double BANDWIDTH_UTILIZATION = 0.8;
-
 MockEncoder::MockEncoder()
     : output_stream_(nullptr),
       initialized_(false),
@@ -53,8 +51,9 @@ void MockEncoder::SetTargetBitrate(int bitrate_kbps) {
   }
 
   target_bitrate_kbps_ = bitrate_kbps;
-  double bitrate = bitrate_kbps * BANDWIDTH_UTILIZATION;
-  bytes_per_frame_ = static_cast<size_t>(bitrate) * 1000 / (8 * fps_);
+  // A real encoder targets the full allocated bitrate; size frames to match it
+  // exactly (no headroom factor).
+  bytes_per_frame_ = static_cast<size_t>(target_bitrate_kbps_) * 1000 / (8 * fps_);
   if (bytes_per_frame_ == 0) bytes_per_frame_ = 1;
 
   LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps << " kbps"
