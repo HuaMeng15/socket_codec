@@ -90,6 +90,13 @@ class BandwidthProber {
   void InitiateAlrProbe();
   void InitiateDropRecoveryProbe();
   int ComputeProbeTarget() const;
+  // Cap a probe target so it can't exceed a sane multiple of the CURRENT
+  // estimate. After a capacity cliff (e.g. 10→1 Mbps) the drop-recovery probe
+  // would otherwise target 0.85× the stale pre-drop rate (≈9 Mbps) and flood
+  // the new 1 Mbps link. Bounding by current estimate keeps every probe
+  // proportional to what the link is actually carrying now.
+  int CapProbeTarget(int target_kbps) const;
+  static constexpr int kMaxProbeMultipleOfEstimate = 3;
 
   mutable std::mutex mutex_;
   State state_;

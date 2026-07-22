@@ -160,6 +160,14 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   Encoder* encoder_ptr = video_capture_and_send.GetEncoder();
   Pacer* pacer_ptr = video_capture_and_send.GetPacer();
 
+  // Apply pacer tuning from config. Note SetPacer() already started the pacer
+  // thread inside Initialize(); these setters are safe to call while it runs.
+  if (pacer_ptr) {
+    pacer_ptr->SetPaceMultiplier(
+        parser.GetFlag<int>("cc_pace_multiplier_x100") / 100.0);
+    pacer_ptr->SetBurstCapMs(parser.GetFlag<int>("cc_pace_burst_cap_ms"));
+  }
+
   // Align the encoder and pacer to the GCC initial target BEFORE the first
   // frame is encoded. cc_initial is the single source of truth for the startup
   // rate; without this the encoder/pacer use their own hardcoded defaults
@@ -173,14 +181,22 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
         gcc.OnTransportFeedback(fb);
         int target = gcc.GetTargetBitrateKbps();
         if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);
-        if (pacer_ptr) pacer_ptr->SetTargetBitrate(target);
+        if (pacer_ptr) {
+          pacer_ptr->SetTargetBitrate(target);
+          // Keep the pacer's probe state in sync so it fills idle time with
+          // padding while the prober tests for headroom.
+          pacer_ptr->SetProbing(gcc.IsProbing());
+        }
       });
   feedback_handler.SetLossReportCallback(
       [&gcc, encoder_ptr, pacer_ptr](const LossReport& report) {
         gcc.OnLossReport(report);
         int target = gcc.GetTargetBitrateKbps();
         if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);
-        if (pacer_ptr) pacer_ptr->SetTargetBitrate(target);
+        if (pacer_ptr) {
+          pacer_ptr->SetTargetBitrate(target);
+          pacer_ptr->SetProbing(gcc.IsProbing());
+        }
       });
 
   int feedback_port = dest_port + 1;

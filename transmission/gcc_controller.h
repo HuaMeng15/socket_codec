@@ -48,6 +48,14 @@ class GccController : public CongestionController {
   void SetInitialBitrate(int kbps);
 
   /**
+   * True while the bandwidth prober is actively probing (send rate elevated
+   * above the estimate to test for headroom). The pacer uses this to fill idle
+   * time with padding so the probe's measured received rate reflects true link
+   * capacity. Thread-safe.
+   */
+  bool IsProbing() const;
+
+  /**
    * Report total packets sent in a period. Call periodically so the loss
    * fraction can be computed correctly: loss_fraction = lost / sent.
    * Without this, OnLossReport can only approximate.
@@ -69,6 +77,12 @@ class GccController : public CongestionController {
   // Override the acknowledged-throughput estimate for deterministic
   // delay-based unit tests (decouples them from synthetic acked estimation).
   void SetAckedBitrateForTesting(double kbps);
+  // Read the current acknowledged-throughput estimate (the sliding-window
+  // measured received rate). Test-only.
+  double GetAckedBitrateKbpsForTesting() const;
+  // Re-enable the real sliding-window acked estimator after a prior
+  // SetAckedBitrateForTesting froze it. Resets the window. Test-only.
+  void EnableAckedEstimatorForTesting();
 
  private:
   int64_t NowMs() const;
@@ -85,7 +99,10 @@ class GccController : public CongestionController {
   double ComputeTrendlineSlope() const;
 
   // --- Overuse detector ---
-  BandwidthUsage Detect(double trendline_slope, double ts_delta_ms,
+  // elapsed_ms: real elapsed time since the previous sample (arrival-time
+  // delta), used to accumulate "time over using". Arrival deltas (not send
+  // deltas) so burst-paced sends don't collapse the overuse timer.
+  BandwidthUsage Detect(double trendline_slope, double elapsed_ms,
                         int64_t now_ms);
   void UpdateAdaptiveThreshold(double modified_trend, int64_t now_ms);
 
@@ -135,6 +152,7 @@ class GccController : public CongestionController {
   int64_t last_overuse_time_ms_;
   double time_over_using_ms_;     // accumulated time over threshold (-1 = reset)
   double prev_trend_;             // previous raw trendline slope
+  double last_modified_trend_ = 0.0;  // last modified_trend (for trace logging)
   static constexpr double kOverusingTimeThresholdMs = 10.0;  // WebRTC default
 
   // Delay-based rate control
@@ -148,12 +166,24 @@ class GccController : public CongestionController {
 
   // Acknowledged throughput estimate (WebRTC AimdRateControl uses this to cap
   // the increase at 1.5x and to snap the decrease to measured throughput).
-  // Estimated from feedback: total acked payload bytes over the arrival span.
+  // Measured from feedback as a sliding window of received bytes over time:
+  // rate = sum(recv_size over window) * 8 / window_span. A time window (vs a
+  // single feedback batch) is robust to bursty arrivals — a batch whose
+  // packets happen to land close together can't inflate the estimate past the
+  // true link rate, because the window span still reflects real elapsed time.
   void UpdateAckedBitrate(const TransportFeedback& feedback);
   double acked_bitrate_kbps_;
   bool acked_frozen_for_testing_ = false;  // pin acked in detector unit tests
-  static constexpr double kAckedSmoothingCoeff = 0.95;  // EWMA on acked rate
-  static constexpr int kPayloadBytesPerPacket = 1454;   // MTU payload estimate
+  // Sliding window of (arrival_time_us, recv_bytes) samples, keyed on the
+  // receiver-clock arrival offset carried in the feedback.
+  struct AckedSample {
+    int64_t arrival_us;
+    int bytes;
+  };
+  std::deque<AckedSample> acked_window_;
+  int64_t acked_window_bytes_ = 0;  // running sum of bytes in the window
+  static constexpr int64_t kAckedWindowUs = 1000000;  // 1s sliding window
+  static constexpr int kAckedMinSamples = 2;          // need ≥2 for a span
 
   // Loss-based rate control (WebRTC send_side_bandwidth_estimation)
   int loss_based_bitrate_kbps_;
@@ -179,23 +209,32 @@ class GccController : public CongestionController {
 
   // Bandwidth probing
   BandwidthProber prober_;
-  // Probe resolution bookkeeping (GCC side). WebRTC's ProbeBitrateEstimator
-  // commits a probe the moment it has a *received-rate* sample for the probe
-  // traffic — it does not wait a fixed time. We mirror that: on the first
-  // feedback batch after a probe starts we measure the batch's received rate
-  // and commit immediately. The received rate is self-limiting (if the probe
-  // exceeds capacity, packets queue and arrive at the bottleneck rate), so we
-  // commit measured capacity rather than the over-target send rate — which is
-  // exactly what avoids overshoot and converges fast.
+  // Probe resolution bookkeeping (GCC side), following WebRTC's
+  // ProbeBitrateEstimator: accumulate the probe traffic's received bytes and
+  // arrival span across feedback batches starting when the probe begins, and
+  // resolve once the accumulated span is long enough to be a trustworthy
+  // measurement. A *minimum span* guard is essential — a single batch whose
+  // packets arrive bunched (delivery jitter, scheduler coalescing, a burst
+  // racing ahead of the bottleneck) spans only microseconds and would report a
+  // rate many times the real capacity. Requiring a real span before committing
+  // makes the measured probe rate robust to that bunching.
   bool probe_active_;
   int probe_floor_kbps_;
-  // Per-batch received rate from the most recent feedback (kbps), the raw
-  // (un-smoothed) sample used to resolve a probe. 0 if not yet measured.
+  // Accumulated probe-traffic measurement since the probe started.
+  int64_t probe_first_arrival_us_;   // arrival of the first probe-window packet
+  int64_t probe_last_arrival_us_;    // arrival of the most recent packet
+  double probe_recv_bytes_;          // received bytes since the first (exclusive)
+  bool probe_first_seen_;            // have we recorded the first packet yet
+  // Per-batch received rate from the most recent feedback (kbps), kept for
+  // diagnostics. The probe now resolves from the accumulated measurement below.
   double last_received_rate_kbps_;
   // WebRTC kTargetUtilizationFraction: when the link is saturated by the probe,
   // commit slightly below the measured receive rate to avoid immediate overuse.
   static constexpr double kProbeUtilizationFraction = 0.95;
   static constexpr double kProbeAbortDelayMs = 80.0;  // abort if queue grows past this
+  // Minimum accumulated arrival span before a probe may commit. Below this, the
+  // measurement is dominated by bunching noise, not real throughput.
+  static constexpr int64_t kProbeMinSpanUs = 30000;  // 30 ms
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;

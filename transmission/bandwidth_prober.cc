@@ -122,9 +122,19 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
     LOG(INFO) << "[Prober] Probe succeeded: target=" << probe_target_kbps_
               << " estimated=" << estimated_kbps << " kbps";
 
+    // Continue the exponential chain as long as the measured rate keeps
+    // clearing the further-probe threshold and there is still headroom below
+    // the ceiling. This is NOT gated on initial_probing_done_ (matching
+    // WebRTC's SetEstimatedBitrate chain): the 3x/6x seed probes only bootstrap
+    // discovery; the chain that follows must keep doubling from each measured
+    // rate until the link saturates (ratio < threshold) or we approach max.
+    // Gating it on initial_probing_done_ was what capped convergence at the
+    // seed probes and forced the slow 8%/s AIMD ramp the rest of the way.
+    // (A low-ratio result here does NOT end initial probing: the sequential
+    // 6x seed in MaybeInitiateProbe still gets its turn — only an outright
+    // probe failure, handled below, stops the seeds.)
     double ratio = static_cast<double>(estimated_kbps) / probe_target_kbps_;
     if (ratio >= kFurtherProbeThreshold &&
-        !initial_probing_done_ &&
         estimated_kbps < max_bitrate_kbps_ * 0.95) {
       probe_target_kbps_ = std::min(
           estimated_kbps * kFurtherProbeMultiplier, max_bitrate_kbps_);
@@ -227,6 +237,8 @@ void BandwidthProber::InitiateExponentialProbe() {
       ? kFirstExponentialMultiplier
       : kSecondExponentialMultiplier;
 
+  // Exponential startup probes are already proportional to the current estimate
+  // (3×/6×) and chain via measured commits, so they self-limit — no extra cap.
   probe_target_kbps_ = std::min(
       estimated_bitrate_kbps_ * multiplier, max_bitrate_kbps_);
 
@@ -269,9 +281,13 @@ void BandwidthProber::InitiateAlrProbe() {
 }
 
 void BandwidthProber::InitiateDropRecoveryProbe() {
-  probe_target_kbps_ = std::min(
+  // Drop-recovery references the (stale) pre-drop rate, which after a true
+  // capacity cliff (10→1 Mbps) is far above the new capacity. Cap it by the
+  // current estimate so we don't flood the link probing back toward a rate it
+  // can no longer carry.
+  probe_target_kbps_ = CapProbeTarget(std::min(
       static_cast<int>(pre_drop_bitrate_kbps_ * kProbeFractionAfterDrop),
-      max_bitrate_kbps_);
+      max_bitrate_kbps_));
 
   if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
     bitrate_drop_detected_ = false;
@@ -286,4 +302,15 @@ void BandwidthProber::InitiateDropRecoveryProbe() {
   LOG(INFO) << "[Prober] Drop recovery probe at " << probe_target_kbps_
             << " kbps (pre-drop=" << pre_drop_bitrate_kbps_
             << ", current=" << estimated_bitrate_kbps_ << ")";
+}
+
+int BandwidthProber::CapProbeTarget(int target_kbps) const {
+  // Never probe at more than kMaxProbeMultipleOfEstimate × the current
+  // estimate. Keeps a probe proportional to what the link carries now, so a
+  // stale pre-drop reference can't push the probe far above real capacity.
+  if (estimated_bitrate_kbps_ <= 0) {
+    return target_kbps;
+  }
+  int cap = estimated_bitrate_kbps_ * kMaxProbeMultipleOfEstimate;
+  return std::min(target_kbps, cap);
 }

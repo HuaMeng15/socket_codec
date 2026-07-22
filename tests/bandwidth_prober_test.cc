@@ -87,6 +87,66 @@ TEST_F(BandwidthProberTest, SecondExponentialProbeAt6x) {
   EXPECT_EQ(probes2[0].target_bitrate_kbps, 30000);
 }
 
+TEST_F(BandwidthProberTest, ExponentialChainRunsPastSeedProbesToSaturation) {
+  // Regression: the further-probe chain must keep doubling from each measured
+  // rate until the link saturates or we approach max — it must NOT stop after
+  // the 2 seed probes. Previously initial_probing_done_ (set once the seed
+  // count hit the cap) gated the chain off, capping convergence at the seeds.
+  prober.SetMaxBitrate(30000);
+  prober.SetEstimatedBitrate(1000);
+
+  // Seed probe #1 at 3x = 3000.
+  int r = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(r, 3000);
+  prober.GetPendingProbes();
+  // Strong result (2700/3000 = 0.9 >= 0.7) → chain to 2x = 5400.
+  prober.OnProbeResult(2700, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+  auto p2 = prober.GetPendingProbes();
+  ASSERT_EQ(p2.size(), 1u);
+  EXPECT_EQ(p2[0].target_bitrate_kbps, 5400);
+
+  // Chain continues: 4860/5400 = 0.9 → 2x = 9720.
+  prober.OnProbeResult(4860, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+  auto p3 = prober.GetPendingProbes();
+  ASSERT_EQ(p3.size(), 1u);
+  EXPECT_EQ(p3[0].target_bitrate_kbps, 9720);
+
+  // And again: 8748/9720 = 0.9 → 2x = 17496. This is the 4th probe overall,
+  // well past the old 2-seed cap — proving the chain is uncapped.
+  prober.OnProbeResult(8748, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+  auto p4 = prober.GetPendingProbes();
+  ASSERT_EQ(p4.size(), 1u);
+  EXPECT_EQ(p4[0].target_bitrate_kbps, 17496);
+}
+
+TEST_F(BandwidthProberTest, ChainStopsWhenLinkSaturates) {
+  // When a probe result falls below the further-probe threshold (link can't
+  // sustain the elevated rate), the chain must stop rather than keep probing.
+  prober.SetMaxBitrate(30000);
+  prober.SetEstimatedBitrate(1000);
+
+  prober.GetEffectiveBitrateKbps();  // seed #1 at 3000
+  prober.GetPendingProbes();
+  // Weak result: 1800/3000 = 0.6 < 0.7 → no further chain probe.
+  prober.OnProbeResult(1800, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+}
+
+TEST_F(BandwidthProberTest, ChainStopsNearMax) {
+  // The chain must not probe once the measured rate is within 5% of max.
+  prober.SetMaxBitrate(10000);
+  prober.SetEstimatedBitrate(1000);
+
+  prober.GetEffectiveBitrateKbps();  // seed at 3000
+  prober.GetPendingProbes();
+  // 9600 >= 10000*0.95 = 9500 → at ceiling, no further probe.
+  prober.OnProbeResult(9600, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+}
+
 TEST_F(BandwidthProberTest, OveruseCancelsProbe) {
   prober.GetEffectiveBitrateKbps();
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);

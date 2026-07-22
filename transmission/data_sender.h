@@ -43,8 +43,9 @@ class DataSender {
 
   /** Optional: set to record send time for each (frame, packet) for latency stats. */
   void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
-  /** Optional: set to pace packet sends (spread over time by bitrate). */
-  void SetPacer(Pacer* pacer) { pacer_ = pacer; }
+  /** Optional: set to pace packet sends (spread over time by bitrate). Wires
+   *  the pacer's send/record callbacks to this sender and starts its thread. */
+  void SetPacer(Pacer* pacer);
   /** Optional: attach a network simulator for bandwidth/delay/loss. */
   void SetSimulator(NetworkSimulator* simulator);
   /** Optional: callback invoked with packet count after each SendFrame. */

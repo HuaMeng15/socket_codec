@@ -39,6 +39,10 @@ GccController::GccController()
       max_bitrate_kbps_(30000),
       probe_active_(false),
       probe_floor_kbps_(0),
+      probe_first_arrival_us_(0),
+      probe_last_arrival_us_(0),
+      probe_recv_bytes_(0.0),
+      probe_first_seen_(false),
       last_received_rate_kbps_(0.0),
       fake_clock_ms_(nullptr) {
   last_threshold_update_ms_ = NowMs();
@@ -66,6 +70,13 @@ int GccController::GetTargetBitrateKbps() const {
   return target_bitrate_kbps_;
 }
 
+bool GccController::IsProbing() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto s = prober_.GetState();
+  return s == BandwidthProber::State::kProbing ||
+         s == BandwidthProber::State::kWaitingForResult;
+}
+
 int GccController::GetDelayBasedBitrateKbps() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return delay_based_bitrate_kbps_;
@@ -90,6 +101,19 @@ void GccController::SetAckedBitrateForTesting(double kbps) {
   std::lock_guard<std::mutex> lock(mutex_);
   acked_bitrate_kbps_ = kbps;
   acked_frozen_for_testing_ = true;
+}
+
+double GccController::GetAckedBitrateKbpsForTesting() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return acked_bitrate_kbps_;
+}
+
+void GccController::EnableAckedEstimatorForTesting() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  acked_frozen_for_testing_ = false;
+  acked_bitrate_kbps_ = 0.0;
+  acked_window_.clear();
+  acked_window_bytes_ = 0;
 }
 
 void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
@@ -128,29 +152,53 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   bool probing = prober_.GetState() == BandwidthProber::State::kProbing ||
                  prober_.GetState() == BandwidthProber::State::kWaitingForResult;
   if (probing && !probe_active_) {
-    // New probe just started — snapshot the floor and reset the delay
-    // integrator so the probe's effect is measured fresh. We do NOT commit on
-    // this batch: the probe traffic hasn't been acknowledged yet.
+    // New probe just started — snapshot the floor, reset the delay integrator
+    // and the probe-measurement accumulators. We do NOT commit yet: the probe
+    // traffic hasn't been acknowledged, and we need a real arrival span first.
     probe_active_ = true;
     probe_floor_kbps_ = loss_based_bitrate_kbps_;
     accumulated_delay_ = 0.0;
     smoothed_delay_ = 0.0;
-  } else if (probing && probe_active_) {
+    probe_first_seen_ = false;
+    probe_recv_bytes_ = 0.0;
+    probe_first_arrival_us_ = 0;
+    probe_last_arrival_us_ = 0;
+  }
+  if (probing && probe_active_) {
+    // Accumulate this batch's probe traffic into the measurement. Exclude the
+    // very first packet (rate is measured over the span between arrivals).
+    for (const auto& pkt : feedback.packets) {
+      if (pkt.recv_size == 0) continue;
+      if (!probe_first_seen_) {
+        probe_first_seen_ = true;
+        probe_first_arrival_us_ = pkt.arrival_time_us;
+        probe_last_arrival_us_ = pkt.arrival_time_us;
+        continue;  // first packet: starts the span, contributes no bytes
+      }
+      probe_recv_bytes_ += pkt.recv_size;
+      probe_last_arrival_us_ = pkt.arrival_time_us;
+    }
+
     // Abort if the elevated rate already induced congestion.
     bool congested = (usage == BandwidthUsage::kOveruse) ||
                      (accumulated_delay_ > kProbeAbortDelayMs) ||
                      (loss_based_bitrate_kbps_ < probe_floor_kbps_ / 2);
+    int64_t span_us = probe_last_arrival_us_ - probe_first_arrival_us_;
     if (congested) {
       prober_.OnProbeResult(delay_based_bitrate_kbps_, /*success=*/false);
       probe_active_ = false;
-    } else if (last_received_rate_kbps_ > 0.0) {
-      // We have a received-rate sample for the probe traffic — resolve now.
+    } else if (probe_first_seen_ && span_us >= kProbeMinSpanUs) {
+      // Enough accumulated span for a trustworthy measurement. The probe's
+      // received rate over the span is the throughput the link sustained at the
+      // elevated send rate. A min span guards against bunched arrivals reporting
+      // a rate far above real capacity.
+      double measured_kbps = probe_recv_bytes_ * 8.0 / 1000.0 / (span_us / 1e6);
+      last_received_rate_kbps_ = measured_kbps;
       int probe_target = prober_.GetEffectiveBitrateKbps();
-      int received = static_cast<int>(last_received_rate_kbps_);
+      int received = static_cast<int>(measured_kbps);
       // WebRTC commits min(send_rate, receive_rate); the probe target bounds the
-      // send rate, so the result is min(target, received). When the link is
-      // saturated (received well below the probe target), back off to
-      // kProbeUtilizationFraction × received to avoid immediate overuse.
+      // send rate. When the link is saturated (received below the probe target),
+      // back off to kProbeUtilizationFraction × received to avoid overuse.
       int probed;
       if (received < probe_target) {
         probed = static_cast<int>(kProbeUtilizationFraction * received);
@@ -165,6 +213,7 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
         last_increase_time_ms_ = now_ms;  // reset AIMD pacing from new base
       }
     }
+    // else: not enough span yet — keep accumulating across the next batches.
   } else if (!probing) {
     probe_active_ = false;
   }
@@ -241,43 +290,76 @@ void GccController::SetClockForTesting(int64_t* clock_ms) {
 
 // --- Acknowledged throughput estimate ---
 //
-// Estimate the rate actually getting through from a feedback batch: the
-// packets in the batch arrived over a span, so received_rate = bytes / span.
-// Packets are ~MTU; we approximate payload as kPayloadBytesPerPacket. The
-// result is EWMA-smoothed. AimdRateControl uses this to cap the increase
-// (<= 1.5x acked) and to snap the decrease to measured throughput.
+// Estimate the rate actually getting through, using a sliding time window of
+// received bytes: rate = sum(recv_size in window) * 8 / window_span. A time
+// window (rather than a single feedback batch) is robust to bursty arrivals —
+// if a batch's packets happen to land close together (delivery-thread bunching,
+// network jitter, a probe burst racing ahead of the bottleneck), the short
+// intra-batch span can't inflate the estimate, because the window span still
+// reflects real elapsed time across many batches. Uses the real per-packet
+// recv_size carried in the feedback, not a fixed-MTU assumption.
 void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
   if (acked_frozen_for_testing_) {
-    // Tests pin the smoothed acked estimate; mirror it as the raw per-batch
+    // Tests pin the smoothed acked estimate; mirror it as the per-batch
     // received-rate sample so probe-commit logic is exercisable in unit tests.
     last_received_rate_kbps_ = acked_bitrate_kbps_;
     return;
   }
-  if (feedback.packets.size() < 2) {
+
+  // --- Per-batch instantaneous received rate (for probe resolution) ---
+  // The probe commits on the first feedback batch carrying the probe traffic,
+  // so it needs the rate of *this batch's* packets, not the slow 1s window
+  // (which is still mostly pre-probe samples at that instant). This mirrors
+  // WebRTC's ProbeBitrateEstimator, which measures the probe cluster's own
+  // received rate. Uses real recv_size and the batch's own arrival span.
+  if (feedback.packets.size() >= 2) {
+    int64_t batch_first_us = feedback.packets.front().arrival_time_us;
+    int64_t batch_last_us = feedback.packets.back().arrival_time_us;
+    int64_t batch_span_us = batch_last_us - batch_first_us;
+    if (batch_span_us > 0) {
+      double batch_bytes = 0.0;  // exclude first packet (rate over the gaps)
+      for (size_t i = 1; i < feedback.packets.size(); i++) {
+        batch_bytes += feedback.packets[i].recv_size;
+      }
+      last_received_rate_kbps_ =
+          batch_bytes * 8.0 / 1000.0 / (batch_span_us / 1e6);
+    }
+  }
+
+  // --- Sliding-window acked throughput (for AIMD increase/decrease) ---
+  // Add each acked packet to the sliding window.
+  for (const auto& pkt : feedback.packets) {
+    if (pkt.recv_size == 0) {
+      continue;
+    }
+    acked_window_.push_back({pkt.arrival_time_us, pkt.recv_size});
+    acked_window_bytes_ += pkt.recv_size;
+  }
+  if (acked_window_.empty()) {
     return;
   }
-  int64_t first_us = feedback.packets.front().arrival_time_us;
-  int64_t last_us = feedback.packets.back().arrival_time_us;
-  double span_s = (last_us - first_us) / 1e6;
-  if (span_s <= 0) {
+
+  // Evict samples older than the window relative to the newest arrival.
+  int64_t newest_us = acked_window_.back().arrival_us;
+  while (acked_window_.size() > 1 &&
+         newest_us - acked_window_.front().arrival_us > kAckedWindowUs) {
+    acked_window_bytes_ -= acked_window_.front().bytes;
+    acked_window_.pop_front();
+  }
+
+  if (static_cast<int>(acked_window_.size()) < kAckedMinSamples) {
     return;
   }
-  // Bytes received in the batch (exclude the first packet: rate is over the
-  // gaps between arrivals).
-  double bytes = (feedback.packets.size() - 1) *
-                 static_cast<double>(kPayloadBytesPerPacket);
-  double sample_kbps = bytes * 8.0 / 1000.0 / span_s;
 
-  // Keep the raw per-batch sample for probe resolution (WebRTC resolves probes
-  // from the measured received rate, not the EWMA-smoothed estimate).
-  last_received_rate_kbps_ = sample_kbps;
-
-  if (acked_bitrate_kbps_ <= 0.0) {
-    acked_bitrate_kbps_ = sample_kbps;
-  } else {
-    acked_bitrate_kbps_ = kAckedSmoothingCoeff * acked_bitrate_kbps_ +
-                          (1.0 - kAckedSmoothingCoeff) * sample_kbps;
+  // Rate over the window span. Exclude the first sample's bytes: the rate is
+  // measured over the gaps between arrivals (span = last - first).
+  int64_t span_us = newest_us - acked_window_.front().arrival_us;
+  if (span_us <= 0) {
+    return;
   }
+  double window_bytes = acked_window_bytes_ - acked_window_.front().bytes;
+  // The window already smooths over time, so use it directly as the estimate.
+  acked_bitrate_kbps_ = window_bytes * 8.0 / 1000.0 / (span_us / 1e6);
 }
 
 // --- Trendline estimator (faithful to WebRTC trendline_estimator.cc) ---
@@ -340,7 +422,39 @@ GccController::BandwidthUsage GccController::UpdateTrendline(
       trend = ComputeTrendlineSlope();
     }
 
-    usage = Detect(trend, send_delta_ms, static_cast<int64_t>(arrival_ms));
+    // Pass recv_delta (arrival-time elapsed), NOT send_delta, as the "time
+    // over using" increment. WebRTC uses send_delta, which is fine when the
+    // pacer output is smooth (send_delta ≈ real spacing). But our 2.5x burst
+    // pacer compresses send_delta to ~0.01ms within a burst, so the 10ms
+    // "sustained overuse" guard was never met mid-burst even when the trend was
+    // 15x over threshold. Arrival deltas reflect real elapsed time (packets
+    // arrive at link rate), so overuse accumulates correctly.
+    usage = Detect(trend, recv_delta_ms, static_cast<int64_t>(arrival_ms));
+
+    // Detailed per-packet CC trace (VERBOSE so it doesn't flood normal runs).
+    // One line per acknowledged packet: the full delay-based pipeline from raw
+    // timestamps through to the overuse decision. Grep [CC_TRACE] for analysis.
+    const char* u = usage == BandwidthUsage::kOveruse ? "overuse"
+                  : usage == BandwidthUsage::kUnderuse ? "underuse" : "normal";
+    LOG(VERBOSE) << "[CC_TRACE] f=" << pkt.frame_sequence
+                 << " p=" << static_cast<int>(pkt.packet_index)
+                 << " send_ms=" << send_ms
+                 << " arr_ms=" << arrival_ms
+                 << " recv_delta=" << recv_delta_ms
+                 << " send_delta=" << send_delta_ms
+                 << " delta=" << delta_ms
+                 << " accum=" << accumulated_delay_
+                 << " smooth=" << smoothed_delay_
+                 << " win=" << trendline_window_.size()
+                 << " span=" << (trendline_window_.back().arrival_time_ms -
+                                 trendline_window_.front().arrival_time_ms)
+                 << " dofit=" << dofit
+                 << " slope=" << trend
+                 << " mod_trend=" << last_modified_trend_
+                 << " thr=" << adaptive_threshold_
+                 << " ovuse_cnt=" << overuse_counter_
+                 << " t_over=" << time_over_using_ms_
+                 << " usage=" << u;
   }
 
   return usage;
@@ -371,7 +485,7 @@ double GccController::ComputeTrendlineSlope() const {
 // --- Overuse detector (faithful to TrendlineEstimator::Detect) ---
 
 GccController::BandwidthUsage GccController::Detect(double trend,
-                                                   double ts_delta_ms,
+                                                   double elapsed_ms,
                                                    int64_t now_ms) {
   if (num_deltas_ < 2) {
     return BandwidthUsage::kNormal;
@@ -380,15 +494,16 @@ GccController::BandwidthUsage GccController::Detect(double trend,
   // modified_trend = min(num_deltas, kMinNumDeltas) * trend * gain
   const double modified_trend =
       std::min(num_deltas_, kMinNumDeltas) * trend * kThresholdGain;
+  last_modified_trend_ = modified_trend;  // expose for trace logging
 
   BandwidthUsage result = BandwidthUsage::kNormal;
 
   if (modified_trend > adaptive_threshold_) {
     if (time_over_using_ms_ < 0) {
       // Initialize: assume over-using half the time since the previous sample.
-      time_over_using_ms_ = ts_delta_ms / 2.0;
+      time_over_using_ms_ = elapsed_ms / 2.0;
     } else {
-      time_over_using_ms_ += ts_delta_ms;
+      time_over_using_ms_ += elapsed_ms;
     }
     overuse_counter_++;
     if (time_over_using_ms_ > kOverusingTimeThresholdMs &&

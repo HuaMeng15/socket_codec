@@ -106,6 +106,18 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
   uint8_t total_packets = header->total_packets;
   uint16_t payload_size = ntohs(header->payload_size);
 
+  // Padding packet: pacer-generated filler for bandwidth probing. Report its
+  // arrival + wire size in TWCC feedback so it contributes to the probe's
+  // received-rate measurement, but do NOT assemble or decode it. Its
+  // packet_index is a rolling counter unique within the padding sentinel
+  // "frame"; the sender records no send-time for it, so the delay trendline
+  // skips it (send_time_us stays -1). See kPaddingFrameSequence.
+  if (frame_sequence == kPaddingFrameSequence) {
+    SendFeedback(frame_sequence, packet_index,
+                 static_cast<uint16_t>(packet_size));
+    return;
+  }
+
   // Validate payload size
   size_t expected_packet_size = sizeof(FramePacketHeader) + payload_size;
   if (packet_size < expected_packet_size) {
@@ -145,8 +157,10 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
                  << " (" << (int)frame_assembly.received_packets << "/" << (int)total_packets
                  << " complete)";
 
-    // Send feedback for received packet
-    SendFeedback(frame_sequence, packet_index);
+    // Send feedback for received packet. Pass the actual wire bytes received
+    // (header + payload) so the acked-throughput estimator uses real sizes.
+    SendFeedback(frame_sequence, packet_index,
+                 static_cast<uint16_t>(packet_size));
   }
 
   // Check if frame is complete
@@ -207,7 +221,8 @@ void ReceivedFrameDataHandler::ReportFrameLoss(uint16_t frame_sequence,
   }
 }
 
-void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t packet_index) {
+void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
+                                            uint16_t recv_size) {
   // Try to initialize feedback sender if not already initialized
   if (!feedback_sender_initialized_) {
     if (InitializeFeedbackSender()) {
@@ -230,8 +245,10 @@ void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t pac
   }
 
   // Feed arrival into collector — it batches and sends TWCC TransportFeedback.
-  // This is what the GCC delay-based estimator consumes.
-  feedback_collector_.OnPacketReceived(frame_sequence, packet_index);
+  // This is what the GCC delay-based estimator consumes. Report the actual
+  // wire bytes received (header + payload) so the acked-throughput estimator
+  // uses real sizes, not a fixed-MTU assumption.
+  feedback_collector_.OnPacketReceived(frame_sequence, packet_index, recv_size);
 }
 
 void ReceivedFrameDataHandler::HandleCompleteFrame(uint32_t frame_sequence,

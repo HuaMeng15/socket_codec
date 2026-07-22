@@ -35,9 +35,9 @@ void InitializeFlags() {
                     "simulated packet loss percentage (0 = none)");
   parser.AddIntFlag("sim_jitter_ms", 0,
                     "simulated jitter in ms (0 = none)");
-  parser.AddIntFlag("sim_max_queue_ms", 300,
+  parser.AddIntFlag("sim_max_queue_ms", 0,
                     "bottleneck buffer size in ms; packets queued longer are "
-                    "dropped (default 300ms, a realistic router buffer)");
+                    "dropped (0 = unlimited queue, no buffer-overflow drops)");
   parser.AddStringFlag("sim_bandwidth_schedule", "",
                        "time-based bandwidth steps as 't_sec:kbps,...' "
                        "e.g. '0:10000,10:1000' (overrides sim_bandwidth_kbps)");
@@ -50,4 +50,17 @@ void InitializeFlags() {
   parser.AddIntFlag("cc_max_bitrate_kbps", 20000,
                     "maximum GCC target bitrate in kbps (ceiling; also caps "
                     "probe targets)");
+
+  // Pacer tuning. The pacer is a bounded token bucket: it releases packets at
+  // pace_multiplier × target, with bursts capped at pace_burst_cap_ms of data.
+  // Default 1.0× matches a greedy encoder (mock or real) that always fills the
+  // target rate — the frame occupies the full interval and there is no idle
+  // gap for bursting. Set to 2.5× (250) to match WebRTC's kDefaultPaceMultiplier
+  // when using a real encoder that sometimes undershoots its target.
+  parser.AddIntFlag("cc_pace_multiplier_x100", 100,
+                    "pacer rate as a multiple of target, ×100 (100 = 1.0x for "
+                    "greedy encoders; 250 = 2.5x for real encoders that undershoot)");
+  parser.AddIntFlag("cc_pace_burst_cap_ms", 5,
+                    "max pacer burst in ms of data at the current rate "
+                    "(token-bucket depth; prevents idle-gap credit buildup)");
 }

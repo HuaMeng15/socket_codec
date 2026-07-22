@@ -72,6 +72,22 @@ int DataSender::Initialize(const std::string& dest_ip, int dest_port,
   return 0;
 }
 
+void DataSender::SetPacer(Pacer* pacer) {
+  pacer_ = pacer;
+  if (!pacer_) return;
+  // The pacer thread is the sole caller of SendPacket once wired. It records
+  // each real packet's send-time at actual send (not enqueue) so the delay
+  // trendline uses true wire departure times; padding gets no send-time.
+  pacer_->SetSendCallback([this](const uint8_t* data, size_t size) {
+    SendPacket(data, size);
+  });
+  pacer_->SetRecordCallback([this](uint16_t frame_sequence, uint8_t packet_index) {
+    if (send_time_store_) send_time_store_->Record(frame_sequence, packet_index);
+  });
+  pacer_->SetMaxPacketSize(max_packet_size_);
+  pacer_->Start();
+}
+
 int DataSender::SendFrame(const EncodedData* encoded_data) {
   if (!initialized_ || socket_fd_ < 0) {
     LOG(ERROR) << "[DataSender] Not initialized";
@@ -127,20 +143,24 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
 
       size_t packet_size = header_size + payload_size;
       if (pacer_) {
-        pacer_->Pace(packet_size);
+        // Hand the packet to the pacer thread, which paces it (bounded token
+        // bucket), records its send-time at actual send, and may interleave
+        // probe padding. Enqueue copies the bytes, so packet_buffer is reusable.
+        pacer_->Enqueue(packet, packet_size, frame_sequence, packet_index);
+      } else {
+        // No pacer: send inline immediately (record send-time at send).
+        if (send_time_store_) {
+          send_time_store_->Record(frame_sequence, packet_index);
+        }
+        int ret = SendPacket(packet, packet_size);
+        if (ret != 0) {
+          LOG(ERROR) << "[DataSender] Failed to send packet " << (int)packet_index
+                     << " of frame " << frame_sequence;
+          return ret;
+        }
+        LOG(VERBOSE) << "[DataSender] Sent packet " << (int)packet_index
+                     << " for frame " << frame_sequence;
       }
-      if (send_time_store_) {
-        send_time_store_->Record(frame_sequence, packet_index);
-      }
-      // Send packet
-      int ret = SendPacket(packet, packet_size);
-      if (ret != 0) {
-        LOG(ERROR) << "[DataSender] Failed to send packet " << (int)packet_index
-                   << " of frame " << frame_sequence;
-        return ret;
-      }
-      LOG(VERBOSE) << "[DataSender] Sent packet " << (int)packet_index
-                   << " for frame " << frame_sequence;
 
       offset += payload_size;
       packet_index++;
