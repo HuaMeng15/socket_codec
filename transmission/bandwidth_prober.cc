@@ -19,6 +19,10 @@ BandwidthProber::BandwidthProber()
       max_bitrate_kbps_(30000),
       initial_probing_done_(false),
       exponential_probe_count_(0),
+      seed_base_kbps_(0),
+      current_probe_type_(ProbeType::kSeed),
+      chain_hops_(0),
+      last_periodic_probe_ms_(0),
       application_limited_(false),
       last_alr_probe_ms_(0),
       pre_drop_bitrate_kbps_(0),
@@ -32,6 +36,7 @@ BandwidthProber::BandwidthProber()
       fake_clock_ms_(nullptr) {
   int64_t now = NowMs();
   last_alr_probe_ms_ = now;
+  last_periodic_probe_ms_ = now;
   bitrate_drop_time_ms_ = now;
   probe_start_ms_ = now;
   last_overuse_time_ms_ = now;
@@ -45,6 +50,7 @@ void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
   if (clock_ms) {
     int64_t now = *clock_ms;
     last_alr_probe_ms_ = now;
+    last_periodic_probe_ms_ = now;
     bitrate_drop_time_ms_ = now;
     probe_start_ms_ = now;
     last_overuse_time_ms_ = now - 2000;  // allow probing immediately in tests
@@ -122,26 +128,28 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
     LOG(INFO) << "[Prober] Probe succeeded: target=" << probe_target_kbps_
               << " estimated=" << estimated_kbps << " kbps";
 
-    // Continue the exponential chain as long as the measured rate keeps
-    // clearing the further-probe threshold and there is still headroom below
-    // the ceiling. This is NOT gated on initial_probing_done_ (matching
-    // WebRTC's SetEstimatedBitrate chain): the 3x/6x seed probes only bootstrap
-    // discovery; the chain that follows must keep doubling from each measured
-    // rate until the link saturates (ratio < threshold) or we approach max.
-    // Gating it on initial_probing_done_ was what capped convergence at the
-    // seed probes and forced the slow 8%/s AIMD ramp the rest of the way.
-    // (A low-ratio result here does NOT end initial probing: the sequential
-    // 6x seed in MaybeInitiateProbe still gets its turn — only an outright
-    // probe failure, handled below, stops the seeds.)
+    // Chaining rule (aligned with the WebRTC reference curve):
+    //   - Seed probes (3x/6x startup cluster) do NOT chain. They commit their
+    //     measured rate and hand control to AIMD, which is why the reference
+    //     jumps once to ~4 Mbps at startup and then climbs slowly — rather than
+    //     chaining straight to the ceiling and flooding the link.
+    //   - Periodic / drop-recovery probes MAY chain, but only up to
+    //     kMaxChainHops hops. Bounding the hop count stops a single probe
+    //     session from doubling all the way to 2x the link capacity (the
+    //     runaway that caused the overuse->collapse->slow-recovery cycle).
     double ratio = static_cast<double>(estimated_kbps) / probe_target_kbps_;
-    if (ratio >= kFurtherProbeThreshold &&
+    bool chainable = (current_probe_type_ != ProbeType::kSeed);
+    if (chainable && chain_hops_ < kMaxChainHops &&
+        ratio >= kFurtherProbeThreshold &&
         estimated_kbps < max_bitrate_kbps_ * 0.95) {
+      chain_hops_++;
       probe_target_kbps_ = std::min(
           estimated_kbps * kFurtherProbeMultiplier, max_bitrate_kbps_);
       state_ = State::kProbing;
       probe_start_ms_ = NowMs();
       pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
-      LOG(INFO) << "[Prober] Further probe at " << probe_target_kbps_ << " kbps";
+      LOG(INFO) << "[Prober] Further probe (" << chain_hops_ << "/"
+                << kMaxChainHops << ") at " << probe_target_kbps_ << " kbps";
     }
 
     bitrate_drop_detected_ = false;
@@ -149,7 +157,11 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
   } else {
     LOG(INFO) << "[Prober] Probe failed or no improvement: target="
               << probe_target_kbps_ << " estimated=" << estimated_kbps;
-    initial_probing_done_ = true;
+    // A failed seed still ends initial probing (hand off to AIMD); a failed
+    // periodic/recovery probe just returns to AIMD until the next interval.
+    if (current_probe_type_ == ProbeType::kSeed) {
+      initial_probing_done_ = true;
+    }
   }
 }
 
@@ -223,7 +235,20 @@ void BandwidthProber::MaybeInitiateProbe() {
     }
   }
 
-  // 3. ALR periodic probing
+  // 3. Periodic re-probing. After initial probing, search for headroom every
+  //    kPeriodicProbeIntervalMs — independent of the ALR flag, which never
+  //    fires for a greedy (mock/CBR) encoder. This is what drives convergence
+  //    up to the cap after the seed cluster + AIMD, mirroring WebRTC where an
+  //    ALR-limited real encoder gets a periodic probe on the same cadence.
+  if (estimated_bitrate_kbps_ <
+      max_bitrate_kbps_ * kPeriodicProbeMaxEstimateFraction) {
+    if (now - last_periodic_probe_ms_ >= kPeriodicProbeIntervalMs) {
+      InitiatePeriodicProbe();
+      return;
+    }
+  }
+
+  // 4. ALR periodic probing
   if (application_limited_) {
     if (now - last_alr_probe_ms_ >= kAlrProbeIntervalMs) {
       InitiateAlrProbe();
@@ -232,15 +257,42 @@ void BandwidthProber::MaybeInitiateProbe() {
   }
 }
 
+void BandwidthProber::InitiatePeriodicProbe() {
+  probe_target_kbps_ = std::min(
+      static_cast<int>(estimated_bitrate_kbps_ * kPeriodicProbeMultiplier),
+      max_bitrate_kbps_);
+
+  if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
+    last_periodic_probe_ms_ = NowMs();
+    return;
+  }
+
+  current_probe_type_ = ProbeType::kPeriodic;
+  chain_hops_ = 0;
+  state_ = State::kProbing;
+  probe_start_ms_ = NowMs();
+  last_periodic_probe_ms_ = probe_start_ms_;
+  pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
+
+  LOG(INFO) << "[Prober] Periodic probe at " << probe_target_kbps_
+            << " kbps (est=" << estimated_bitrate_kbps_ << ")";
+}
+
 void BandwidthProber::InitiateExponentialProbe() {
+  // Snapshot the estimate when the seed cluster begins, and take BOTH seeds
+  // off that base. Using the live estimate for the 6x seed would compound: the
+  // 3x probe commits a higher estimate first, so 6x of THAT lands near the
+  // ceiling in two jumps. WebRTC fires 3x and 6x of the same start rate.
+  if (exponential_probe_count_ == 0) {
+    seed_base_kbps_ = estimated_bitrate_kbps_;
+  }
+
   int multiplier = (exponential_probe_count_ == 0)
       ? kFirstExponentialMultiplier
       : kSecondExponentialMultiplier;
 
-  // Exponential startup probes are already proportional to the current estimate
-  // (3×/6×) and chain via measured commits, so they self-limit — no extra cap.
   probe_target_kbps_ = std::min(
-      estimated_bitrate_kbps_ * multiplier, max_bitrate_kbps_);
+      seed_base_kbps_ * multiplier, max_bitrate_kbps_);
 
   if (estimated_bitrate_kbps_ >= max_bitrate_kbps_ * 0.95) {
     initial_probing_done_ = true;
@@ -252,13 +304,15 @@ void BandwidthProber::InitiateExponentialProbe() {
     initial_probing_done_ = true;
   }
 
+  current_probe_type_ = ProbeType::kSeed;
+  chain_hops_ = 0;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
 
   LOG(INFO) << "[Prober] Exponential probe #" << exponential_probe_count_
-            << " at " << probe_target_kbps_ << " kbps (est="
-            << estimated_bitrate_kbps_ << ")";
+            << " at " << probe_target_kbps_ << " kbps (seed_base="
+            << seed_base_kbps_ << ")";
 }
 
 void BandwidthProber::InitiateAlrProbe() {
@@ -270,6 +324,8 @@ void BandwidthProber::InitiateAlrProbe() {
     return;
   }
 
+  current_probe_type_ = ProbeType::kPeriodic;
+  chain_hops_ = 0;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   last_alr_probe_ms_ = probe_start_ms_;
@@ -294,6 +350,8 @@ void BandwidthProber::InitiateDropRecoveryProbe() {
     return;
   }
 
+  current_probe_type_ = ProbeType::kDropRecovery;
+  chain_hops_ = 0;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});

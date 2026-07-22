@@ -41,20 +41,20 @@ TEST_F(BandwidthProberTest, DoesNotProbeAfterRecentOveruse) {
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
-TEST_F(BandwidthProberTest, SuccessfulProbeTriggersNextProbe) {
-  prober.GetEffectiveBitrateKbps();  // 3x probe at 15000
+TEST_F(BandwidthProberTest, SeedProbeDoesNotChain) {
+  // Seed (startup) probes commit their measured rate and hand off to AIMD.
+  // They must NOT fire a further probe even on a strong result — matching the
+  // WebRTC reference, where the initial 3x/6x cluster jumps once and then lets
+  // AIMD climb, rather than chaining straight to the ceiling. (Chaining is
+  // reserved for periodic / drop-recovery probes; see PeriodicProbeChains*.)
+  prober.GetEffectiveBitrateKbps();  // seed #1 at 3x = 15000
   auto probes = prober.GetPendingProbes();
   ASSERT_EQ(probes.size(), 1u);
   EXPECT_EQ(probes[0].target_bitrate_kbps, 15000);
 
-  // Report success: estimated 12000 (12000/15000 = 0.8 > 0.7 threshold)
+  // Strong result 12000/15000 = 0.8 >= 0.7, but a seed still does not chain.
   prober.OnProbeResult(12000, true);
-  // Should trigger further probe at 2x 12000 = 24000
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-
-  auto probes2 = prober.GetPendingProbes();
-  ASSERT_EQ(probes2.size(), 1u);
-  EXPECT_EQ(probes2[0].target_bitrate_kbps, 24000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
 TEST_F(BandwidthProberTest, SecondExponentialProbeAt6x) {
@@ -87,39 +87,37 @@ TEST_F(BandwidthProberTest, SecondExponentialProbeAt6x) {
   EXPECT_EQ(probes2[0].target_bitrate_kbps, 30000);
 }
 
-TEST_F(BandwidthProberTest, ExponentialChainRunsPastSeedProbesToSaturation) {
-  // Regression: the further-probe chain must keep doubling from each measured
-  // rate until the link saturates or we approach max — it must NOT stop after
-  // the 2 seed probes. Previously initial_probing_done_ (set once the seed
-  // count hit the cap) gated the chain off, capping convergence at the seeds.
+TEST_F(BandwidthProberTest, PeriodicProbeChainsUpToHopCap) {
+  // A periodic probe MAY chain (unlike a seed), but only up to kMaxChainHops
+  // (2) further hops. Bounding the hop count is what stops one probe session
+  // from doubling all the way to 2x the link capacity and flooding the pipe.
   prober.SetMaxBitrate(30000);
-  prober.SetEstimatedBitrate(1000);
+  prober.SetEstimatedBitrate(2000);
+  prober.OnOveruseDetected();  // finish initial probing
 
-  // Seed probe #1 at 3x = 3000.
+  // Trigger the periodic probe: 2x estimate = 4000.
+  AdvanceMs(5100);
   int r = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(r, 3000);
+  EXPECT_EQ(r, 4000);
   prober.GetPendingProbes();
-  // Strong result (2700/3000 = 0.9 >= 0.7) → chain to 2x = 5400.
-  prober.OnProbeResult(2700, true);
+
+  // Hop 1: strong result 3600/4000 = 0.9 → chain to 2x = 7200.
+  prober.OnProbeResult(3600, true);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
   auto p2 = prober.GetPendingProbes();
   ASSERT_EQ(p2.size(), 1u);
-  EXPECT_EQ(p2[0].target_bitrate_kbps, 5400);
+  EXPECT_EQ(p2[0].target_bitrate_kbps, 7200);
 
-  // Chain continues: 4860/5400 = 0.9 → 2x = 9720.
-  prober.OnProbeResult(4860, true);
+  // Hop 2: strong result 6480/7200 = 0.9 → chain to 2x = 12960 (last hop).
+  prober.OnProbeResult(6480, true);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
   auto p3 = prober.GetPendingProbes();
   ASSERT_EQ(p3.size(), 1u);
-  EXPECT_EQ(p3[0].target_bitrate_kbps, 9720);
+  EXPECT_EQ(p3[0].target_bitrate_kbps, 12960);
 
-  // And again: 8748/9720 = 0.9 → 2x = 17496. This is the 4th probe overall,
-  // well past the old 2-seed cap — proving the chain is uncapped.
-  prober.OnProbeResult(8748, true);
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-  auto p4 = prober.GetPendingProbes();
-  ASSERT_EQ(p4.size(), 1u);
-  EXPECT_EQ(p4[0].target_bitrate_kbps, 17496);
+  // Hop cap reached: even a strong result 11664/12960 = 0.9 must NOT chain.
+  prober.OnProbeResult(11664, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
 TEST_F(BandwidthProberTest, ChainStopsWhenLinkSaturates) {
@@ -172,22 +170,23 @@ TEST_F(BandwidthProberTest, NoProbeWhenNearMax) {
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
-TEST_F(BandwidthProberTest, AlrProbingAfterInterval) {
-  // Complete initial probing
-  prober.OnOveruseDetected();
+TEST_F(BandwidthProberTest, PeriodicProbingAfterInterval) {
+  // After initial probing completes, the prober re-probes every
+  // kPeriodicProbeIntervalMs at 2x the current estimate — independent of the
+  // ALR flag (a greedy encoder is never application-limited, so ALR alone
+  // would never fire and convergence would stall on AIMD).
+  prober.OnOveruseDetected();  // completes initial probing
+
+  // Not enough time elapsed since the last probe yet.
   AdvanceMs(1100);
-
-  // Enter ALR
-  prober.OnApplicationLimited();
-
-  // Not enough time yet
   int rate = prober.GetEffectiveBitrateKbps();
   EXPECT_EQ(rate, 5000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 
-  // Advance past ALR interval
+  // Past the periodic interval → probe at 2x = 10000.
   AdvanceMs(5100);
   rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 7500);  // 1.5x
+  EXPECT_EQ(rate, 10000);  // 2x estimate
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
 }
 
