@@ -41,11 +41,15 @@ class BandwidthProber {
  public:
   enum class State { kIdle, kProbing, kWaitingForResult };
 
-  // Origin of the currently active probe. Only kPeriodic (ALR) probes are
-  // allowed to chain (fire a further probe from their result); the kSeed
-  // startup probes commit their measured rate and hand off to AIMD, matching
-  // WebRTC where the initial 3x/6x cluster does not self-extend indefinitely.
-  enum class ProbeType { kSeed, kPeriodic };
+  // Origin of the currently active probe.
+  //   kSeed    — the initial 3x/6x exponential cluster; commits and does not chain.
+  //   kStartup — startup-stage accelerator probe (1.5x, one per ~1s settle) that
+  //              keeps re-probing until overuse or a weak result, so a fast idle
+  //              link (e.g. 10 Mbps) converges in a few seconds instead of the
+  //              ~16s AIMD crawl. Does not chain; the cadence is driven by the
+  //              settle timer in MaybeInitiateProbe.
+  //   kPeriodic — ALR probe; the only type allowed to chain within OnProbeResult.
+  enum class ProbeType { kSeed, kStartup, kPeriodic };
 
   struct ProbeCluster {
     int target_bitrate_kbps;
@@ -99,6 +103,7 @@ class BandwidthProber {
   int64_t NowMs() const;
   void MaybeInitiateProbe();
   void InitiateExponentialProbe();
+  void InitiateStartupProbe();
   void InitiateAlrProbe();
   // Cap a probe target to WebRTC's AimdRateControl increase limit:
   // 1.5 × current estimate. A probe (ALR seed or a further/chained hop) can
@@ -125,6 +130,17 @@ class BandwidthProber {
   static constexpr int kSecondExponentialMultiplier = 6;  // Second seed: 6x
   static constexpr int kMaxExponentialProbes = 2;
   static constexpr double kFurtherProbeThreshold = 0.7;   // Success if est > 0.7 * target
+
+  // Startup stage. After the seed cluster, keep firing 1.5x probes (one per
+  // ~kStartupSettleMs, letting the new rate settle in between) so an idle
+  // high-capacity link converges in a few seconds rather than the slow AIMD
+  // crawl. The stage ends the first time a probe comes back weak (< 70% of
+  // target => link can't sustain it) or the delay detector signals overuse
+  // (latency rising) — after that, normal AIMD/ALR takes over.
+  bool startup_stage_;
+  int64_t last_startup_probe_ms_;
+  static constexpr int kStartupSettleMs = 1000;
+  static constexpr double kStartupProbeMultiplier = 1.5;
   // Next probe explores 1.5× the measured rate (see kMaxProbeIncreaseLimit /
   // CapProbeTarget) — WebRTC's AimdRateControl increase limit, not a raw 2×.
 

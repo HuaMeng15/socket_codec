@@ -20,6 +20,8 @@ BandwidthProber::BandwidthProber()
       initial_probing_done_(false),
       exponential_probe_count_(0),
       seed_base_kbps_(0),
+      startup_stage_(true),
+      last_startup_probe_ms_(0),
       current_probe_type_(ProbeType::kSeed),
       chain_hops_(0),
       application_limited_(false),
@@ -40,6 +42,7 @@ void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
   if (clock_ms) {
     int64_t now = *clock_ms;
     last_alr_probe_ms_ = now;
+    last_startup_probe_ms_ = now;
     probe_start_ms_ = now;
     last_overuse_time_ms_ = now - 2000;  // allow probing immediately in tests
   }
@@ -113,7 +116,23 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
     //     probe session from running to ~2× the link capacity — the runaway
     //     that flooded the pipe and caused the overuse→"drop"→re-probe cycle.
     double ratio = static_cast<double>(estimated_kbps) / probe_target_kbps_;
-    bool chainable = (current_probe_type_ != ProbeType::kSeed);
+
+    // Startup accelerator: a strong result keeps the stage going (the settle
+    // timer in MaybeInitiateProbe fires the next 1.5x probe); a weak result
+    // (< 70% of target) means the link can't sustain the higher rate, so end
+    // the stage and hand off to AIMD. Startup probes never chain here — their
+    // cadence is the settle timer, not immediate re-fire.
+    if (current_probe_type_ == ProbeType::kStartup) {
+      if (ratio < kFurtherProbeThreshold) {
+        startup_stage_ = false;
+        LOG(INFO) << "[Prober] Startup probe weak (ratio=" << ratio
+                  << ") — ending startup stage";
+      }
+      return;
+    }
+
+    // Only ALR (periodic) probes chain within OnProbeResult.
+    bool chainable = (current_probe_type_ == ProbeType::kPeriodic);
     if (chainable && chain_hops_ < kMaxChainHops &&
         ratio >= kFurtherProbeThreshold &&
         estimated_kbps < max_bitrate_kbps_ * 0.95) {
@@ -133,10 +152,16 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
   } else {
     LOG(INFO) << "[Prober] Probe failed or no improvement: target="
               << probe_target_kbps_ << " estimated=" << estimated_kbps;
-    // A failed seed still ends initial probing (hand off to AIMD); a failed
-    // periodic/recovery probe just returns to AIMD until the next interval.
+    // A failed probe means the link couldn't sustain even this rate, so stop
+    // ramping: a failed seed ends initial probing AND the startup accelerator
+    // (no point probing higher after the link rejected the seed); a failed
+    // startup probe ends the startup stage; a failed periodic probe just
+    // returns to AIMD until the next interval.
     if (current_probe_type_ == ProbeType::kSeed) {
       initial_probing_done_ = true;
+      startup_stage_ = false;
+    } else if (current_probe_type_ == ProbeType::kStartup) {
+      startup_stage_ = false;
     }
   }
 }
@@ -145,6 +170,9 @@ void BandwidthProber::OnOveruseDetected() {
   std::lock_guard<std::mutex> lock(mutex_);
   last_overuse_time_ms_ = NowMs();
   initial_probing_done_ = true;
+  // Latency rising ends the startup stage — we've found the ceiling; let normal
+  // AIMD take over from here.
+  startup_stage_ = false;
 
   if (state_ != State::kIdle) {
     LOG(INFO) << "[Prober] Overuse during probe, cancelling";
@@ -187,13 +215,29 @@ void BandwidthProber::MaybeInitiateProbe() {
     return;
   }
 
-  // 1. Initial exponential probing
+  // 1. Initial exponential probing (the 3x/6x seed cluster).
   if (!initial_probing_done_) {
     InitiateExponentialProbe();
     return;
   }
 
-  // 2. ALR periodic probing. WebRTC fires a periodic probe every
+  // 2. Startup-stage accelerator. After the seeds, keep probing 1.5x every
+  //    settle interval so a fast idle link converges in a few seconds instead
+  //    of AIMD's slow additive crawl. Ends on a weak probe or overuse (handled
+  //    in OnProbeResult / OnOveruseDetected). At the ceiling there is nothing
+  //    left to find, so exit the stage.
+  if (startup_stage_) {
+    if (estimated_bitrate_kbps_ >= max_bitrate_kbps_ * 0.95) {
+      startup_stage_ = false;
+    } else if (now - last_startup_probe_ms_ >= kStartupSettleMs) {
+      InitiateStartupProbe();
+      return;
+    } else {
+      return;  // still settling from the last startup probe
+    }
+  }
+
+  // 3. ALR periodic probing. WebRTC fires a periodic probe every
   //    kAlrProbeIntervalMs ONLY while the sender is application-limited — the
   //    encoder is producing below the estimate, so AIMD can't grow the estimate
   //    (nothing is pushing on the pipe) and a probe is the only way to discover
@@ -241,10 +285,37 @@ void BandwidthProber::InitiateExponentialProbe() {
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
+  // Start the startup-stage settle clock from the last seed, so the first
+  // accelerator probe waits one settle interval after the seed commits.
+  last_startup_probe_ms_ = probe_start_ms_;
 
   LOG(INFO) << "[Prober] Exponential probe #" << exponential_probe_count_
             << " at " << probe_target_kbps_ << " kbps (seed_base="
             << seed_base_kbps_ << ")";
+}
+
+void BandwidthProber::InitiateStartupProbe() {
+  // Explore 1.5x the current estimate (AimdRateControl increase limit). Unlike
+  // the seed cluster this repeats every settle interval until overuse or a weak
+  // result ends the startup stage.
+  probe_target_kbps_ = std::min(
+      static_cast<int>(estimated_bitrate_kbps_ * kStartupProbeMultiplier),
+      max_bitrate_kbps_);
+
+  if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
+    startup_stage_ = false;  // nowhere to grow — hand off to AIMD
+    return;
+  }
+
+  current_probe_type_ = ProbeType::kStartup;
+  chain_hops_ = 0;
+  state_ = State::kProbing;
+  probe_start_ms_ = NowMs();
+  last_startup_probe_ms_ = probe_start_ms_;
+  pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
+
+  LOG(INFO) << "[Prober] Startup probe at " << probe_target_kbps_
+            << " kbps (est=" << estimated_bitrate_kbps_ << ")";
 }
 
 void BandwidthProber::InitiateAlrProbe() {

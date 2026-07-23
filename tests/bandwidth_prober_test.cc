@@ -87,6 +87,91 @@ TEST_F(BandwidthProberTest, SecondExponentialProbeAt6x) {
   EXPECT_EQ(probes2[0].target_bitrate_kbps, 30000);
 }
 
+// --- Startup stage (post-seed accelerator) ------------------------------------
+
+class StartupStageTest : public BandwidthProberTest {
+ protected:
+  // Drive both seed probes to completion so initial_probing_done_ is set and
+  // the prober is in the startup stage with the estimate committed at `est`.
+  void FinishSeeds(int est) {
+    prober.GetEffectiveBitrateKbps();  // seed #1
+    prober.OnProbeResult(est, true);
+    AdvanceMs(1100);
+    prober.GetEffectiveBitrateKbps();  // seed #2 -> initial_probing_done_
+    prober.OnProbeResult(est, true);
+    prober.SetEstimatedBitrate(est);   // controller commits the measured rate
+  }
+};
+
+TEST_F(StartupStageTest, FiresStartupProbeAfterSettle) {
+  // Low estimate so seeds (3x/6x) stay well under the 30000 cap.
+  prober.SetEstimatedBitrate(1000);
+  FinishSeeds(2000);
+
+  // Before the settle interval elapses, no startup probe fires.
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  EXPECT_EQ(rate, 2000);
+
+  // After the settle interval, a startup probe fires at 1.5x the estimate.
+  AdvanceMs(1000);
+  rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+  EXPECT_EQ(rate, 3000);  // 1.5 * 2000
+}
+
+TEST_F(StartupStageTest, StrongStartupProbeKeepsProbing) {
+  prober.SetEstimatedBitrate(1000);
+  FinishSeeds(2000);
+  AdvanceMs(1000);
+  prober.GetEffectiveBitrateKbps();      // startup probe at 3000
+  ASSERT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+
+  // Strong result (2800/3000 = 0.93 >= 0.7): stage continues, no chain fires
+  // immediately (cadence is the settle timer).
+  prober.OnProbeResult(2800, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  prober.SetEstimatedBitrate(2800);
+
+  // Next settle interval -> another startup probe at 1.5 * 2800 = 4200.
+  AdvanceMs(1000);
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+  EXPECT_EQ(rate, 4200);
+}
+
+TEST_F(StartupStageTest, WeakStartupProbeEndsStage) {
+  prober.SetEstimatedBitrate(1000);
+  FinishSeeds(2000);
+  AdvanceMs(1000);
+  prober.GetEffectiveBitrateKbps();      // startup probe at 3000
+  ASSERT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+
+  // Weak result (1900/3000 = 0.63 < 0.7): link can't sustain it -> end stage.
+  prober.OnProbeResult(1900, true);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  prober.SetEstimatedBitrate(1900);
+
+  // No further startup probe fires even after the settle interval.
+  AdvanceMs(2000);
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  EXPECT_EQ(rate, 1900);
+}
+
+TEST_F(StartupStageTest, OveruseEndsStage) {
+  prober.SetEstimatedBitrate(1000);
+  FinishSeeds(2000);
+
+  // Latency rising during startup ends the stage immediately.
+  prober.OnOveruseDetected();
+
+  AdvanceMs(2000);  // well past a settle interval
+  int rate = prober.GetEffectiveBitrateKbps();
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  EXPECT_EQ(rate, 2000);  // no startup probe — AIMD owns it now
+}
+
 TEST_F(BandwidthProberTest, AlrProbeChainsUpToHopCap) {
   // An ALR (periodic) probe MAY chain (unlike a seed), but only up to
   // kMaxChainHops (2) further hops, and each hop explores at most 1.5x the
