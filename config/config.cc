@@ -63,4 +63,31 @@ void InitializeFlags() {
   parser.AddIntFlag("cc_pace_burst_cap_ms", 5,
                     "max pacer burst in ms of data at the current rate "
                     "(token-bucket depth; prevents idle-gap credit buildup)");
+
+  // Mock encoder mode. Set encoder_variable_mode=1 to enable a content-adaptive
+  // VBR simulation: during each period the encoder spends encoder_alr_fraction%
+  // of time in a low-demand (app-limited) phase producing only
+  // encoder_alr_low_ratio_x100 / 100 of the CC target, and the rest of the time
+  // at full target (no ALR). This makes the AlrDetector enter ALR during the low
+  // phase → fires the WebRTC periodic ALR probe → exercises the full CC probing
+  // pipeline.
+  //
+  // Set encoder_variable_mode=0 (default) for the static / greedy mode used in
+  // CC performance benchmarks: the encoder always fills the CC target exactly,
+  // the AlrDetector never enters ALR, and steady state is pure AIMD — faithful
+  // to WebRTC with a source that saturates the link.
+  //
+  // When using variable mode, also set cc_pace_multiplier_x100=250 to match
+  // WebRTC's kDefaultPaceMultiplier (2.5×), which absorbs encoder-rate variance.
+  parser.AddIntFlag("encoder_variable_mode", 0,
+                    "0=static/greedy (always fills CC target); "
+                    "1=variable/VBR (duty-cycle ALR simulation)");
+  parser.AddIntFlag("encoder_alr_low_ratio_x100", 15,
+                    "production rate during the low/ALR phase as "
+                    "percent of CC target (default 15 = 15%)");
+  parser.AddIntFlag("encoder_period_ms", 10000,
+                    "length of one high/low duty-cycle in ms (default 10 s)");
+  parser.AddIntFlag("encoder_alr_fraction_x100", 40,
+                    "percent of each period spent in the ALR (low) phase "
+                    "(default 40 = 40%; the rest is full-rate)");
 }

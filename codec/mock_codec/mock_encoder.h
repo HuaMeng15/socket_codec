@@ -30,7 +30,21 @@ class MockEncoder : public Encoder {
   int height_;
   int fps_;
   int target_bitrate_kbps_;
-  size_t bytes_per_frame_;  // target_bitrate / (8 * fps)
+  size_t bytes_per_frame_;  // full-rate bytes: target_bitrate / (8 * fps)
+
+  // --- Variable (content-adaptive VBR) mode ---
+  // When enabled, EncodeFrame produces min(target, content_demand(t)) where
+  // content_demand follows a duty cycle: full target for the "high" portion of
+  // each period, then alr_low_ratio_ x target for the "low" (app-limited)
+  // portion. Static mode (default) always produces the full target.
+  bool variable_mode_ = false;
+  double alr_low_ratio_ = 0.15;      // low-phase output as fraction of target
+  int period_ms_ = 10000;            // one high/low cycle
+  double alr_fraction_ = 0.40;       // fraction of the period in the low phase
+  int64_t first_frame_time_ms_ = -1; // wall-clock anchor for the duty cycle
+  bool in_low_phase_ = false;        // last phase, for transition logging
+
+  int64_t NowMs() const;
 
   // Startup default; overridden by SetTargetBitrate(cc_initial) before the
   // first frame. Aligned with the GCC/pacer startup rate.

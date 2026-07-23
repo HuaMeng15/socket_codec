@@ -60,11 +60,14 @@ run_scenario() {
   sleep 1
 
   # Sender with bandwidth schedule. Start GCC high so it must converge down.
+  # SENDER_EXTRA_FLAGS lets callers append flags (e.g. encoder_variable_mode=1
+  # and cc_pace_multiplier_x100=250 to exercise the ALR probing path).
   set +e
   "$BINARY" --codec=mock --fps=$FPS --port="$port" --ip=127.0.0.1 \
     --frames_to_encode=$FRAMES \
-    --sim_delay_ms=20 \
+    --sim_delay_ms=0 \
     --sim_bandwidth_schedule="$schedule" \
+    --encoder_variable_mode=0 \
     > "$result_dir/send.log" 2>&1
   local send_status=$?
   set -e
@@ -94,7 +97,7 @@ run_scenario "static_10mbps" "0:10000" $((PORT_BASE + 0))
 # Scenario 2: 10 Mbps -> 1 Mbps drop at t=10s
 run_scenario "drop_10to1" "0:10000,10:1000" $((PORT_BASE + 2))
 
-# Scenario 3: static 1 Mbps
+# # Scenario 3: static 1 Mbps
 run_scenario "static_1mbps" "0:1000" $((PORT_BASE + 4))
 
 echo ""

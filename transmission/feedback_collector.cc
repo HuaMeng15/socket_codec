@@ -20,7 +20,8 @@ void FeedbackCollector::SetFeedbackInterval(int packet_count) {
 }
 
 void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
-                                         uint8_t packet_index) {
+                                         uint8_t packet_index,
+                                         uint16_t recv_size) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto now = std::chrono::steady_clock::now();
@@ -29,7 +30,7 @@ void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
     epoch_set_ = true;
   }
 
-  pending_entries_.push_back({frame_sequence, packet_index, now});
+  pending_entries_.push_back({frame_sequence, packet_index, recv_size, now});
 
   if (static_cast<int>(pending_entries_.size()) >= feedback_interval_) {
     SendTransportFeedback();
@@ -88,6 +89,8 @@ void FeedbackCollector::SendTransportFeedback() {
     auto delta = std::chrono::duration_cast<std::chrono::microseconds>(
         entry.arrival_time - epoch_);
     records[i].arrival_time_us = htonl(static_cast<int32_t>(delta.count()));
+    records[i].recv_size = htons(entry.recv_size);
+    records[i].reserved2 = 0;
   }
 
   send_cb_(buffer.data(), buffer.size());

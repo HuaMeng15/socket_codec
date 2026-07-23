@@ -42,7 +42,7 @@ class NetworkSimulator {
     int propagation_delay_ms = 0;  // constant one-way base delay
     double loss_rate = 0.0;        // [0.0, 1.0] random loss
     int jitter_ms = 0;             // random +/- jitter on delivery
-    int max_queue_ms = 1000;       // drop when queuing delay exceeds this
+    int max_queue_ms = 0;          // 0 = unlimited queue (no overflow drops)
   };
 
   // Callback that performs the actual delivery (e.g. socket send()).

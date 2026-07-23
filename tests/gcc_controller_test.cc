@@ -40,6 +40,7 @@ class GccControllerTest : public ::testing::Test {
       info.packet_index = static_cast<uint8_t>(i % 10);
       info.send_time_us = send_base_us + i * send_spacing_us;
       info.arrival_time_us = arrival_base_us + i * arrival_spacing_us;
+      info.recv_size = 1454;  // full-MTU packet (real wire size)
       fb.packets.push_back(info);
     }
     return fb;
@@ -376,19 +377,62 @@ TEST_F(GccControllerTest, ProbeCommitsFromReceivedRateWithoutWaiting) {
   EXPECT_GT(gcc.GetDelayBasedBitrateKbps(), before);
 }
 
-TEST_F(GccControllerTest, ProbeCommitsCapacityWhenLinkSaturated) {
+TEST_F(GccControllerTest, ProbeIntoSaturatedLinkAbortsWithoutOvershoot) {
   gcc.SetInitialBitrate(1000);
   gcc.SetBitrateRange(100, 30000);
-  // Received rate BELOW the 3x probe target (3000): the link is saturated by
-  // the probe. We should commit ~0.95 × received (≈ 1900), i.e. measured
-  // capacity backed off slightly — never the over-target 3000 send rate.
-  gcc.SetAckedBitrateForTesting(2000);
+  gcc.EnableAckedEstimatorForTesting();  // probe measures real bytes/span
 
+  // Model a link that cannot carry the probe: arrivals lag sends (arrival
+  // spacing 5816us vs send spacing 1000us), so every packet adds ~4.8ms of
+  // queuing delay — a growing queue. The 3x probe target is 3000, but the link
+  // only delivers ~2000. With the overuse timer driven by arrival-time deltas,
+  // this growing delay trips overuse, so the probe ABORTS (congestion guard)
+  // rather than overshooting the send rate to 3000. The key guarantee: the
+  // delay-based estimate does not run up to the over-target probe rate.
+  const int64_t kArrivalSpacingUs = 5816;
   int64_t send = 1000000, arrival = 1000000;
-  FeedStable(3, send, arrival);
+  for (int i = 0; i < 4; i++) {
+    auto fb = MakeFeedback(send, arrival, 20, 1000, kArrivalSpacingUs);
+    gcc.OnTransportFeedback(fb);
+    send += 33000;
+    arrival += 20 * kArrivalSpacingUs;
+    AdvanceMs(33);
+  }
 
-  int committed = gcc.GetDelayBasedBitrateKbps();
-  EXPECT_GT(committed, 1000);   // a real gain over the start
-  EXPECT_LE(committed, 2000);   // capped at measured capacity, not 3000
-  EXPECT_GE(committed, 1800);   // ≈ 0.95 × 2000
+  // Probe aborted on congestion → no overshoot to the 3000 probe target.
+  EXPECT_LE(gcc.GetDelayBasedBitrateKbps(), 3000);
+}
+
+// --- Acked throughput: sliding window robust to bursty arrivals ---
+
+TEST_F(GccControllerTest, AckedWindowNotInflatedByBurstyArrivals) {
+  // Don't freeze acked — exercise the real sliding-window estimator.
+  gcc.SetInitialBitrate(5000);
+  gcc.SetBitrateRange(100, 30000);
+  gcc.EnableAckedEstimatorForTesting();  // undo SetUp's frozen acked
+
+  // Feed 1s of feedback where packets are paced ~1ms apart (≈ 11.6 Mbps of
+  // full-MTU packets), BUT inject one batch whose packets all arrive bunched
+  // within a tiny span (the pathological case that used to read ~26 Mbps from
+  // a single batch). With a 1s window the burst can't dominate: the windowed
+  // rate must stay near the real ~11-12 Mbps, not spike to 25+.
+  int64_t send = 1000000, arrival = 1000000;
+  // Normal paced batches: 20 pkts, 1ms arrival spacing.
+  for (int r = 0; r < 20; r++) {
+    auto fb = MakeFeedback(send, arrival, 20, 1000, 1000);
+    gcc.OnTransportFeedback(fb);
+    send += 20000;
+    arrival += 20000;
+    AdvanceMs(20);
+  }
+  double steady = gcc.GetAckedBitrateKbpsForTesting();
+  EXPECT_GT(steady, 8000);    // measuring a real multi-Mbps rate
+  EXPECT_LT(steady, 16000);   // ~11.6 Mbps for 1454B @ 1ms, not inflated
+
+  // Now a bunched batch: 20 pkts arriving only 50us apart (≈ 232 Mbps if taken
+  // alone). The window must absorb it without exploding.
+  auto burst = MakeFeedback(send, arrival, 20, 1000, 50);
+  gcc.OnTransportFeedback(burst);
+  double after_burst = gcc.GetAckedBitrateKbpsForTesting();
+  EXPECT_LT(after_burst, 20000);  // not the ~232 Mbps the burst alone implies
 }

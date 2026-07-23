@@ -68,6 +68,13 @@ void Pacer::Stop() {
   if (thread_.joinable()) thread_.join();
 }
 
+size_t Pacer::ConsumeBytesSent() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  size_t n = bytes_sent_since_consume_;
+  bytes_sent_since_consume_ = 0;
+  return n;
+}
+
 // Current pace rate in bits/s. During a probe we pace at exactly the target
 // (the probe target IS the rate we want to test on the wire); outside probes we
 // pace at multiplier× to absorb encoder bursts.
@@ -125,6 +132,7 @@ void Pacer::Run() {
         QueuedPacket p = std::move(queue_.front());
         queue_.pop_front();
         tokens_bits_ -= need_bits;
+        bytes_sent_since_consume_ += p.data.size();
         lock.unlock();
         if (record_fn_) record_fn_(p.frame_sequence, p.packet_index);
         if (send_fn_) send_fn_(p.data.data(), p.data.size());
@@ -146,6 +154,7 @@ void Pacer::Run() {
       double pkt_bits = static_cast<double>(header_size + payload) * 8.0;
       if (tokens_bits_ > 0.0) {
         tokens_bits_ -= pkt_bits;
+        bytes_sent_since_consume_ += header_size + payload;
         lock.unlock();
         SendPadding(payload);
         lock.lock();

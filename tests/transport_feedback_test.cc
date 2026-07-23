@@ -22,9 +22,10 @@ TEST(TransportFeedbackTest, SerializeDeserializeRoundtrip) {
 
   auto* records = reinterpret_cast<PacketArrivalRecord*>(
       buffer.data() + sizeof(FeedbackMessageHeader));
-  records[0] = {htons(1), 0, 0, htonl(0)};
-  records[1] = {htons(1), 1, 0, htonl(5)};
-  records[2] = {htons(2), 0, 0, htonl(10)};
+  // {frame_seq, packet_index, padding, arrival_time_us, recv_size, reserved2}
+  records[0] = {htons(1), 0, 0, htonl(0),  htons(1200), 0};
+  records[1] = {htons(1), 1, 0, htonl(5),  htons(800),  0};
+  records[2] = {htons(2), 0, 0, htonl(10), htons(1454), 0};
 
   // Parse on sender side via FeedbackHandler
   FeedbackHandler handler;
@@ -40,10 +41,13 @@ TEST(TransportFeedbackTest, SerializeDeserializeRoundtrip) {
   ASSERT_EQ(received_fb.packets.size(), 3u);
   EXPECT_EQ(received_fb.packets[0].frame_sequence, 1);
   EXPECT_EQ(received_fb.packets[0].packet_index, 0);
+  EXPECT_EQ(received_fb.packets[0].recv_size, 1200);
   EXPECT_EQ(received_fb.packets[1].frame_sequence, 1);
   EXPECT_EQ(received_fb.packets[1].packet_index, 1);
+  EXPECT_EQ(received_fb.packets[1].recv_size, 800);
   EXPECT_EQ(received_fb.packets[2].frame_sequence, 2);
   EXPECT_EQ(received_fb.packets[2].packet_index, 0);
+  EXPECT_EQ(received_fb.packets[2].recv_size, 1454);
 }
 
 TEST(TransportFeedbackTest, LossReportSerializeDeserialize) {

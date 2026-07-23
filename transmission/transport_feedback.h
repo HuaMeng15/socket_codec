@@ -41,6 +41,11 @@ struct PacketArrivalRecord {
                              // Microsecond resolution avoids the quantization
                              // noise that ms rounding injected into the
                              // delay-based trendline at high bitrates.
+  uint16_t recv_size;        // Actual bytes received on the wire for this
+                             // packet (header + payload). Lets the sender's
+                             // acked-throughput estimator use real sizes
+                             // instead of assuming a fixed MTU.
+  uint16_t reserved2;        // Pad to 4-byte alignment (record is 12 bytes).
 };
 
 // Per-packet loss record in LossReport
@@ -60,6 +65,7 @@ struct TransportFeedback {
     uint8_t packet_index;
     int64_t send_time_us;     // Sender clock (looked up from PacketSendTimeStore)
     int64_t arrival_time_us;  // Receiver clock (from feedback message)
+    uint16_t recv_size = 0;   // Actual wire bytes received for this packet
   };
 
   std::vector<PacketInfo> packets;

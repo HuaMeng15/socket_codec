@@ -20,13 +20,19 @@
  *    the estimated capacity (application-limited), periodically probe
  *    to re-discover bandwidth (every kAlrProbeIntervalMs).
  *
- * 3. Probe after bitrate drop: if the estimated bitrate drops by
- *    kBitrateDropThreshold (66%) and stabilizes, probe at a fraction
- *    (kProbeFractionAfterDrop = 0.85) of the pre-drop bitrate.
+ * There is deliberately NO probe-on-bitrate-drop path. WebRTC's only
+ * drop-recovery probe (ProbeController::RequestProbe) is gated on being in ALR
+ * (in_alr || alr_ended_recently) — a drop while the pipe was full is treated as
+ * real congestion and recovered by AIMD alone, never a probe. Our ALR probe (#2)
+ * already covers the app-limited case, so a separate drop path would only
+ * re-probe into a link that AIMD is already backing off from — the exact
+ * self-induced overshoot→"drop"→re-probe loop we removed.
  *
  * Probe bitrate targets consider current network situation:
  *   - Limited by max_bitrate (don't probe above ceiling)
- *   - Scaled by current estimate (probe at 2x current, not absolute)
+ *   - Bounded by kMaxProbeIncreaseLimit × current estimate (WebRTC AimdRateControl
+ *     uses 1.5×throughput as its increase limit; we cap probe targets the same
+ *     way so a probe can't shoot far past what the link is actually carrying)
  *   - Further probes only if headroom exists (current < max * 0.95)
  *
  * State: Idle → Probing → WaitingForResult → (success/failure) → Idle
@@ -35,11 +41,11 @@ class BandwidthProber {
  public:
   enum class State { kIdle, kProbing, kWaitingForResult };
 
-  // Origin of the currently active probe. Only kPeriodic/kDropRecovery probes
-  // are allowed to chain (fire a further probe from their result); the kSeed
+  // Origin of the currently active probe. Only kPeriodic (ALR) probes are
+  // allowed to chain (fire a further probe from their result); the kSeed
   // startup probes commit their measured rate and hand off to AIMD, matching
   // WebRTC where the initial 3x/6x cluster does not self-extend indefinitely.
-  enum class ProbeType { kSeed, kPeriodic, kDropRecovery };
+  enum class ProbeType { kSeed, kPeriodic };
 
   struct ProbeCluster {
     int target_bitrate_kbps;
@@ -71,9 +77,9 @@ class BandwidthProber {
   void OnOveruseDetected();
 
   /**
-   * Report underuse signal — the delay-based estimator sees the queue
-   * draining. Drop-recovery probing is only permitted shortly after underuse,
-   * so we never probe back into a still-congested link.
+   * Report underuse signal — the delay-based estimator sees the queue draining.
+   * Retained for interface compatibility with GccController; recovery is now
+   * pure AIMD (WebRTC-faithful), so this no longer arms any probe.
    */
   void OnUnderuseDetected();
 
@@ -93,17 +99,14 @@ class BandwidthProber {
   int64_t NowMs() const;
   void MaybeInitiateProbe();
   void InitiateExponentialProbe();
-  void InitiatePeriodicProbe();
   void InitiateAlrProbe();
-  void InitiateDropRecoveryProbe();
-  int ComputeProbeTarget() const;
-  // Cap a probe target so it can't exceed a sane multiple of the CURRENT
-  // estimate. After a capacity cliff (e.g. 10→1 Mbps) the drop-recovery probe
-  // would otherwise target 0.85× the stale pre-drop rate (≈9 Mbps) and flood
-  // the new 1 Mbps link. Bounding by current estimate keeps every probe
-  // proportional to what the link is actually carrying now.
+  // Cap a probe target to WebRTC's AimdRateControl increase limit:
+  // 1.5 × current estimate. A probe (ALR seed or a further/chained hop) can
+  // explore up to 50% above what the link is currently carrying, but no more —
+  // so it can't shoot to ~2× capacity, flood the bottleneck, and trigger the
+  // AIMD backoff that used to be misread as a fresh "bitrate drop".
   int CapProbeTarget(int target_kbps) const;
-  static constexpr int kMaxProbeMultipleOfEstimate = 3;
+  static constexpr double kMaxProbeIncreaseLimit = 1.5;
 
   mutable std::mutex mutex_;
   State state_;
@@ -122,7 +125,8 @@ class BandwidthProber {
   static constexpr int kSecondExponentialMultiplier = 6;  // Second seed: 6x
   static constexpr int kMaxExponentialProbes = 2;
   static constexpr double kFurtherProbeThreshold = 0.7;   // Success if est > 0.7 * target
-  static constexpr int kFurtherProbeMultiplier = 2;       // Next probe: 2x successful est
+  // Next probe explores 1.5× the measured rate (see kMaxProbeIncreaseLimit /
+  // CapProbeTarget) — WebRTC's AimdRateControl increase limit, not a raw 2×.
 
   // Chain control: which probe is active, and how many further hops it has
   // taken. A periodic/recovery probe may chain at most kMaxChainHops times so a
@@ -132,36 +136,16 @@ class BandwidthProber {
   int chain_hops_;
   static constexpr int kMaxChainHops = 2;
 
-  // Periodic re-probing. After initial probing, re-probe every
-  // kPeriodicProbeIntervalMs at kPeriodicProbeMultiplier x the current estimate
-  // to search for freed-up headroom. Decoupled from the ALR/application-limited
-  // flag: a greedy encoder (mock, or CBR) is never application-limited, so the
-  // WebRTC ALR trigger would never fire and convergence would stall on AIMD.
-  int64_t last_periodic_probe_ms_;
-  static constexpr int kPeriodicProbeIntervalMs = 5000;
-  static constexpr double kPeriodicProbeMultiplier = 2.0;
-  // Don't bother re-probing once we're already near the ceiling.
-  static constexpr double kPeriodicProbeMaxEstimateFraction = 0.95;
-
-  // ALR periodic probing (kept for real application-limited encoders).
+  // ALR periodic probing. Fires only while application-limited (the encoder is
+  // sending below the estimate), driven by the real AlrDetector. This is the
+  // sole periodic probe mechanism — WebRTC-faithful: a greedy encoder that
+  // fills the pipe is never in ALR, so no periodic probe fires and AIMD alone
+  // tracks capacity; a variable/VBR encoder goes app-limited on simple content
+  // and gets a probe to keep the estimate warm for the next scene change.
   bool application_limited_;
   int64_t last_alr_probe_ms_;
   static constexpr int kAlrProbeIntervalMs = 5000;
   static constexpr double kAlrProbeMultiplier = 1.5;
-
-  // Bitrate drop recovery probing
-  int pre_drop_bitrate_kbps_;
-  int64_t bitrate_drop_time_ms_;
-  bool bitrate_drop_detected_;
-  static constexpr double kBitrateDropThreshold = 0.66;
-  static constexpr int kBitrateDropTimeoutMs = 5000;
-  static constexpr double kProbeFractionAfterDrop = 0.85;
-  // Drop-recovery probing is only allowed within this window after an underuse
-  // signal (queue draining). Mirrors WebRTC's in_alr / alr_ended_recently gate
-  // in ProbeController::RequestProbe — probe only when the link is no longer
-  // congested, never straight back into a full queue.
-  int64_t last_underuse_time_ms_;
-  static constexpr int kUnderuseRecencyMs = 3000;
 
   // Current probe state
   int probe_target_kbps_;

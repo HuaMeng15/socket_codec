@@ -125,6 +125,9 @@ int FeedbackHandler::HandleTransportFeedback(const uint8_t* data, size_t size) {
         static_cast<uint32_t>(records[i].arrival_time_us)));
     info.arrival_time_us = static_cast<int64_t>(offset_us);
 
+    // Actual wire bytes received for this packet (header + payload).
+    info.recv_size = ntohs(records[i].recv_size);
+
     // Send time: looked up from the send-time store (sender clock, us).
     // Falls back to -1 if unknown so GCC can skip that packet.
     info.send_time_us = -1;

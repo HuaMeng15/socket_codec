@@ -87,36 +87,39 @@ TEST_F(BandwidthProberTest, SecondExponentialProbeAt6x) {
   EXPECT_EQ(probes2[0].target_bitrate_kbps, 30000);
 }
 
-TEST_F(BandwidthProberTest, PeriodicProbeChainsUpToHopCap) {
-  // A periodic probe MAY chain (unlike a seed), but only up to kMaxChainHops
-  // (2) further hops. Bounding the hop count is what stops one probe session
-  // from doubling all the way to 2x the link capacity and flooding the pipe.
+TEST_F(BandwidthProberTest, AlrProbeChainsUpToHopCap) {
+  // An ALR (periodic) probe MAY chain (unlike a seed), but only up to
+  // kMaxChainHops (2) further hops, and each hop explores at most 1.5x the
+  // measured rate (WebRTC AimdRateControl increase limit). Bounding both the
+  // hop count and the per-hop multiple stops one probe session from running to
+  // ~2x the link capacity and flooding the pipe. Fires only while app-limited.
   prober.SetMaxBitrate(30000);
   prober.SetEstimatedBitrate(2000);
-  prober.OnOveruseDetected();  // finish initial probing
+  prober.OnOveruseDetected();     // finish initial probing
+  prober.OnApplicationLimited();  // encoder under-producing -> ALR
 
-  // Trigger the periodic probe: 2x estimate = 4000.
+  // Trigger the ALR probe: 1.5x estimate = 3000.
   AdvanceMs(5100);
   int r = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(r, 4000);
+  EXPECT_EQ(r, 3000);
   prober.GetPendingProbes();
 
-  // Hop 1: strong result 3600/4000 = 0.9 → chain to 2x = 7200.
-  prober.OnProbeResult(3600, true);
+  // Hop 1: strong result 2700/3000 = 0.9 → chain to 1.5x = 4050.
+  prober.OnProbeResult(2700, true);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
   auto p2 = prober.GetPendingProbes();
   ASSERT_EQ(p2.size(), 1u);
-  EXPECT_EQ(p2[0].target_bitrate_kbps, 7200);
+  EXPECT_EQ(p2[0].target_bitrate_kbps, 4050);
 
-  // Hop 2: strong result 6480/7200 = 0.9 → chain to 2x = 12960 (last hop).
-  prober.OnProbeResult(6480, true);
+  // Hop 2: strong result 3645/4050 = 0.9 → chain to 1.5x = 5467 (last hop).
+  prober.OnProbeResult(3645, true);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
   auto p3 = prober.GetPendingProbes();
   ASSERT_EQ(p3.size(), 1u);
-  EXPECT_EQ(p3[0].target_bitrate_kbps, 12960);
+  EXPECT_EQ(p3[0].target_bitrate_kbps, 5467);
 
-  // Hop cap reached: even a strong result 11664/12960 = 0.9 must NOT chain.
-  prober.OnProbeResult(11664, true);
+  // Hop cap reached: even a strong result 4920/5467 = 0.9 must NOT chain.
+  prober.OnProbeResult(4920, true);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
@@ -170,52 +173,44 @@ TEST_F(BandwidthProberTest, NoProbeWhenNearMax) {
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 
-TEST_F(BandwidthProberTest, PeriodicProbingAfterInterval) {
-  // After initial probing completes, the prober re-probes every
-  // kPeriodicProbeIntervalMs at 2x the current estimate — independent of the
-  // ALR flag (a greedy encoder is never application-limited, so ALR alone
-  // would never fire and convergence would stall on AIMD).
+TEST_F(BandwidthProberTest, AlrProbingOnlyWhileApplicationLimited) {
+  // After initial probing, a periodic probe fires ONLY while the sender is
+  // application-limited (WebRTC-faithful). Without the ALR flag, no probe fires
+  // no matter how much time passes — a greedy encoder that fills the pipe gets
+  // pure AIMD, never a periodic probe.
   prober.OnOveruseDetected();  // completes initial probing
 
-  // Not enough time elapsed since the last probe yet.
-  AdvanceMs(1100);
+  // Not application-limited: even well past the interval, no probe.
+  AdvanceMs(6100);
   int rate = prober.GetEffectiveBitrateKbps();
   EXPECT_EQ(rate, 5000);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 
-  // Past the periodic interval → probe at 2x = 10000.
+  // Now the AlrDetector reports application-limited (encoder under-producing).
+  prober.OnApplicationLimited();
+
+  // Interval elapsed since the last probe → ALR probe at 1.5x = 7500.
   AdvanceMs(5100);
   rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 10000);  // 2x estimate
+  EXPECT_EQ(rate, 7500);  // 1.5x estimate
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
 }
 
-TEST_F(BandwidthProberTest, DropRecoveryProbe) {
+TEST_F(BandwidthProberTest, BitrateDropDoesNotProbe) {
+  // WebRTC-faithful: a bitrate drop is recovered by AIMD, never a probe. The
+  // only drop-recovery probe in WebRTC (ProbeController::RequestProbe) is ALR-
+  // gated, and our ALR probe already covers the app-limited case. So a plain
+  // estimate drop must NOT arm any probe — that self-induced re-probe loop is
+  // exactly what we removed.
   prober.OnOveruseDetected();
   AdvanceMs(1100);
 
-  // Simulate drop: was 5000, now 1500 (< 0.66*5000=3300)
+  // Sharp drop (5000 -> 1500). No ALR flag set.
   prober.SetEstimatedBitrate(1500);
-
-  // The queue must be draining (underuse) before we dare probe back up —
-  // otherwise we'd re-probe into a still-congested link.
-  prober.OnUnderuseDetected();
+  prober.OnUnderuseDetected();  // queue draining — must still not probe
 
   int rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 4250);  // 0.85 * 5000
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-}
-
-TEST_F(BandwidthProberTest, NoDropRecoveryProbeWhileStillCongested) {
-  prober.OnOveruseDetected();
-  AdvanceMs(1100);
-
-  // Bitrate dropped sharply, but no underuse signal — the link is still
-  // congested (queue not draining). Probing now would worsen congestion.
-  prober.SetEstimatedBitrate(1500);
-
-  int rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 1500);  // no probe — just track the estimate
+  EXPECT_EQ(rate, 1500);  // just track the estimate; AIMD handles recovery
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 }
 

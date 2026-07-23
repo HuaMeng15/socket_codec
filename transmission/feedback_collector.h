@@ -36,10 +36,11 @@ class FeedbackCollector {
   void SetFeedbackInterval(int packet_count);
 
   /**
-   * Record a packet arrival. Stores timestamp and triggers feedback
-   * send if interval is reached.
+   * Record a packet arrival. Stores timestamp and the actual received byte
+   * count, and triggers feedback send if interval is reached.
    */
-  void OnPacketReceived(uint16_t frame_sequence, uint8_t packet_index);
+  void OnPacketReceived(uint16_t frame_sequence, uint8_t packet_index,
+                        uint16_t recv_size);
 
   /**
    * Detect lost packets: checks for gaps in expected sequence within a frame.
@@ -62,6 +63,7 @@ class FeedbackCollector {
   struct ArrivalEntry {
     uint16_t frame_sequence;
     uint8_t packet_index;
+    uint16_t recv_size;
     std::chrono::steady_clock::time_point arrival_time;
   };
 

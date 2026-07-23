@@ -67,6 +67,14 @@ class Pacer {
   /** Stop and join the drain thread. Idempotent. */
   void Stop();
 
+  /**
+   * Returns total wire bytes sent since the last call (including padding),
+   * then resets the counter to zero. Intended for the ALR detector: called
+   * once per feedback batch so GccController can compute the send rate and
+   * determine whether the sender is application-limited.
+   */
+  size_t ConsumeBytesSent();
+
  private:
   struct QueuedPacket {
     std::vector<uint8_t> data;
@@ -84,6 +92,9 @@ class Pacer {
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<QueuedPacket> queue_;
+
+  // Wire bytes sent since the last ConsumeBytesSent() (real + padding).
+  size_t bytes_sent_since_consume_ = 0;
 
   int bitrate_kbps_;
   double pace_multiplier_ = 2.5;

@@ -22,27 +22,17 @@ BandwidthProber::BandwidthProber()
       seed_base_kbps_(0),
       current_probe_type_(ProbeType::kSeed),
       chain_hops_(0),
-      last_periodic_probe_ms_(0),
       application_limited_(false),
       last_alr_probe_ms_(0),
-      pre_drop_bitrate_kbps_(0),
-      bitrate_drop_time_ms_(0),
-      bitrate_drop_detected_(false),
       probe_target_kbps_(0),
       next_cluster_id_(0),
       probe_start_ms_(0),
       last_overuse_time_ms_(0),
-      last_underuse_time_ms_(0),
       fake_clock_ms_(nullptr) {
   int64_t now = NowMs();
   last_alr_probe_ms_ = now;
-  last_periodic_probe_ms_ = now;
-  bitrate_drop_time_ms_ = now;
   probe_start_ms_ = now;
   last_overuse_time_ms_ = now;
-  // Far enough in the past that drop-recovery is gated off until a real
-  // underuse signal arrives.
-  last_underuse_time_ms_ = now - kUnderuseRecencyMs - 1;
 }
 
 void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
@@ -50,32 +40,16 @@ void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
   if (clock_ms) {
     int64_t now = *clock_ms;
     last_alr_probe_ms_ = now;
-    last_periodic_probe_ms_ = now;
-    bitrate_drop_time_ms_ = now;
     probe_start_ms_ = now;
     last_overuse_time_ms_ = now - 2000;  // allow probing immediately in tests
-    last_underuse_time_ms_ = now - kUnderuseRecencyMs - 1;  // gated off by default
   }
 }
 
 void BandwidthProber::SetEstimatedBitrate(int bitrate_kbps) {
   std::lock_guard<std::mutex> lock(mutex_);
-
-  // Detect significant bitrate drop
-  if (!bitrate_drop_detected_ && pre_drop_bitrate_kbps_ > 0) {
-    double ratio = static_cast<double>(bitrate_kbps) / pre_drop_bitrate_kbps_;
-    if (ratio < kBitrateDropThreshold) {
-      bitrate_drop_detected_ = true;
-      bitrate_drop_time_ms_ = NowMs();
-      LOG(INFO) << "[Prober] Bitrate drop detected: " << pre_drop_bitrate_kbps_
-                << " -> " << bitrate_kbps << " kbps";
-    }
-  }
-
-  if (bitrate_kbps > pre_drop_bitrate_kbps_ && !bitrate_drop_detected_) {
-    pre_drop_bitrate_kbps_ = bitrate_kbps;
-  }
-
+  // No drop-detection here: a bitrate drop is recovered by AIMD, not a probe
+  // (WebRTC-faithful). Reacting to a drop with a probe re-fed the estimate dip
+  // caused by our own probe overshoot straight back into another probe.
   estimated_bitrate_kbps_ = bitrate_kbps;
 }
 
@@ -133,27 +107,29 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
     //     measured rate and hand control to AIMD, which is why the reference
     //     jumps once to ~4 Mbps at startup and then climbs slowly — rather than
     //     chaining straight to the ceiling and flooding the link.
-    //   - Periodic / drop-recovery probes MAY chain, but only up to
-    //     kMaxChainHops hops. Bounding the hop count stops a single probe
-    //     session from doubling all the way to 2x the link capacity (the
-    //     runaway that caused the overuse->collapse->slow-recovery cycle).
+    //   - Periodic (ALR) probes MAY chain, but only up to kMaxChainHops hops,
+    //     AND each hop is capped at 1.5× the just-measured rate (CapProbeTarget).
+    //     Bounding both the hop count and the per-hop multiple stops a single
+    //     probe session from running to ~2× the link capacity — the runaway
+    //     that flooded the pipe and caused the overuse→"drop"→re-probe cycle.
     double ratio = static_cast<double>(estimated_kbps) / probe_target_kbps_;
     bool chainable = (current_probe_type_ != ProbeType::kSeed);
     if (chainable && chain_hops_ < kMaxChainHops &&
         ratio >= kFurtherProbeThreshold &&
         estimated_kbps < max_bitrate_kbps_ * 0.95) {
       chain_hops_++;
-      probe_target_kbps_ = std::min(
-          estimated_kbps * kFurtherProbeMultiplier, max_bitrate_kbps_);
+      // Cap against the freshly measured rate (estimated_bitrate_kbps_ hasn't
+      // been updated with this probe's result yet), so the next hop explores at
+      // most 1.5× what the link just demonstrated it can carry.
+      probe_target_kbps_ =
+          std::min(static_cast<int>(estimated_kbps * kMaxProbeIncreaseLimit),
+                   max_bitrate_kbps_);
       state_ = State::kProbing;
       probe_start_ms_ = NowMs();
       pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
       LOG(INFO) << "[Prober] Further probe (" << chain_hops_ << "/"
                 << kMaxChainHops << ") at " << probe_target_kbps_ << " kbps";
     }
-
-    bitrate_drop_detected_ = false;
-    pre_drop_bitrate_kbps_ = estimated_kbps;
   } else {
     LOG(INFO) << "[Prober] Probe failed or no improvement: target="
               << probe_target_kbps_ << " estimated=" << estimated_kbps;
@@ -178,8 +154,8 @@ void BandwidthProber::OnOveruseDetected() {
 }
 
 void BandwidthProber::OnUnderuseDetected() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  last_underuse_time_ms_ = NowMs();
+  // No-op. Recovery from a drop is handled by AIMD (GccController), not a probe.
+  // Kept so GccController's existing call site needs no change.
 }
 
 void BandwidthProber::OnApplicationLimited() {
@@ -217,65 +193,21 @@ void BandwidthProber::MaybeInitiateProbe() {
     return;
   }
 
-  // 2. Bitrate drop recovery — only if the queue is draining (recent underuse).
-  //    A bitrate drop is itself a congestion symptom; probing back up while the
-  //    link is still congested deepens the congestion. Require a recent
-  //    underuse signal, mirroring WebRTC's in_alr / alr_ended_recently gate.
-  if (bitrate_drop_detected_) {
-    bool queue_draining =
-        now - last_underuse_time_ms_ < kUnderuseRecencyMs;
-    if (now - bitrate_drop_time_ms_ < kBitrateDropTimeoutMs) {
-      if (queue_draining) {
-        InitiateDropRecoveryProbe();
-        return;
-      }
-      // Still congested — hold the drop flag and wait for the link to drain.
-    } else {
-      bitrate_drop_detected_ = false;
-    }
-  }
-
-  // 3. Periodic re-probing. After initial probing, search for headroom every
-  //    kPeriodicProbeIntervalMs — independent of the ALR flag, which never
-  //    fires for a greedy (mock/CBR) encoder. This is what drives convergence
-  //    up to the cap after the seed cluster + AIMD, mirroring WebRTC where an
-  //    ALR-limited real encoder gets a periodic probe on the same cadence.
-  if (estimated_bitrate_kbps_ <
-      max_bitrate_kbps_ * kPeriodicProbeMaxEstimateFraction) {
-    if (now - last_periodic_probe_ms_ >= kPeriodicProbeIntervalMs) {
-      InitiatePeriodicProbe();
-      return;
-    }
-  }
-
-  // 4. ALR periodic probing
+  // 2. ALR periodic probing. WebRTC fires a periodic probe every
+  //    kAlrProbeIntervalMs ONLY while the sender is application-limited — the
+  //    encoder is producing below the estimate, so AIMD can't grow the estimate
+  //    (nothing is pushing on the pipe) and a probe is the only way to discover
+  //    freed-up headroom. When the encoder is filling the pipe the sender is
+  //    NOT in ALR, no periodic probe fires, and plain AIMD tracks capacity.
+  //    The application_limited_ flag is driven by the real AlrDetector
+  //    (bytes-sent vs. target), so a greedy encoder never trips it — exactly
+  //    like WebRTC.
   if (application_limited_) {
     if (now - last_alr_probe_ms_ >= kAlrProbeIntervalMs) {
       InitiateAlrProbe();
       return;
     }
   }
-}
-
-void BandwidthProber::InitiatePeriodicProbe() {
-  probe_target_kbps_ = std::min(
-      static_cast<int>(estimated_bitrate_kbps_ * kPeriodicProbeMultiplier),
-      max_bitrate_kbps_);
-
-  if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
-    last_periodic_probe_ms_ = NowMs();
-    return;
-  }
-
-  current_probe_type_ = ProbeType::kPeriodic;
-  chain_hops_ = 0;
-  state_ = State::kProbing;
-  probe_start_ms_ = NowMs();
-  last_periodic_probe_ms_ = probe_start_ms_;
-  pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
-
-  LOG(INFO) << "[Prober] Periodic probe at " << probe_target_kbps_
-            << " kbps (est=" << estimated_bitrate_kbps_ << ")";
 }
 
 void BandwidthProber::InitiateExponentialProbe() {
@@ -316,9 +248,9 @@ void BandwidthProber::InitiateExponentialProbe() {
 }
 
 void BandwidthProber::InitiateAlrProbe() {
-  probe_target_kbps_ = std::min(
+  probe_target_kbps_ = CapProbeTarget(std::min(
       static_cast<int>(estimated_bitrate_kbps_ * kAlrProbeMultiplier),
-      max_bitrate_kbps_);
+      max_bitrate_kbps_));
 
   if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
     return;
@@ -336,39 +268,13 @@ void BandwidthProber::InitiateAlrProbe() {
             << " kbps (est=" << estimated_bitrate_kbps_ << ")";
 }
 
-void BandwidthProber::InitiateDropRecoveryProbe() {
-  // Drop-recovery references the (stale) pre-drop rate, which after a true
-  // capacity cliff (10→1 Mbps) is far above the new capacity. Cap it by the
-  // current estimate so we don't flood the link probing back toward a rate it
-  // can no longer carry.
-  probe_target_kbps_ = CapProbeTarget(std::min(
-      static_cast<int>(pre_drop_bitrate_kbps_ * kProbeFractionAfterDrop),
-      max_bitrate_kbps_));
-
-  if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
-    bitrate_drop_detected_ = false;
-    return;
-  }
-
-  current_probe_type_ = ProbeType::kDropRecovery;
-  chain_hops_ = 0;
-  state_ = State::kProbing;
-  probe_start_ms_ = NowMs();
-  pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
-  bitrate_drop_detected_ = false;
-
-  LOG(INFO) << "[Prober] Drop recovery probe at " << probe_target_kbps_
-            << " kbps (pre-drop=" << pre_drop_bitrate_kbps_
-            << ", current=" << estimated_bitrate_kbps_ << ")";
-}
-
 int BandwidthProber::CapProbeTarget(int target_kbps) const {
-  // Never probe at more than kMaxProbeMultipleOfEstimate × the current
-  // estimate. Keeps a probe proportional to what the link carries now, so a
-  // stale pre-drop reference can't push the probe far above real capacity.
+  // WebRTC AimdRateControl caps every increase at 1.5×throughput. We apply the
+  // same bound to probe targets: a probe explores at most 50% above the current
+  // estimate, so it can't overshoot to ~2× capacity and flood the bottleneck.
   if (estimated_bitrate_kbps_ <= 0) {
     return target_kbps;
   }
-  int cap = estimated_bitrate_kbps_ * kMaxProbeMultipleOfEstimate;
+  int cap = static_cast<int>(estimated_bitrate_kbps_ * kMaxProbeIncreaseLimit);
   return std::min(target_kbps, cap);
 }

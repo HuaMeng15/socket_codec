@@ -39,7 +39,8 @@ class ReceivedFrameDataHandler : public MessageHandler {
 
   void ProcessPacket(const uint8_t* packet_data, size_t packet_size);
 
-  void SendFeedback(uint16_t frame_sequence, uint8_t packet_index);
+  void SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
+                    uint16_t recv_size);
 
   void ReportFrameLoss(uint16_t frame_sequence, const FrameAssembly& assembly);
 

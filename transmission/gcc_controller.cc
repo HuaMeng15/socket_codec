@@ -34,6 +34,7 @@ GccController::GccController()
       packets_sent_since_last_loss_update_(0),
       packets_lost_since_last_loss_update_(0),
       last_loss_update_ms_(0),
+      last_loss_fraction_(0.0),
       target_bitrate_kbps_(1000),
       min_bitrate_kbps_(100),
       max_bitrate_kbps_(30000),
@@ -137,6 +138,10 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
     prober_.OnUnderuseDetected();
   }
   prober_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
+  // Keep the ALR budget accruing against the current delay-based estimate (not
+  // the transient probe target), so "sending below capacity" is judged against
+  // what the link can actually carry.
+  alr_detector_.SetEstimatedBitrate(delay_based_bitrate_kbps_);
 
   // --- Probe lifecycle management (WebRTC ProbeBitrateEstimator semantics) ---
   // The prober raises the send rate to test for headroom. WebRTC resolves a
@@ -218,6 +223,9 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
     probe_active_ = false;
   }
 
+  // Keep loss_based aligned with the (possibly just-committed) delay_based under
+  // low loss, so ComputeFinalBitrate isn't dragged down by a stale value.
+  MaybeSyncLossToDelay();
   target_bitrate_kbps_ = ComputeFinalBitrate();
 
   // Queuing-delay signal for plotting: the per-batch change in accumulated
@@ -248,12 +256,24 @@ void GccController::OnLossReport(const LossReport& report) {
   packets_lost_since_last_loss_update_ += static_cast<int>(report.packets.size());
 
   MaybeUpdateLossRate(NowMs());
+  MaybeSyncLossToDelay();
   target_bitrate_kbps_ = ComputeFinalBitrate();
 }
 
 void GccController::OnPacketsSent(int count) {
   std::lock_guard<std::mutex> lock(mutex_);
   packets_sent_since_last_loss_update_ += count;
+}
+
+void GccController::OnBytesSent(size_t bytes_sent) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  alr_detector_.OnBytesSent(NowMs(), bytes_sent);
+  // While application-limited, arm the prober's periodic (ALR) probe. The
+  // prober enforces its own 5s interval, so calling every batch is fine — it
+  // just keeps the flag fresh so a probe fires once per interval while in ALR.
+  if (alr_detector_.InAlr()) {
+    prober_.OnApplicationLimited();
+  }
 }
 
 void GccController::MaybeUpdateLossRate(int64_t now_ms) {
@@ -268,6 +288,7 @@ void GccController::MaybeUpdateLossRate(int64_t now_ms) {
 
   double loss_fraction = static_cast<double>(packets_lost_since_last_loss_update_) /
       packets_sent_since_last_loss_update_;
+  last_loss_fraction_ = loss_fraction;
   UpdateLossBasedRate(loss_fraction);
 
   last_loss_update_ms_ = now_ms;
@@ -635,6 +656,18 @@ void GccController::UpdateLossBasedRate(double loss_fraction) {
               << "% → loss-based rate=" << loss_based_bitrate_kbps_ << " kbps";
   }
   // 2-10% loss: hold (no change)
+}
+
+void GccController::MaybeSyncLossToDelay() {
+  // Low-loss regime: loss_based tracks delay_based exactly (WebRTC: loss-based
+  // target is capped at delay-based, and with no loss they coincide). Done every
+  // batch so a stale loss_based can't pin the final target below a just-updated
+  // delay_based — the post-probe rate collapse we saw at static_10mbps t≈1.16s,
+  // where delay_based=2542 but loss_based lingered at 531 for ~0.4s.
+  if (last_loss_fraction_ < kLossIncreaseThreshold) {
+    loss_based_bitrate_kbps_ = std::clamp(delay_based_bitrate_kbps_,
+                                          min_bitrate_kbps_, max_bitrate_kbps_);
+  }
 }
 
 int GccController::ComputeFinalBitrate() const {

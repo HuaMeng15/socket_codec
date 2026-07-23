@@ -178,6 +178,10 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
 
   feedback_handler.SetTransportFeedbackCallback(
       [&gcc, encoder_ptr, pacer_ptr](const TransportFeedback& fb) {
+        // Feed the ALR detector the wire bytes sent since the last batch so it
+        // can tell whether the encoder is filling the pipe (not app-limited ->
+        // no periodic probe) or under-producing (app-limited -> probe).
+        if (pacer_ptr) gcc.OnBytesSent(pacer_ptr->ConsumeBytesSent());
         gcc.OnTransportFeedback(fb);
         int target = gcc.GetTargetBitrateKbps();
         if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);

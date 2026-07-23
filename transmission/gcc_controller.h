@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vector>
 
+#include "alr_detector.h"
 #include "bandwidth_prober.h"
 #include "congestion_controller.h"
 
@@ -63,6 +64,15 @@ class GccController : public CongestionController {
   void OnPacketsSent(int count);
 
   /**
+   * Report wire bytes actually sent since the last call, for ALR detection.
+   * Call once per feedback batch (bytes come from Pacer::ConsumeBytesSent()).
+   * Feeds the AlrDetector; when it reports application-limited, the prober is
+   * armed to fire a periodic probe. A greedy encoder that fills the pipe never
+   * trips this (WebRTC-faithful); a variable/VBR encoder does on simple scenes.
+   */
+  void OnBytesSent(size_t bytes_sent);
+
+  /**
    * Inject a fake clock for deterministic testing. When set, all internal
    * time reads use this value instead of steady_clock. Advance it manually.
    * Pass nullptr to revert to real clock.
@@ -113,6 +123,13 @@ class GccController : public CongestionController {
   // accumulated window. Called from the feedback path so the estimate tracks
   // upward when loss is low and downward when loss is high.
   void MaybeUpdateLossRate(int64_t now_ms);
+  // Under low loss, keep loss_based == delay_based every batch. WebRTC caps the
+  // loss-based target at the delay-based estimate; with no loss the two coincide.
+  // Doing this continuously (not only on the kLossUpdateIntervalMs cadence)
+  // stops a stale loss_based from pinning ComputeFinalBitrate below a
+  // just-committed delay_based (e.g. immediately after a successful probe), and
+  // keeps loss_based a correct base for the next decrease when loss rises.
+  void MaybeSyncLossToDelay();
   int ComputeFinalBitrate() const;
 
   mutable std::mutex mutex_;
@@ -199,6 +216,12 @@ class GccController : public CongestionController {
   int packets_sent_since_last_loss_update_;
   int packets_lost_since_last_loss_update_;
   int64_t last_loss_update_ms_;
+  // Most recent measured loss fraction. Under low loss we keep loss_based
+  // pinned to delay_based every batch (not just on the periodic cadence), so a
+  // freshly committed delay_based (e.g. right after a probe) is never dragged
+  // down by a stale loss_based in ComputeFinalBitrate. Defaults to 0 (low-loss
+  // regime) before the first loss measurement.
+  double last_loss_fraction_;
   static constexpr int kLossUpdateIntervalMs = 500;
   static constexpr int kLossUpdateMinPackets = 20;
 
@@ -209,6 +232,7 @@ class GccController : public CongestionController {
 
   // Bandwidth probing
   BandwidthProber prober_;
+  AlrDetector alr_detector_;
   // Probe resolution bookkeeping (GCC side), following WebRTC's
   // ProbeBitrateEstimator: accumulate the probe traffic's received bytes and
   // arrival span across feedback batches starting when the probe begins, and
