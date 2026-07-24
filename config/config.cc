@@ -53,13 +53,21 @@ void InitializeFlags() {
 
   // Pacer tuning. The pacer is a bounded token bucket: it releases packets at
   // pace_multiplier × target, with bursts capped at pace_burst_cap_ms of data.
-  // Default 1.0× matches a greedy encoder (mock or real) that always fills the
-  // target rate — the frame occupies the full interval and there is no idle
-  // gap for bursting. Set to 2.5× (250) to match WebRTC's kDefaultPaceMultiplier
-  // when using a real encoder that sometimes undershoots its target.
-  parser.AddIntFlag("cc_pace_multiplier_x100", 100,
-                    "pacer rate as a multiple of target, ×100 (100 = 1.0x for "
-                    "greedy encoders; 250 = 2.5x for real encoders that undershoot)");
+  // Default 2.5× matches WebRTC's kDefaultPaceMultiplier. It MUST exceed 1.0×:
+  // a greedy encoder produces target/fps bits per frame, so at exactly 1.0× the
+  // pacer drains one frame in precisely one frame interval (=1/fps) — 100%
+  // utilization with zero headroom. That is only marginally stable: any queue
+  // that ever forms (an AIMD sawtooth peak above the link, or a startup-probe
+  // overshoot) can never be drained, because the pacer's output rate equals the
+  // encoder's input rate at every target. The queue becomes a permanent standing
+  // delay (~40ms on a 10 Mbps link). At 2.5× the pacer empties each frame in
+  // ~1/(2.5·fps) and sits idle the rest of the interval, so that idle headroom
+  // flushes any accumulated queue within a frame and keeps latency at ~one
+  // interval. The burst cap below stops the faster drain from becoming a flood.
+  parser.AddIntFlag("cc_pace_multiplier_x100", 250,
+                    "pacer rate as a multiple of target, ×100 (250 = 2.5x, "
+                    "WebRTC's kDefaultPaceMultiplier; must be >1.0x or a standing "
+                    "queue at the pacer can never drain)");
   parser.AddIntFlag("cc_pace_burst_cap_ms", 5,
                     "max pacer burst in ms of data at the current rate "
                     "(token-bucket depth; prevents idle-gap credit buildup)");
@@ -75,10 +83,10 @@ void InitializeFlags() {
   // Set encoder_variable_mode=0 (default) for the static / greedy mode used in
   // CC performance benchmarks: the encoder always fills the CC target exactly,
   // the AlrDetector never enters ALR, and steady state is pure AIMD — faithful
-  // to WebRTC with a source that saturates the link.
-  //
-  // When using variable mode, also set cc_pace_multiplier_x100=250 to match
-  // WebRTC's kDefaultPaceMultiplier (2.5×), which absorbs encoder-rate variance.
+  // to WebRTC with a source that saturates the link. (The pacer already
+  // defaults to 2.5× — see cc_pace_multiplier_x100 above — which absorbs
+  // encoder-rate variance in variable mode and keeps the pacer queue drained
+  // in static mode.)
   parser.AddIntFlag("encoder_variable_mode", 0,
                     "0=static/greedy (always fills CC target); "
                     "1=variable/VBR (duty-cycle ALR simulation)");
