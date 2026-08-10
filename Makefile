@@ -101,6 +101,7 @@ TESTABLE_SRCS = $(wildcard tools/*.cc log_system/*.cc) \
                 transmission/pacer.cc \
                 transmission/gcc_controller.cc \
                 transmission/bandwidth_prober.cc \
+                transmission/congestion_window_pushback_controller.cc \
                 transmission/alr_detector.cc
 UNIT_TEST_OBJS = $(patsubst %.cc,$(BUILD_DIR)/%.o,$(UNIT_TEST_SRCS)) \
                  $(patsubst %.cc,$(BUILD_DIR)/%.o,$(TESTABLE_SRCS))

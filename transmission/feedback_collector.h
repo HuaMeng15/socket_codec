@@ -36,6 +36,15 @@ class FeedbackCollector {
   void SetFeedbackInterval(int packet_count);
 
   /**
+   * Set the max time a packet may wait before its batch is sent (ms). Feedback
+   * is flushed on whichever comes first: feedback_interval_ packets, or a
+   * pending packet aging past this window. This bounds feedback latency at low
+   * bitrates, where the packet-count trigger would otherwise take far too long
+   * (e.g. 20 pkts @ 1 Mbps ≈ 192 ms). <=0 disables the time trigger.
+   */
+  void SetFeedbackMaxIntervalMs(int ms);
+
+  /**
    * Record a packet arrival. Stores timestamp and the actual received byte
    * count, and triggers feedback send if interval is reached.
    */
@@ -71,6 +80,7 @@ class FeedbackCollector {
   std::vector<ArrivalEntry> pending_entries_;
   SendCallback send_cb_;
   int feedback_interval_;  // send after this many packets
+  int feedback_max_interval_ms_;  // or after a packet waits this long (<=0 off)
   std::chrono::steady_clock::time_point epoch_;
   bool epoch_set_;
 };

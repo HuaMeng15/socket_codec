@@ -38,24 +38,44 @@ def main():
 
     text = send_log.read_text()
 
-    # GCC_STATE lines
-    re_gcc = re.compile(
-        r"\[" + _TS + r"\].*\[GCC_STATE\] target=(\d+) delay_based=(\d+) "
-        r"loss_based=(\d+) slope=(\S+) threshold=(\S+) usage=(\S+) "
-        r"queuing_delay_ms=(\S+)"
-    )
+    # GCC_STATE lines. Parse every "key=value" token generically so the CSV
+    # automatically tracks whatever fields the log line emits — no need to edit
+    # this regex each time a metric is added to GccController.
+    re_gcc_line = re.compile(r"\[" + _TS + r"\].*\[GCC_STATE\] (.*)")
+    re_kv = re.compile(r"(\w+)=(\S+)")
+
+    def _coerce(v):
+        """int if it looks like one, else float, else the raw string."""
+        try:
+            return int(v)
+        except ValueError:
+            pass
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
     gcc_rows = []
-    for m in re_gcc.finditer(text):
-        gcc_rows.append({
-            "ts": parse_ts(m.group(1)),
-            "target": int(m.group(2)),
-            "delay_based": int(m.group(3)),
-            "loss_based": int(m.group(4)),
-            "slope": float(m.group(5)),
-            "threshold": float(m.group(6)),
-            "usage": m.group(7),
-            "queuing_delay": float(m.group(8)),
-        })
+    # Preserve the field order as first seen in the log for stable CSV columns.
+    field_order = []
+    for m in re_gcc_line.finditer(text):
+        row = {"ts": parse_ts(m.group(1))}
+        for km in re_kv.finditer(m.group(2)):
+            key, val = km.group(1), km.group(2)
+            row[key] = _coerce(val)
+            if key not in field_order:
+                field_order.append(key)
+        gcc_rows.append(row)
+
+    # Back-compat aliases used by the plotting code below.
+    for r in gcc_rows:
+        r["target"] = r.get("target", 0)
+        r["delay_based"] = r.get("delay_based", 0)
+        r["loss_based"] = r.get("loss_based", 0)
+        r["slope"] = r.get("slope", 0.0)
+        r["threshold"] = r.get("threshold", 0.0)
+        r["usage"] = r.get("usage", "")
+        r["queuing_delay"] = r.get("queuing_delay_ms", 0.0)
 
     # SCHEDULE lines (link capacity ground truth).
     # Groups: 1=timestamp, 2=schedule time (t=Nms), 3=bandwidth kbps.
@@ -161,16 +181,23 @@ def main():
             achieved_t.append(s["ts"] - t0)
             achieved_v.append(kbps)
 
-    # Write CSV for reference
+    # Write CSV for reference. Columns = t_sec followed by every field seen in
+    # the GCC_STATE lines, in the order they first appeared in the log. This
+    # stays complete automatically as new metrics are added to the log line.
     csv_path = result_dir / "gcc_state.csv"
+
+    def _fmt(v):
+        if isinstance(v, float):
+            return f"{v:.4f}"
+        return str(v)
+
     with open(csv_path, "w") as f:
-        f.write("t_sec,target_kbps,delay_based_kbps,loss_based_kbps,"
-                "slope,threshold,usage,queuing_delay_ms\n")
+        f.write("t_sec," + ",".join(field_order) + "\n")
         for r in gcc_rows:
-            f.write(f"{r['ts']-t0:.3f},{r['target']},{r['delay_based']},"
-                    f"{r['loss_based']},{r['slope']:.4f},{r['threshold']:.3f},"
-                    f"{r['usage']},{r['queuing_delay']:.3f}\n")
-    print(f"Wrote {csv_path} ({len(gcc_rows)} GCC samples)")
+            cells = [f"{r['ts']-t0:.3f}"] + [_fmt(r.get(k, "")) for k in field_order]
+            f.write(",".join(cells) + "\n")
+    print(f"Wrote {csv_path} ({len(gcc_rows)} GCC samples, "
+          f"{len(field_order)} metrics: {', '.join(field_order)})")
 
     # Plot
     try:

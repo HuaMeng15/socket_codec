@@ -8,6 +8,7 @@
 
 FeedbackCollector::FeedbackCollector()
     : feedback_interval_(20),
+      feedback_max_interval_ms_(25),
       epoch_set_(false) {
 }
 
@@ -17,6 +18,11 @@ void FeedbackCollector::SetSendCallback(SendCallback cb) {
 
 void FeedbackCollector::SetFeedbackInterval(int packet_count) {
   feedback_interval_ = packet_count > 0 ? packet_count : 20;
+}
+
+void FeedbackCollector::SetFeedbackMaxIntervalMs(int ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  feedback_max_interval_ms_ = ms;
 }
 
 void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
@@ -32,7 +38,22 @@ void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
 
   pending_entries_.push_back({frame_sequence, packet_index, recv_size, now});
 
-  if (static_cast<int>(pending_entries_.size()) >= feedback_interval_) {
+  // Send on whichever fires first: enough packets accumulated, OR the oldest
+  // pending packet has waited longer than the max interval. The time trigger
+  // bounds feedback latency when the link is slow — at low bitrates the
+  // packet-count trigger alone would delay feedback by ~one window's worth of
+  // arrivals (e.g. 192 ms for 20 pkts @ 1 Mbps), starving the sender's
+  // congestion controller exactly when it most needs to react.
+  bool count_reached =
+      static_cast<int>(pending_entries_.size()) >= feedback_interval_;
+  bool time_reached = false;
+  if (feedback_max_interval_ms_ > 0 && !pending_entries_.empty()) {
+    auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now - pending_entries_.front().arrival_time)
+                   .count();
+    time_reached = age >= feedback_max_interval_ms_;
+  }
+  if (count_reached || time_reached) {
     SendTransportFeedback();
   }
 }

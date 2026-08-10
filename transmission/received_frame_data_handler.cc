@@ -221,6 +221,10 @@ void ReceivedFrameDataHandler::ReportFrameLoss(uint16_t frame_sequence,
   }
 }
 
+void ReceivedFrameDataHandler::SetFeedbackMaxIntervalMs(int ms) {
+  feedback_collector_.SetFeedbackMaxIntervalMs(ms);
+}
+
 void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
                                             uint16_t recv_size) {
   // Try to initialize feedback sender if not already initialized

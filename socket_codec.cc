@@ -148,6 +148,9 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   int cc_max = parser.GetFlag<int>("cc_max_bitrate_kbps");
   gcc.SetBitrateRange(cc_min, cc_max);
   gcc.SetInitialBitrate(cc_initial);  // ramp/probe up to capacity
+  gcc.SetCongestionWindowConfig(
+      parser.GetFlag<int>("cc_cwnd_queue_size_ms"),
+      parser.GetFlag<int>("cc_cwnd_min_bitrate_kbps"));
 
   // Wire actual sent packet count from DataSender into GCC
   DataSender* data_sender_ptr = video_capture_and_send.GetDataSender();
@@ -272,6 +275,8 @@ int receiver_create_and_run(CmdLineParser& parser, int dest_port, const std::str
     LOG(ERROR) << "[socket_codec_main] Failed to initialize received frame data handler";
     return -1;
   }
+  received_frame_data_handler.SetFeedbackMaxIntervalMs(
+      parser.GetFlag<int>("feedback_max_interval_ms"));
   data_receiver.SetMessageHandler(&received_frame_data_handler);
 
   /* Start Running */

@@ -28,6 +28,10 @@ class ReceivedFrameDataHandler : public MessageHandler {
   // Initialize the handler (creates and initializes decoder)
   int Initialize();
 
+  // Max time (ms) a packet may wait before its feedback batch is flushed.
+  // Bounds feedback latency at low bitrates. Forwards to the FeedbackCollector.
+  void SetFeedbackMaxIntervalMs(int ms);
+
  private:
   // Frame assembly state
   struct FrameAssembly {

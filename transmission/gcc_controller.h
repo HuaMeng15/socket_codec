@@ -4,12 +4,15 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "alr_detector.h"
 #include "bandwidth_prober.h"
 #include "congestion_controller.h"
+#include "congestion_window_pushback_controller.h"
 
 /**
  * GccController: Google Congestion Control aligned with WebRTC implementation.
@@ -47,6 +50,14 @@ class GccController : public CongestionController {
   void SetBitrateRange(int min_kbps, int max_kbps) override;
 
   void SetInitialBitrate(int kbps);
+
+  /**
+   * Configure the congestion-window pushback controller (WebRTC field trial
+   * "WebRTC-CongestionWindow"). queue_size_ms is the additional time added to
+   * the min RTT when sizing the window; min_bitrate_kbps is the pushback floor.
+   * Set queue_size_ms <= 0 to disable pushback entirely (legacy behavior).
+   */
+  void SetCongestionWindowConfig(int queue_size_ms, int min_bitrate_kbps);
 
   /**
    * True while the bandwidth prober is actively probing (send rate elevated
@@ -118,6 +129,10 @@ class GccController : public CongestionController {
 
   // --- Rate controller ---
   void UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms);
+  // Acked throughput the AIMD controller should react to: the instantaneous
+  // per-batch received rate while in overuse (fast reaction to a capacity
+  // drop), otherwise the smoothed sliding-window rate.
+  double EffectiveAckedKbps() const;
   void UpdateLossBasedRate(double loss_fraction);
   // Periodically (time-based) recompute the loss-based estimate over the
   // accumulated window. Called from the feedback path so the estimate tracks
@@ -199,8 +214,19 @@ class GccController : public CongestionController {
   };
   std::deque<AckedSample> acked_window_;
   int64_t acked_window_bytes_ = 0;  // running sum of bytes in the window
-  static constexpr int64_t kAckedWindowUs = 1000000;  // 1s sliding window
+  // 100ms sliding window, aligned with the congestion-window RTT horizon. A
+  // short window reacts to a capacity cliff within ~1 RTT instead of lagging a
+  // full second (the old 1s window kept pre-drop ACKs alive, so the AIMD
+  // decrease chased a stale-high acked rate and overshot the queue up).
+  static constexpr int64_t kAckedWindowUs = 100000;  // 100ms sliding window
   static constexpr int kAckedMinSamples = 2;          // need ≥2 for a span
+
+  // When overuse is detected we switch the AIMD decrease/increase-cap to use
+  // the INSTANTANEOUS per-batch received rate instead of the windowed acked
+  // rate — the instant rate reflects the collapsed capacity immediately (the
+  // window still averages in pre-drop throughput). We hold this mode until the
+  // queue drains enough to register underuse, then switch back to the window.
+  bool use_instant_acked_ = false;
 
   // Loss-based rate control (WebRTC send_side_bandwidth_estimation)
   int loss_based_bitrate_kbps_;
@@ -259,6 +285,28 @@ class GccController : public CongestionController {
   // Minimum accumulated arrival span before a probe may commit. Below this, the
   // measurement is dominated by bunching noise, not real throughput.
   static constexpr int64_t kProbeMinSpanUs = 30000;  // 30 ms
+
+  // --- Congestion-window pushback (WebRTC goog_cc port) -------------------
+  // Recomputes the congestion window from the loss-based rate and the min
+  // feedback-max RTT, and applies the pushback ratchet to the final target.
+  // Disabled when cwnd_queue_size_ms_ <= 0 (mirrors an unset field trial).
+  void UpdateCongestionWindowSize();
+  // nullptr when pushback is disabled (mirrors WebRTC's optional controller).
+  std::unique_ptr<CongestionWindowPushbackController> pushback_;
+  int cwnd_queue_size_ms_ = 350;      // field-trial QueueSize (additional time)
+  int cwnd_min_bitrate_kbps_ = 30;    // field-trial MinBitrate
+  int64_t current_data_window_bytes_ = -1;  // <0 = unset (EWMA seed)
+  // Outstanding (in-flight) bytes = cumulative sent - cumulative acked.
+  int64_t total_sent_bytes_ = 0;
+  int64_t total_acked_bytes_ = 0;
+  // Feedback-max-RTT window (ms). Each batch contributes its max sample; the
+  // congestion window uses the MIN across the window (WebRTC semantics).
+  std::deque<std::pair<int64_t, int64_t>> feedback_max_rtts_;  // (time_ms, rtt_ms)
+  static constexpr int64_t kRttWindowMs = 1000;
+  int64_t last_rtt_ms_ = 0;              // most recent batch max, for logging
+  double pushback_ratio_ = 1.0;          // for logging
+  static constexpr int64_t kMinCwndBytes = 2 * 1500;
+  static constexpr int64_t kMaxRttWindowSamples = 100;
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;

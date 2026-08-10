@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "transmission/transport_feedback.h"
 #include "transmission/feedback_collector.h"
@@ -82,6 +84,40 @@ TEST(TransportFeedbackTest, LossReportSerializeDeserialize) {
   EXPECT_EQ(received_report.packets[0].packet_index, 2);
   EXPECT_EQ(received_report.packets[1].frame_sequence, 5);
   EXPECT_EQ(received_report.packets[1].packet_index, 7);
+}
+
+TEST(TransportFeedbackTest, CountTriggerSendsAfterInterval) {
+  // With the time trigger disabled, feedback is sent only when the packet
+  // count reaches the interval — not before.
+  FeedbackCollector collector;
+  collector.SetFeedbackMaxIntervalMs(0);  // disable time trigger
+  collector.SetFeedbackInterval(5);
+  int sends = 0;
+  collector.SetSendCallback([&](const uint8_t*, size_t) { sends++; });
+
+  for (int i = 0; i < 4; i++) {
+    collector.OnPacketReceived(1, static_cast<uint8_t>(i), 1200);
+  }
+  EXPECT_EQ(sends, 0);  // 4 < 5, no send yet
+  collector.OnPacketReceived(1, 4, 1200);
+  EXPECT_EQ(sends, 1);  // 5th packet hits the interval
+}
+
+TEST(TransportFeedbackTest, TimeTriggerSendsBeforeCountReached) {
+  // At low bitrate the count interval is far from reached, but a packet aging
+  // past the max interval must still flush — this is what bounds feedback
+  // latency when the link is slow.
+  FeedbackCollector collector;
+  collector.SetFeedbackInterval(20);        // count trigger far off
+  collector.SetFeedbackMaxIntervalMs(20);   // 20ms time bound
+  int sends = 0;
+  collector.SetSendCallback([&](const uint8_t*, size_t) { sends++; });
+
+  collector.OnPacketReceived(1, 0, 1200);   // starts the clock
+  EXPECT_EQ(sends, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));  // exceed window
+  collector.OnPacketReceived(1, 1, 1200);   // 2 pkts (<20) but oldest is >20ms
+  EXPECT_EQ(sends, 1);  // time trigger fired despite count not reached
 }
 
 TEST(TransportFeedbackTest, LossDetection) {

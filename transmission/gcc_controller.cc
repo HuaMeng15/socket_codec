@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <numeric>
 
 #include "log_system/log_system.h"
@@ -49,6 +50,10 @@ GccController::GccController()
   last_threshold_update_ms_ = NowMs();
   last_increase_time_ms_ = NowMs();
   last_loss_update_ms_ = NowMs();
+  // Enable congestion-window pushback with WebRTC's default field-trial values
+  // (QueueSize:350, MinBitrate:30000). This is on by default in SparkRTC.
+  pushback_ = std::make_unique<CongestionWindowPushbackController>(
+      static_cast<uint32_t>(cwnd_min_bitrate_kbps_) * 1000u);
 }
 
 void GccController::SetInitialBitrate(int kbps) {
@@ -57,6 +62,20 @@ void GccController::SetInitialBitrate(int kbps) {
   loss_based_bitrate_kbps_ = kbps;
   target_bitrate_kbps_ = kbps;
   prober_.SetEstimatedBitrate(kbps);
+}
+
+void GccController::SetCongestionWindowConfig(int queue_size_ms,
+                                              int min_bitrate_kbps) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  cwnd_queue_size_ms_ = queue_size_ms;
+  cwnd_min_bitrate_kbps_ = min_bitrate_kbps;
+  if (queue_size_ms > 0) {
+    pushback_ = std::make_unique<CongestionWindowPushbackController>(
+        static_cast<uint32_t>(min_bitrate_kbps) * 1000u);
+  } else {
+    pushback_.reset();  // disabled
+  }
+  current_data_window_bytes_ = -1;
 }
 
 void GccController::SetBitrateRange(int min_kbps, int max_kbps) {
@@ -120,6 +139,32 @@ void GccController::EnableAckedEstimatorForTesting() {
 void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t now_ms = NowMs();
+
+  // --- Congestion-window inputs: RTT and acked (in-flight) bytes ----------
+  // RTT sample per acked packet = feedback-receipt time (now, sender clock) -
+  // packet send time (sender clock). Both are steady_clock us. We take the
+  // batch MAX (WebRTC's feedback_max_rtt) and keep a sliding window; the
+  // window MIN is used to size the congestion window (robust to transient
+  // spikes). Also accumulate acked wire bytes for the outstanding estimate.
+  int64_t batch_max_rtt_ms = -1;
+  int64_t now_us = now_ms * 1000;
+  for (const auto& pkt : feedback.packets) {
+    if (pkt.send_time_us >= 0) {
+      int64_t rtt_ms = (now_us - pkt.send_time_us) / 1000;
+      if (rtt_ms > batch_max_rtt_ms) batch_max_rtt_ms = rtt_ms;
+    }
+    total_acked_bytes_ += static_cast<int64_t>(pkt.recv_size);
+  }
+  if (batch_max_rtt_ms >= 0) {
+    last_rtt_ms_ = batch_max_rtt_ms;
+    feedback_max_rtts_.emplace_back(now_ms, batch_max_rtt_ms);
+    while (feedback_max_rtts_.size() > 1 &&
+           (now_ms - feedback_max_rtts_.front().first > kRttWindowMs ||
+            feedback_max_rtts_.size() >
+                static_cast<size_t>(kMaxRttWindowSamples))) {
+      feedback_max_rtts_.pop_front();
+    }
+  }
 
   BandwidthUsage usage = UpdateTrendline(feedback);
   UpdateAckedBitrate(feedback);
@@ -226,7 +271,34 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   // Keep loss_based aligned with the (possibly just-committed) delay_based under
   // low loss, so ComputeFinalBitrate isn't dragged down by a stale value.
   MaybeSyncLossToDelay();
-  target_bitrate_kbps_ = ComputeFinalBitrate();
+  int base_kbps = ComputeFinalBitrate();
+
+  // --- Congestion-window pushback (WebRTC goog_cc) ------------------------
+  // Recompute the window from the loss-based rate and min feedback RTT, feed
+  // in the current in-flight bytes, and let the pushback ratchet adjust the
+  // target. This is the piece that crashes the target to the floor within
+  // ~1 RTT under a capacity drop and holds it until the backlog drains — with
+  // no packet loss required. Applied to the target directly (DropFrame:false).
+  if (pushback_) {
+    UpdateCongestionWindowSize();
+    if (current_data_window_bytes_ > 0) {
+      pushback_->SetDataWindow(current_data_window_bytes_);
+    }
+    int64_t outstanding = total_sent_bytes_ - total_acked_bytes_;
+    if (outstanding < 0) outstanding = 0;  // acked>sent only from rounding
+    pushback_->UpdateOutstandingData(outstanding);
+    uint32_t pushed_bps = pushback_->UpdateTargetBitrate(
+        static_cast<uint32_t>(base_kbps) * 1000u);
+    pushback_ratio_ = pushback_->encoding_rate_ratio();
+    // Pushback deliberately drives the target BELOW the operational min during
+    // a drain (down to its own floor, cwnd_min_bitrate_kbps_), so we do NOT
+    // re-apply min_bitrate_kbps_ here — that would block the drain. The
+    // controller already guarantees result >= min(estimate, pushback floor),
+    // mirroring WebRTC's max(GetMinBitrate()=5kbps, pushback_rate).
+    base_kbps = std::max<int>(cwnd_min_bitrate_kbps_,
+                              static_cast<int>(pushed_bps / 1000));
+  }
+  target_bitrate_kbps_ = base_kbps;
 
   // Queuing-delay signal for plotting: the per-batch change in accumulated
   // delay (ms). Absolute one-way delay is NOT meaningful here because send
@@ -239,13 +311,26 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   // Structured state line for offline analysis / plotting.
   const char* usage_str = usage == BandwidthUsage::kOveruse ? "overuse"
                         : usage == BandwidthUsage::kUnderuse ? "underuse" : "normal";
+  bool is_probing = prober_.GetState() == BandwidthProber::State::kProbing ||
+                    prober_.GetState() == BandwidthProber::State::kWaitingForResult;
   LOG(INFO) << "[GCC_STATE] target=" << target_bitrate_kbps_
             << " delay_based=" << delay_based_bitrate_kbps_
             << " loss_based=" << loss_based_bitrate_kbps_
+            << " acked_kbps=" << acked_bitrate_kbps_
             << " slope=" << prev_trend_
             << " threshold=" << adaptive_threshold_
             << " usage=" << usage_str
-            << " queuing_delay_ms=" << queuing_delay_ms;
+            << " overuse_counter=" << overuse_counter_
+            << " loss_fraction=" << last_loss_fraction_
+            << " queuing_delay_ms=" << queuing_delay_ms
+            << " smoothed_delay_ms=" << smoothed_delay_
+            << " rtt_ms=" << last_rtt_ms_
+            << " outstanding_bytes=" << (total_sent_bytes_ - total_acked_bytes_)
+            << " data_window=" << current_data_window_bytes_
+            << " pushback_ratio=" << pushback_ratio_
+            << " received_rate_kbps=" << last_received_rate_kbps_
+            << " instant_acked=" << (use_instant_acked_ ? 1 : 0)
+            << " probing=" << (is_probing ? 1 : 0);
 }
 
 void GccController::OnLossReport(const LossReport& report) {
@@ -267,6 +352,7 @@ void GccController::OnPacketsSent(int count) {
 
 void GccController::OnBytesSent(size_t bytes_sent) {
   std::lock_guard<std::mutex> lock(mutex_);
+  total_sent_bytes_ += static_cast<int64_t>(bytes_sent);
   alr_detector_.OnBytesSent(NowMs(), bytes_sent);
   // While application-limited, arm the prober's periodic (ALR) probe. The
   // prober enforces its own 5s interval, so calling every batch is fine — it
@@ -574,16 +660,36 @@ void GccController::UpdateAdaptiveThreshold(double modified_trend,
 
 // --- Rate controller (WebRTC: AIMD) ---
 
+double GccController::EffectiveAckedKbps() const {
+  // In overuse, react to the instantaneous received rate — on a capacity
+  // cliff it reports the collapsed rate immediately, whereas the sliding
+  // window still averages in pre-drop throughput and lags ~1 window behind.
+  if (use_instant_acked_ && last_received_rate_kbps_ > 0.0) {
+    return last_received_rate_kbps_;
+  }
+  return acked_bitrate_kbps_;
+}
+
 void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
+  // Latch the acked-rate source on state transitions: overuse -> react to the
+  // instantaneous rate; underuse (queue draining) -> back to the smooth
+  // window. kNormal holds whichever mode we're in.
+  if (usage == BandwidthUsage::kOveruse) {
+    use_instant_acked_ = true;
+  } else if (usage == BandwidthUsage::kUnderuse) {
+    use_instant_acked_ = false;
+  }
   switch (usage) {
     case BandwidthUsage::kOveruse: {
       // WebRTC AimdRateControl decrease: snap to beta * measured throughput
       // (not beta * current estimate). This drains the self-induced queue and
       // lands the estimate right at ~capacity instead of just shaving the
-      // (possibly inflated) current value.
+      // (possibly inflated) current value. During overuse the throughput is
+      // the INSTANTANEOUS received rate (see EffectiveAckedKbps).
+      double eff_acked = EffectiveAckedKbps();
       int target = delay_based_bitrate_kbps_;
-      if (acked_bitrate_kbps_ > 0.0) {
-        int from_acked = static_cast<int>(acked_bitrate_kbps_ * kMultiplicativeDecrease);
+      if (eff_acked > 0.0) {
+        int from_acked = static_cast<int>(eff_acked * kMultiplicativeDecrease);
         // Only decrease (never raise on overuse).
         target = std::min(delay_based_bitrate_kbps_, from_acked);
       } else {
@@ -593,7 +699,9 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
       overuse_counter_ = 0;
       last_overuse_time_ms_ = now_ms;
       LOG(INFO) << "[GCC] Overuse → decrease to " << delay_based_bitrate_kbps_
-                << " kbps (acked=" << static_cast<int>(acked_bitrate_kbps_) << ")";
+                << " kbps (eff_acked=" << static_cast<int>(eff_acked)
+                << " instant=" << (use_instant_acked_ ? 1 : 0)
+                << " window_acked=" << static_cast<int>(acked_bitrate_kbps_) << ")";
       break;
     }
     case BandwidthUsage::kUnderuse:
@@ -616,8 +724,9 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
       // throughput (+ a small slack). This is what stops the estimate from
       // ramping far past a saturated link — the acked rate plateaus at
       // capacity, capping the increase near capacity instead of running away.
-      if (acked_bitrate_kbps_ > 0.0) {
-        int increase_limit = static_cast<int>(1.5 * acked_bitrate_kbps_) + 10;
+      double eff_acked = EffectiveAckedKbps();
+      if (eff_acked > 0.0) {
+        int increase_limit = static_cast<int>(1.5 * eff_acked) + 10;
         new_rate = std::min(new_rate, increase_limit);
         // Don't let the cap force a decrease here.
         new_rate = std::max(new_rate, delay_based_bitrate_kbps_);
@@ -668,6 +777,30 @@ void GccController::MaybeSyncLossToDelay() {
     loss_based_bitrate_kbps_ = std::clamp(delay_based_bitrate_kbps_,
                                           min_bitrate_kbps_, max_bitrate_kbps_);
   }
+}
+
+void GccController::UpdateCongestionWindowSize() {
+  // WebRTC goog_cc_network_control.cc::UpdateCongestionWindowSize.
+  // time_window = min(feedback_max_rtt over the window) + additional time.
+  if (feedback_max_rtts_.empty()) return;
+  int64_t min_feedback_max_rtt_ms = feedback_max_rtts_.front().second;
+  for (const auto& s : feedback_max_rtts_) {
+    if (s.second < min_feedback_max_rtt_ms) min_feedback_max_rtt_ms = s.second;
+  }
+  int64_t time_window_ms = min_feedback_max_rtt_ms + cwnd_queue_size_ms_;
+  // data_window = loss_based_rate * time_window. loss_based is kbps, time is
+  // ms: bytes = kbps * 1000 / 8 * (ms/1000) = loss_based_kbps * time_ms / 8.
+  int64_t data_window =
+      static_cast<int64_t>(loss_based_bitrate_kbps_) * time_window_ms / 8;
+  if (current_data_window_bytes_ > 0) {
+    // EWMA with prior: (new + old) / 2, floored at kMinCwndBytes.
+    data_window =
+        std::max<int64_t>(kMinCwndBytes,
+                          (data_window + current_data_window_bytes_) / 2);
+  } else {
+    data_window = std::max<int64_t>(kMinCwndBytes, data_window);
+  }
+  current_data_window_bytes_ = data_window;
 }
 
 int GccController::ComputeFinalBitrate() const {

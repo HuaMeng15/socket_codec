@@ -51,6 +51,17 @@ void InitializeFlags() {
                     "maximum GCC target bitrate in kbps (ceiling; also caps "
                     "probe targets)");
 
+  // Congestion-window pushback (WebRTC "WebRTC-CongestionWindow" field trial).
+  // Crashes the target to cc_cwnd_min_bitrate_kbps within ~1 RTT under a
+  // capacity drop and holds until the in-flight backlog drains — no loss
+  // required. cc_cwnd_queue_size_ms is the additional time added to the min
+  // RTT when sizing the window. Set queue_size_ms <= 0 to disable.
+  parser.AddIntFlag("cc_cwnd_queue_size_ms", 350,
+                    "congestion-window pushback: additional time (ms) added to "
+                    "min RTT for window sizing; <=0 disables pushback");
+  parser.AddIntFlag("cc_cwnd_min_bitrate_kbps", 30,
+                    "congestion-window pushback: target floor in kbps");
+
   // Pacer tuning. The pacer is a bounded token bucket: it releases packets at
   // pace_multiplier × target, with bursts capped at pace_burst_cap_ms of data.
   // Default 2.5× matches WebRTC's kDefaultPaceMultiplier. It MUST exceed 1.0×:
@@ -71,6 +82,15 @@ void InitializeFlags() {
   parser.AddIntFlag("cc_pace_burst_cap_ms", 5,
                     "max pacer burst in ms of data at the current rate "
                     "(token-bucket depth; prevents idle-gap credit buildup)");
+
+  // Receiver-side feedback timing. Feedback is sent on whichever fires first:
+  // 20 packets accumulated, or a pending packet aging past this window. The
+  // time bound keeps feedback fast at low bitrates, where the packet-count
+  // trigger alone would lag ~one window of arrivals (20 pkts @ 1 Mbps ≈ 192ms),
+  // starving the sender's congestion controller. <=0 disables the time trigger.
+  parser.AddIntFlag("feedback_max_interval_ms", 25,
+                    "max time (ms) a packet waits before its feedback batch is "
+                    "sent; bounds feedback latency at low bitrate; <=0 disables");
 
   // Mock encoder mode. Set encoder_variable_mode=1 to enable a content-adaptive
   // VBR simulation: during each period the encoder spends encoder_alr_fraction%
