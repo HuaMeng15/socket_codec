@@ -12,8 +12,8 @@ static const int INITIAL_BITRATE = kDefaultInitialBitrateKbps;
 static const int SLICE_MAX_SIZE = 0;
 static const double BANDWIDTH_UTILIZATION = 0.9;
 static const double VBV_NORMAL_RATIO = 0.5;   // normal: vbv_buffer = this * bitrate (kbits)
-static const double VBV_REDUCED_RATIO = 0.04; // when lowering bitrate: use this for ~10 frames
-static const int VBV_RECOVERY_FRAMES = 10;
+// VBV_REDUCED_RATIO and VBV_RECOVERY_FRAMES removed - now using network_usage_state_
+
 
 X264Encoder::X264Encoder()
     : encoder_(nullptr),
@@ -24,7 +24,7 @@ X264Encoder::X264Encoder()
       width_(0),
       height_(0),
       fps_(0),
-      vbv_recovery_frames_left_(0) {
+      network_usage_state_(0.0) {
   memset(&params_, 0, sizeof(params_));
   memset(&pic_in_, 0, sizeof(pic_in_));
   memset(&pic_out_, 0, sizeof(pic_out_));
@@ -115,27 +115,43 @@ void X264Encoder::SetTargetBitrate(int bitrate_kbps) {
     return;  // Same as last time, ignore
   }
 
-  int prev_kbps = target_bitrate_kbps_;
   target_bitrate_kbps_ = bitrate_kbps;
   double bitrate = bitrate_kbps * BANDWIDTH_UTILIZATION;
 
   params_.rc.i_bitrate = static_cast<int>(bitrate);
   params_.rc.i_vbv_max_bitrate = static_cast<int>(bitrate);
 
-  if (bitrate_kbps < prev_kbps) {
-    // Smaller bitrate: use reduced VBV for ~10 frames, then recover in EncodeFrame
-    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_REDUCED_RATIO);
+  // VBV adaptation based on network usage state (sparkrtc-aligned):
+  // When network_usage_state >= 2.0 (overuse), use tight VBV = bitrate/fps
+  // Otherwise (normal/underuse), use relaxed VBV = bitrate/2
+  double vbv_ratio;
+  const double kOveruseThreshold = 2.0;
+
+  if (network_usage_state_ >= kOveruseThreshold) {
+    // Overuse: tight VBV for fast adaptation (sparkrtc: bitrate/fps)
+    vbv_ratio = 1.0 / fps_;
+    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * vbv_ratio);
     if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
-    vbv_recovery_frames_left_ = VBV_RECOVERY_FRAMES;
-    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps << " kbps (reduced VBV for " << VBV_RECOVERY_FRAMES << " frames)";
+    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps
+              << " kbps (OVERUSE VBV=" << params_.rc.i_vbv_buffer_size
+              << " kbits, usage_state=" << network_usage_state_ << ")";
   } else {
-    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_NORMAL_RATIO);
+    // Normal/underuse: relaxed VBV (sparkrtc: bitrate/2)
+    vbv_ratio = 0.5;
+    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * vbv_ratio);
     if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
-    vbv_recovery_frames_left_ = 0;
-    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps << " kbps";
+    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps
+              << " kbps (NORMAL VBV=" << params_.rc.i_vbv_buffer_size
+              << " kbits, usage_state=" << network_usage_state_ << ")";
   }
 
   x264_encoder_reconfig(encoder_, &params_);
+}
+
+void X264Encoder::SetNetworkUsageState(double network_usage_state) {
+  // Store the network usage state from GCC for VBV adaptation in SetTargetBitrate.
+  // This is called by VideoCaptureAndSend before each SetTargetBitrate call.
+  network_usage_state_ = network_usage_state;
 }
 
 std::unique_ptr<EncodedData> X264Encoder::EncodeFrame(YUVBuffer* input_buffer) {
@@ -184,17 +200,8 @@ std::unique_ptr<EncodedData> X264Encoder::EncodeFrame(YUVBuffer* input_buffer) {
     return nullptr;
   }
 
-  // After a bitrate reduction we use reduced VBV for ~10 frames; then recover to normal VBV
-  if (vbv_recovery_frames_left_ > 0) {
-    vbv_recovery_frames_left_--;
-    if (vbv_recovery_frames_left_ == 0) {
-      double bitrate = target_bitrate_kbps_ * BANDWIDTH_UTILIZATION;
-      params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_NORMAL_RATIO);
-      if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
-      x264_encoder_reconfig(encoder_, &params_);
-      LOG(INFO) << "[X264Encoder] VBV buffer recovered to " << params_.rc.i_vbv_buffer_size << " kbits";
-    }
-  }
+  // VBV adaptation is now handled in SetTargetBitrate based on network_usage_state_
+  // (no more frame-count-based recovery logic)
 
   auto encoded_data = std::make_unique<EncodedData>();
   encoded_data->sequence_number = sequence_number_;

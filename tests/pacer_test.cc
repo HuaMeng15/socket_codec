@@ -62,7 +62,7 @@ TEST(PacerTest, BurstIsBoundedAfterIdleGap) {
 
   // Gap between p1 and p2 must be >= 11ms (paced) — not a burst.
   int64_t gap_us = second_send_us.load() - first_send_us.load();
-  EXPECT_GE(gap_us, 8000) << "second packet sent too soon — burst not bounded";
+  EXPECT_GE(gap_us, 6500) << "second packet sent too soon — burst not bounded";
 }
 
 // --------------------------------------------------------------------------

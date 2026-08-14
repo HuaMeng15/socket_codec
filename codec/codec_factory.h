@@ -9,6 +9,7 @@
 enum class CodecType {
   VVENC,   // VVenC/VVdec
   X264,    // x264 (encoder only, decoding requires libavcodec)
+  X264_SLICE,  // x264 per-slice encoder, x264 decoder
   MOCK  // Fake encoder/decoder for ablation (zeros at target bitrate/fps)
 };
 
@@ -25,4 +26,3 @@ class CodecFactory {
 };
 
 #endif  // CODEC_CODEC_FACTORY_H
-

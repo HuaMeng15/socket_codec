@@ -24,7 +24,7 @@ void InitializeFlags() {
   parser.AddStringFlag("output_video_file", "result/output.266",
                        "output encoded video file for receiver");
   parser.AddStringFlag("codec", "mock",
-                       "codec type: 'vvenc', 'x264', or 'mock'");
+                       "codec type: 'vvenc', 'x264', 'x264_slice', or 'mock'");
 
   // Network simulator flags (sender-side, 0 = disabled)
   parser.AddIntFlag("sim_bandwidth_kbps", 0,

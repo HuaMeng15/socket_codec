@@ -187,7 +187,12 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
         if (pacer_ptr) gcc.OnBytesSent(pacer_ptr->ConsumeBytesSent());
         gcc.OnTransportFeedback(fb);
         int target = gcc.GetTargetBitrateKbps();
-        if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);
+        // Pass network usage state to encoder before setting bitrate
+        // (sparkrtc-aligned VBV adaptation)
+        if (encoder_ptr) {
+          encoder_ptr->SetNetworkUsageState(gcc.GetNetworkUsageState());
+          encoder_ptr->SetTargetBitrate(target);
+        }
         if (pacer_ptr) {
           pacer_ptr->SetTargetBitrate(target);
           // Keep the pacer's probe state in sync so it fills idle time with
@@ -199,7 +204,11 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
       [&gcc, encoder_ptr, pacer_ptr](const LossReport& report) {
         gcc.OnLossReport(report);
         int target = gcc.GetTargetBitrateKbps();
-        if (encoder_ptr) encoder_ptr->SetTargetBitrate(target);
+        // Pass network usage state to encoder before setting bitrate
+        if (encoder_ptr) {
+          encoder_ptr->SetNetworkUsageState(gcc.GetNetworkUsageState());
+          encoder_ptr->SetTargetBitrate(target);
+        }
         if (pacer_ptr) {
           pacer_ptr->SetTargetBitrate(target);
           pacer_ptr->SetProbing(gcc.IsProbing());

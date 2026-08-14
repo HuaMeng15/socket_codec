@@ -136,6 +136,42 @@ void GccController::EnableAckedEstimatorForTesting() {
   acked_window_bytes_ = 0;
 }
 
+double GccController::GetNetworkUsageState() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Return a value representing overuse aggressiveness for encoder adaptation.
+  // Similar to sparkrtc's aggressive_state which returns the accumulated
+  // time_over_using normalized by the detection threshold.
+  //
+  // < 2.0: normal or underuse (encoder uses relaxed VBV = bitrate/2)
+  // >= 2.0: overuse detected (encoder tightens VBV = bitrate/fps for fast adapt)
+  //
+  // We use a lower threshold (kEncoderOveruseThresholdMs = 5ms) than the full
+  // overuse detector (kOverusingTimeThresholdMs = 10ms) so the encoder reacts
+  // earlier, aligned with sparkrtc's early notification strategy.
+
+  if (last_bandwidth_usage_ == BandwidthUsage::kUnderuse) {
+    return 0.0;  // underuse: fully relaxed
+  }
+
+  // When overuse is detected, time_over_using_ms_ is reset to 0 as part of the
+  // state machine, but we still want the encoder to react aggressively. Return
+  // a value >= 2.0 to trigger tight VBV mode immediately.
+  if (last_bandwidth_usage_ == BandwidthUsage::kOveruse) {
+    return 2.0;  // overuse: trigger aggressive mode
+  }
+
+  // During normal or accumulation phase, return the ratio. If time_over_using_ms_
+  // < 0, the detector is not accumulating yet, so return 0.
+  if (time_over_using_ms_ < 0) {
+    return 0.0;
+  }
+
+  // Return the ratio of accumulated over-threshold time to the encoder threshold.
+  // When this exceeds 2.0, the encoder should enter aggressive VBV mode.
+  double aggressive_ratio = time_over_using_ms_ / kEncoderOveruseThresholdMs;
+  return aggressive_ratio;
+}
+
 void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t now_ms = NowMs();
@@ -633,6 +669,10 @@ GccController::BandwidthUsage GccController::Detect(double trend,
 
   prev_trend_ = trend;
   UpdateAdaptiveThreshold(modified_trend, now_ms);
+
+  // Store the bandwidth usage state for GetNetworkUsageState()
+  last_bandwidth_usage_ = result;
+
   return result;
 }
 

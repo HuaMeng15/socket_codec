@@ -7,7 +7,7 @@
 struct FramePacketHeader {
   uint16_t frame_sequence;  // Frame sequence number
   uint8_t packet_index;    // Packet index within frame (0-based)
-  uint8_t total_packets;   // Total number of packets for this frame
+  uint8_t total_packets;   // Total packets for frame; 0 means frame still open
   uint16_t payload_size;    // Size of payload in this packet
 };
 

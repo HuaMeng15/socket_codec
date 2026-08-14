@@ -34,6 +34,7 @@ int DataSender::Initialize(const std::string& dest_ip, int dest_port,
   dest_port_ = dest_port;
   max_packet_size_ = max_packet_size;
   packet_sequence_ = 0;
+  dry_run_ = false;
 
   // Create UDP socket
   socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
@@ -72,6 +73,19 @@ int DataSender::Initialize(const std::string& dest_ip, int dest_port,
   return 0;
 }
 
+void DataSender::InitializeForTesting(size_t max_packet_size) {
+  dest_ip_.clear();
+  dest_port_ = 0;
+  max_packet_size_ = max_packet_size;
+  packet_sequence_ = 0;
+  dry_run_ = true;
+  initialized_ = true;
+  socket_fd_ = -1;
+  network_sender_.SetSocketFd(-1);
+  LOG(INFO) << "[DataSender] Initialized in dry-run mode for testing: max_packet_size="
+            << max_packet_size_;
+}
+
 void DataSender::SetPacer(Pacer* pacer) {
   pacer_ = pacer;
   if (!pacer_) return;
@@ -88,41 +102,85 @@ void DataSender::SetPacer(Pacer* pacer) {
   pacer_->Start();
 }
 
-int DataSender::SendFrame(const EncodedData* encoded_data) {
-  if (!initialized_ || socket_fd_ < 0) {
-    LOG(ERROR) << "[DataSender] Not initialized";
-    return -1;
-  }
-
+size_t DataSender::CountFramePackets(const EncodedData* encoded_data) const {
   if (!encoded_data || encoded_data->size == 0 ||
       encoded_data->data_ptrs.empty() || encoded_data->data_sizes.empty()) {
-    LOG(WARNING) << "[DataSender] Invalid data or size";
-    return -1;
+    return 0;
   }
 
-  // Calculate total packets using ceiling division per NAL, matching the
-  // send loop below exactly: each NAL emits ceil(data_size / max_payload_size)
-  // packets (an empty NAL emits zero).
   const size_t header_size = sizeof(FramePacketHeader);
+  if (max_packet_size_ <= header_size) {
+    return 0;
+  }
   const size_t max_payload_size = max_packet_size_ - header_size;
+
   size_t total_packets_count = 0;
   for (size_t i = 0; i < encoded_data->data_sizes.size(); i++) {
     size_t nal_size = encoded_data->data_sizes[i];
     total_packets_count += (nal_size + max_payload_size - 1) / max_payload_size;
   }
-  uint8_t total_packets = static_cast<uint8_t>(total_packets_count);
+  return total_packets_count;
+}
+
+int DataSender::SendFrame(const EncodedData* encoded_data) {
+  size_t total_packets_count = CountFramePackets(encoded_data);
+  if (total_packets_count == 0) {
+    LOG(WARNING) << "[DataSender] Invalid data or size";
+    return -1;
+  }
+  if (total_packets_count > 255) {
+    LOG(ERROR) << "[DataSender] Frame needs " << total_packets_count
+               << " packets, but header supports at most 255";
+    return -1;
+  }
+
+  uint8_t packets_sent = 0;
+  return SendFrameFragment(encoded_data, 0,
+                           static_cast<uint8_t>(total_packets_count),
+                           &packets_sent);
+}
+
+int DataSender::SendFrameFragment(const EncodedData* encoded_data,
+                                  uint8_t first_packet_index,
+                                  uint8_t total_packets_for_header,
+                                  uint8_t* packets_sent) {
+  if (!initialized_) {
+    LOG(ERROR) << "[DataSender] Not initialized";
+    return -1;
+  }
+
+  size_t fragment_packet_count = CountFramePackets(encoded_data);
+  if (fragment_packet_count == 0) {
+    LOG(WARNING) << "[DataSender] Invalid data or size";
+    return -1;
+  }
+  if (first_packet_index + fragment_packet_count > 255) {
+    LOG(ERROR) << "[DataSender] Fragment exceeds packet-index range: first="
+               << (int)first_packet_index << " count=" << fragment_packet_count;
+    return -1;
+  }
+  if (total_packets_for_header != 0 &&
+      first_packet_index + fragment_packet_count > total_packets_for_header) {
+    LOG(ERROR) << "[DataSender] Fragment extends beyond declared frame total";
+    return -1;
+  }
 
   uint16_t frame_sequence = encoded_data->sequence_number;
+  const size_t header_size = sizeof(FramePacketHeader);
+  const size_t max_payload_size = max_packet_size_ - header_size;
 
   LOG(VERBOSE) << "[DataSender] Sending frame " << frame_sequence
-            << " size=" << encoded_data->size << " bytes in " << (int)total_packets
-            << " packets, nals=" << encoded_data->data_ptrs.size();
+               << " fragment size=" << encoded_data->size
+               << " bytes in " << fragment_packet_count
+               << " packets, first_packet=" << (int)first_packet_index
+               << " total_header=" << (int)total_packets_for_header
+               << " nals=" << encoded_data->data_ptrs.size();
 
   // Allocate packet buffer (use vector to avoid VLA)
   std::vector<uint8_t> packet_buffer(max_packet_size_);
 
   // Send data in chunks
-  uint8_t packet_index = 0;
+  uint8_t packet_index = first_packet_index;
   for (size_t i = 0; i < encoded_data->data_ptrs.size(); i++) {
     uint8_t* data = encoded_data->data_ptrs[i];
     size_t data_size = encoded_data->data_sizes[i];
@@ -135,7 +193,7 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
       FramePacketHeader* header = reinterpret_cast<FramePacketHeader*>(packet);
       header->frame_sequence = htons(frame_sequence);
       header->packet_index = packet_index;
-      header->total_packets = total_packets;
+      header->total_packets = total_packets_for_header;
       header->payload_size = htons(payload_size);
 
       // Copy payload
@@ -148,15 +206,21 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
         // probe padding. Enqueue copies the bytes, so packet_buffer is reusable.
         pacer_->Enqueue(packet, packet_size, frame_sequence, packet_index);
       } else {
-        // No pacer: send inline immediately (record send-time at send).
-        if (send_time_store_) {
-          send_time_store_->Record(frame_sequence, packet_index);
-        }
-        int ret = SendPacket(packet, packet_size);
-        if (ret != 0) {
-          LOG(ERROR) << "[DataSender] Failed to send packet " << (int)packet_index
-                     << " of frame " << frame_sequence;
-          return ret;
+        if (dry_run_) {
+          // Unit-test mode: exercise packetization and callbacks without a
+          // network socket. This keeps the framing path deterministic under
+          // sandboxed test runners.
+        } else {
+          // No pacer: send inline immediately (record send-time at send).
+          if (send_time_store_) {
+            send_time_store_->Record(frame_sequence, packet_index);
+          }
+          int ret = SendPacket(packet, packet_size);
+          if (ret != 0) {
+            LOG(ERROR) << "[DataSender] Failed to send packet " << (int)packet_index
+                       << " of frame " << frame_sequence;
+            return ret;
+          }
         }
         LOG(VERBOSE) << "[DataSender] Sent packet " << (int)packet_index
                      << " for frame " << frame_sequence;
@@ -168,10 +232,15 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
   }
 
   LOG(VERBOSE) << "[DataSender] Successfully sent frame " << frame_sequence
-            << " in " << (int)total_packets << " packets";
+               << " fragment in " << (int)(packet_index - first_packet_index)
+               << " packets";
 
+  uint8_t sent_count = packet_index - first_packet_index;
+  if (packets_sent) {
+    *packets_sent = sent_count;
+  }
   if (packets_sent_cb_) {
-    packets_sent_cb_(total_packets);
+    packets_sent_cb_(sent_count);
   }
 
   return 0;
@@ -204,6 +273,9 @@ int DataSender::SendFeedback(uint16_t frame_sequence, uint8_t packet_index, Feed
 }
 
 int DataSender::SendPacket(const uint8_t* packet_data, size_t packet_size) {
+  if (dry_run_) {
+    return 0;
+  }
   if (socket_fd_ < 0) {
     return -1;
   }
@@ -218,7 +290,13 @@ int DataSender::SendPacket(const uint8_t* packet_data, size_t packet_size) {
 }
 
 int DataSender::SendRawFeedback(const uint8_t* data, size_t size) {
-  if (!initialized_ || socket_fd_ < 0) {
+  if (!initialized_) {
+    return -1;
+  }
+  if (dry_run_) {
+    return 0;
+  }
+  if (socket_fd_ < 0) {
     return -1;
   }
   return SendPacket(data, size);
@@ -234,7 +312,7 @@ void DataSender::Close() {
     socket_fd_ = -1;
   }
   initialized_ = false;
+  dry_run_ = false;
 }
 
 bool DataSender::IsInitialized() const { return initialized_; }
-

@@ -1,6 +1,7 @@
 #include "codec_factory.h"
 
 #include "h264/x264_encoder.h"
+#include "h264/slice_paced_encoder.h"
 #include "h264/x264_decoder.h"
 #include "mock_codec/mock_encoder.h"
 #include "mock_codec/mock_decoder.h"
@@ -20,6 +21,9 @@ std::unique_ptr<Encoder> CodecFactory::CreateEncoder(CodecType type) {
     case CodecType::X264:
       LOG(INFO) << "[CodecFactory] Creating X264Encoder";
       return std::make_unique<X264Encoder>();
+    case CodecType::X264_SLICE:
+      LOG(INFO) << "[CodecFactory] Creating SlicePacedEncoder";
+      return std::make_unique<SlicePacedEncoder>();
     case CodecType::MOCK:
       LOG(INFO) << "[CodecFactory] Creating MockEncoder";
       return std::make_unique<MockEncoder>();
@@ -39,6 +43,9 @@ std::unique_ptr<Decoder> CodecFactory::CreateDecoder(CodecType type) {
     case CodecType::X264:
       LOG(INFO) << "[CodecFactory] Creating X264Decoder";
       return std::make_unique<X264Decoder>();
+    case CodecType::X264_SLICE:
+      LOG(INFO) << "[CodecFactory] Creating X264Decoder";
+      return std::make_unique<X264Decoder>();
     case CodecType::MOCK:
       LOG(INFO) << "[CodecFactory] Creating MockDecoder";
       return std::make_unique<MockDecoder>();
@@ -53,6 +60,9 @@ CodecType CodecFactory::ParseCodecType(const std::string& codec_name) {
     return CodecType::VVENC;
   } else if (codec_name == "x264" || codec_name == "X264") {
     return CodecType::X264;
+  } else if (codec_name == "x264_slice" || codec_name == "X264_SLICE" ||
+             codec_name == "slice_x264" || codec_name == "SLICE_X264") {
+    return CodecType::X264_SLICE;
   } else if (codec_name == "mock" || codec_name == "MOCK") {
     return CodecType::MOCK;
   } else {
@@ -60,4 +70,3 @@ CodecType CodecFactory::ParseCodecType(const std::string& codec_name) {
     return CodecType::X264;
   }
 }
-

@@ -1,6 +1,8 @@
 #include "video_capture_and_send.h"
 
+#include <algorithm>
 #include <chrono>
+#include <thread>
 
 #include "codec/codec_factory.h"
 #include "log_system/log_system.h"
@@ -110,26 +112,105 @@ void VideoCaptureAndSend::Run() {
       LOG(INFO) << "[VideoCaptureAndSend] Read frame " << frame_buffer->sequence_number;
     }
 
-    auto encoded_data = encoder_->EncodeFrame(frame_buffer.get());
+    uint16_t sent_sequence = 0;
+    bool frame_sent = false;
 
-    if (!encoded_data) {
-      LOG(ERROR) << "[VideoCaptureAndSend] Failed to encode frame";
-      continue;
+    if (encoder_->SupportsSliceEncoding()) {
+      clock_.SetSliceCount(encoder_->GetSliceCount());
+      if (!encoder_->StartFrame(frame_buffer.get())) {
+        LOG(ERROR) << "[VideoCaptureAndSend] Failed to start sliced frame";
+        continue;
+      }
+
+      const int slice_count = encoder_->GetSliceCount();
+      uint8_t next_packet_index = 0;
+      bool send_ok = true;
+
+      for (int slice = 0; slice < slice_count; slice++) {
+        const int64_t slice_deadline_us = clock_.GetSliceDeadline(frame_idx, slice);
+        const int64_t now_us = clock_.GetCurrentTimeUs();
+        if (slice_deadline_us > now_us) {
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(slice_deadline_us - now_us));
+        }
+        auto slice_data = encoder_->EncodeSlice(slice);
+        if (!slice_data) {
+          LOG(ERROR) << "[VideoCaptureAndSend] Failed to encode slice " << slice;
+          send_ok = false;
+          break;
+        }
+        if (slice == 0) {
+          sent_sequence = slice_data->sequence_number;
+        }
+
+        size_t fragment_packets = data_sender_->CountFramePackets(slice_data.get());
+        if (fragment_packets == 0 ||
+            next_packet_index + fragment_packets > 255) {
+          LOG(ERROR) << "[VideoCaptureAndSend] Invalid sliced packet count";
+          send_ok = false;
+          break;
+        }
+
+        bool is_final_slice = (slice == slice_count - 1);
+        uint8_t total_packets_for_header = 0;
+        if (is_final_slice) {
+          total_packets_for_header =
+              static_cast<uint8_t>(next_packet_index + fragment_packets);
+        }
+
+        uint8_t packets_sent = 0;
+        int ret = data_sender_->SendFrameFragment(slice_data.get(),
+                                                  next_packet_index,
+                                                  total_packets_for_header,
+                                                  &packets_sent);
+        if (ret != 0) {
+          LOG(ERROR) << "[VideoCaptureAndSend] Failed to send slice " << slice;
+          send_ok = false;
+          break;
+        }
+        next_packet_index += packets_sent;
+      }
+
+      if (!encoder_->FinishFrame()) {
+        LOG(ERROR) << "[VideoCaptureAndSend] Failed to finish sliced frame";
+        send_ok = false;
+      }
+
+      if (!send_ok) {
+        continue;
+      }
+      frame_sent = true;
+      LOG(INFO) << "[VideoCaptureAndSend] Successfully sent sliced frame "
+                << sent_sequence;
+    } else {
+      auto encoded_data = encoder_->EncodeFrame(frame_buffer.get());
+
+      if (!encoded_data) {
+        LOG(ERROR) << "[VideoCaptureAndSend] Failed to encode frame";
+        continue;
+      }
+
+      sent_sequence = encoded_data->sequence_number;
+
+      // Send encoded data via network
+      if (encoded_data->size > 0) {
+        int ret = data_sender_->SendFrame(encoded_data.get());
+        if (ret != 0) {
+          LOG(ERROR) << "[VideoCaptureAndSend] Failed to send encoded data";
+        } else {
+          frame_sent = true;
+          LOG(INFO) << "[VideoCaptureAndSend] Successfully sent encoded data for frame " << encoded_data->sequence_number;
+        }
+      }
     }
 
-    // Send encoded data via network
-    if (encoded_data->size > 0) {
-      int ret = data_sender_->SendFrame(encoded_data.get());
-      if (ret != 0) {
-        LOG(ERROR) << "[VideoCaptureAndSend] Failed to send encoded data";
-      } else {
-        LOG(INFO) << "[VideoCaptureAndSend] Successfully sent encoded data for frame " << encoded_data->sequence_number;
-      }
+    if (!frame_sent) {
+      continue;
     }
 
     // Check if max frames reached (sequence_number is 0-based)
     if (max_frames_ > 0 &&
-        static_cast<int>(encoded_data->sequence_number) + 1 >= max_frames_) {
+        static_cast<int>(sent_sequence) + 1 >= max_frames_) {
       LOG(INFO) << "[VideoCaptureAndSend] Max frames limit reached: " << max_frames_;
       break;
     }
@@ -181,4 +262,3 @@ void VideoCaptureAndSend::PrintSummary() const {
     encoder_->PrintSummary();
   }
 }
-

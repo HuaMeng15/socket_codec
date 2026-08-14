@@ -105,6 +105,15 @@ class GccController : public CongestionController {
   // SetAckedBitrateForTesting froze it. Resets the window. Test-only.
   void EnableAckedEstimatorForTesting();
 
+  /**
+   * Get the current network usage state for encoder adaptation.
+   * Returns a value representing the aggressiveness of overuse:
+   *   < 2.0: normal or underuse (encoder can use relaxed VBV)
+   *   >= 2.0: overuse (encoder should tighten VBV for fast adaptation)
+   * Aligned with sparkrtc's aggressive_state mechanism.
+   */
+  double GetNetworkUsageState() const;
+
  private:
   int64_t NowMs() const;
   // --- Trendline estimator (WebRTC trendline_estimator.cc) ---
@@ -186,6 +195,10 @@ class GccController : public CongestionController {
   double prev_trend_;             // previous raw trendline slope
   double last_modified_trend_ = 0.0;  // last modified_trend (for trace logging)
   static constexpr double kOverusingTimeThresholdMs = 10.0;  // WebRTC default
+  // Reduced threshold for early encoder notification (sparkrtc-aligned).
+  // When time_over_using exceeds this, encoder should enter aggressive VBV mode
+  // before full overuse detection triggers rate decrease.
+  static constexpr double kEncoderOveruseThresholdMs = 5.0;
 
   // Delay-based rate control
   int delay_based_bitrate_kbps_;
@@ -310,6 +323,10 @@ class GccController : public CongestionController {
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;
+
+  // Current bandwidth usage state (updated in Detect). Used by
+  // GetNetworkUsageState for encoder VBV adaptation.
+  BandwidthUsage last_bandwidth_usage_ = BandwidthUsage::kNormal;
 };
 
 #endif  // TRANSMISSION_GCC_CONTROLLER_H

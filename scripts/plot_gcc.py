@@ -90,18 +90,27 @@ def main():
     re_init_bw = re.search(r"Network simulator enabled: bw=(\d+)kbps", text)
     init_bw = int(re_init_bw.group(1)) if re_init_bw else None
 
-    # Achieved send bitrate from per-frame sent bytes
+    # Achieved send bitrate from per-frame sent bytes.
+    # Whole-frame path: "Sending frame N size=B bytes in M packets"
+    # Sliced path:      "Sending frame N fragment size=B bytes in M packets"
+    # Make "fragment " optional; for the sliced path a frame emits one line per
+    # slice, so accumulate bytes per frame and keep the first timestamp as the
+    # frame send-start.
     re_send = re.compile(
-        r"\[" + _TS + r"\].*\[DataSender\] Sending frame (\d+) size=(\d+) bytes"
+        r"\[" + _TS + r"\].*\[DataSender\] Sending frame (\d+) (?:fragment )?size=(\d+) bytes"
     )
-    sends = []
     send_ts_by_frame = {}
+    send_bytes_by_frame = {}
     for m in re_send.finditer(text):
         ts = parse_ts(m.group(1))
         frame = int(m.group(2))
-        sends.append({"ts": ts, "frame": frame, "bytes": int(m.group(3))})
+        send_bytes_by_frame[frame] = send_bytes_by_frame.get(frame, 0) + int(m.group(3))
         # First time we see this frame's send (the send-start timestamp).
         send_ts_by_frame.setdefault(frame, ts)
+    # One entry per frame for the achieved-bitrate series (timestamped at the
+    # frame's send-start, carrying the frame's total bytes across all fragments).
+    sends = [{"ts": send_ts_by_frame[f], "frame": f, "bytes": send_bytes_by_frame[f]}
+             for f in sorted(send_ts_by_frame)]
 
     # Real one-way latency from the receiver log: for each frame, the time the
     # last packet completed it (decode), minus the frame's send time. Sender and

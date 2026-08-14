@@ -9,7 +9,8 @@
 FeedbackCollector::FeedbackCollector()
     : feedback_interval_(20),
       feedback_max_interval_ms_(25),
-      epoch_set_(false) {
+      epoch_set_(false),
+      last_feedback_time_() {
 }
 
 void FeedbackCollector::SetSendCallback(SendCallback cb) {
@@ -36,23 +37,33 @@ void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
     epoch_set_ = true;
   }
 
+  // Add the current packet first
   pending_entries_.push_back({frame_sequence, packet_index, recv_size, now});
 
-  // Send on whichever fires first: enough packets accumulated, OR the oldest
-  // pending packet has waited longer than the max interval. The time trigger
-  // bounds feedback latency when the link is slow — at low bitrates the
-  // packet-count trigger alone would delay feedback by ~one window's worth of
-  // arrivals (e.g. 192 ms for 20 pkts @ 1 Mbps), starving the sender's
-  // congestion controller exactly when it most needs to react.
+  // Send on whichever fires first: enough packets accumulated, OR enough time
+  // has elapsed since the last feedback was sent. Checking time AFTER adding
+  // means the arriving packet is included, so the first packet after an
+  // inter-frame gap triggers feedback immediately (rather than waiting for the
+  // next packet). This bounds the feedback interval as tightly as the packet
+  // arrival rate allows.
   bool count_reached =
       static_cast<int>(pending_entries_.size()) >= feedback_interval_;
   bool time_reached = false;
-  if (feedback_max_interval_ms_ > 0 && !pending_entries_.empty()) {
-    auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                   now - pending_entries_.front().arrival_time)
-                   .count();
-    time_reached = age >= feedback_max_interval_ms_;
+  if (feedback_max_interval_ms_ > 0) {
+    if (last_feedback_time_.time_since_epoch().count() > 0) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         now - last_feedback_time_)
+                         .count();
+      time_reached = elapsed >= feedback_max_interval_ms_;
+    } else {
+      // First feedback ever - measure from first packet
+      auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     now - pending_entries_.front().arrival_time)
+                     .count();
+      time_reached = age >= feedback_max_interval_ms_;
+    }
   }
+
   if (count_reached || time_reached) {
     SendTransportFeedback();
   }
@@ -118,6 +129,9 @@ void FeedbackCollector::SendTransportFeedback() {
 
   LOG(VERBOSE) << "[FeedbackCollector] Sent transport feedback with "
                << record_count << " records";
+
+  // Record the time of this feedback send for the next interval check
+  last_feedback_time_ = std::chrono::steady_clock::now();
 
   pending_entries_.clear();
 }

@@ -2,9 +2,11 @@
 .cache
 .cursor
 .clangd
+.claude
 compile_commands.json
 build
 input
 result
 third_party/
 .venv/
+x264_experiments/

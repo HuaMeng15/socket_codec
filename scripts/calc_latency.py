@@ -15,25 +15,39 @@ def parse_ts(s: str) -> float:
 
 
 def parse_send_log(path: Path):
+    # Whole-frame path: "Sending frame N size=.. in M packets" / "Successfully sent frame N in M packets"
+    # Sliced path:      "Sending frame N fragment size=.. in M packets" /
+    #                   "Successfully sent frame N fragment in M packets"
+    # Match both by making "fragment " optional and accumulating packet counts
+    # across all fragments of a frame.
     re_send = re.compile(
-        r"\[" + _TS + r"\].*\[DataSender\] Sending frame (\d+) .* in (\d+) packets"
+        r"\[" + _TS + r"\].*\[DataSender\] Sending frame (\d+) (?:fragment )?.* in (\d+) packets"
     )
     re_sent = re.compile(
-        r"\[" + _TS + r"\].*\[DataSender\] Successfully sent frame (\d+) in (\d+) packets"
+        r"\[" + _TS + r"\].*\[DataSender\] Successfully sent frame (\d+) (?:fragment )?in (\d+) packets"
     )
     re_capture = re.compile(
         r"\[" + _TS + r"\].*\[VideoCaptureAndSend\] Read frame (\d+)"
     )
     text = path.read_text()
-    sends = {}
+    # Accumulate across fragments: keep the FIRST "Sending" timestamp as the frame
+    # start, the LAST "Successfully sent" timestamp as the frame end, and sum
+    # packet counts. For the whole-frame path there is exactly one of each, so
+    # this reduces to the original behavior.
+    starts = {}       # frame -> first send ts
+    ends = {}         # frame -> last sent ts
+    npackets = {}     # frame -> total packets summed across fragments
     for m in re_send.finditer(text):
-        ts, frame, np = m.group(1), int(m.group(2)), int(m.group(3))
-        sends[frame] = (parse_ts(ts), None, np)
+        ts, frame, np = parse_ts(m.group(1)), int(m.group(2)), int(m.group(3))
+        if frame not in starts:
+            starts[frame] = ts
+        npackets[frame] = npackets.get(frame, 0) + np
     for m in re_sent.finditer(text):
-        ts, frame, np = m.group(1), int(m.group(2)), int(m.group(3))
-        if frame in sends:
-            start, _, n = sends[frame]
-            sends[frame] = (start, parse_ts(ts), n)
+        ts, frame = parse_ts(m.group(1)), int(m.group(2))
+        ends[frame] = ts  # keep overwriting -> last fragment wins
+    sends = {}
+    for frame, start in starts.items():
+        sends[frame] = (start, ends.get(frame), npackets.get(frame, 0))
     capture_times = {}
     for m in re_capture.finditer(text):
         ts, frame = m.group(1), int(m.group(2))

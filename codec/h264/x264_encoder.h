@@ -18,6 +18,7 @@ class X264Encoder : public Encoder {
   void Cleanup() override;
   void PrintSummary() const override;
   void SetTargetBitrate(int bitrate_kbps) override;
+  void SetNetworkUsageState(double network_usage_state) override;
 
  private:
   x264_t* encoder_;
@@ -32,8 +33,8 @@ class X264Encoder : public Encoder {
   int width_;
   int height_;
   int fps_;
-  /** When we set a smaller bitrate, VBV buffer is reduced to 0.04*bitrate for this many frames, then recovered to 0.5*bitrate in EncodeFrame. */
-  int vbv_recovery_frames_left_;
+  /** Current network usage state from GCC (for sparkrtc-aligned VBV adaptation). */
+  double network_usage_state_;
 };
 
 #endif  // CODEC_X264_ENCODER_H

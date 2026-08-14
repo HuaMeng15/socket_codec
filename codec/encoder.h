@@ -109,7 +109,33 @@ class Encoder {
   virtual void PrintSummary() const = 0;
 
   virtual void SetTargetBitrate(int bitrate_kbps) = 0;
+
+  /**
+   * Notify encoder of network usage state for adaptive VBV control.
+   * network_usage_state: value from GCC indicating overuse aggressiveness:
+   *   < 2.0: normal/underuse (relaxed VBV)
+   *   >= 2.0: overuse (tightened VBV for fast adaptation)
+   * Default implementation does nothing (only x264 uses this currently).
+   */
+  virtual void SetNetworkUsageState(double network_usage_state) {
+    (void)network_usage_state;  // Suppress unused parameter warning
+  }
+
+  virtual bool SupportsSliceEncoding() const { return false; }
+
+  virtual int GetSliceCount() const { return 1; }
+
+  virtual bool StartFrame(YUVBuffer* input_buffer) {
+    (void)input_buffer;
+    return false;
+  }
+
+  virtual std::unique_ptr<EncodedData> EncodeSlice(int slice_idx) {
+    (void)slice_idx;
+    return nullptr;
+  }
+
+  virtual bool FinishFrame() { return false; }
 };
 
 #endif  // CODEC_ENCODER_H
-

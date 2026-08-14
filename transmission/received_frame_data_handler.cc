@@ -133,16 +133,35 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
     frame_assembly.total_packets = total_packets;
     frame_assembly.received_packets = 0;
     frame_assembly.complete = false;
-    frame_assembly.packets.resize(total_packets);
+    if (total_packets > 0) {
+      frame_assembly.packets.resize(total_packets);
+    }
     LOG(INFO) << "[ReceivedFrameDataHandler] Starting frame " << frame_sequence
-              << " expecting " << (int)total_packets << " packets";
+              << " expecting "
+              << (total_packets ? std::to_string(total_packets)
+                                : std::string("open-ended"))
+              << " packets";
+  } else if (total_packets > 0) {
+    if (frame_assembly.total_packets == 0) {
+      frame_assembly.total_packets = total_packets;
+      frame_assembly.packets.resize(total_packets);
+    } else if (frame_assembly.total_packets != total_packets) {
+      LOG(WARNING) << "[ReceivedFrameDataHandler] Total packet mismatch for frame "
+                   << frame_sequence << ": old=" << (int)frame_assembly.total_packets
+                   << " new=" << (int)total_packets;
+    }
   }
 
   // Validate packet index
-  if (packet_index >= total_packets) {
+  if (frame_assembly.total_packets > 0 &&
+      packet_index >= frame_assembly.total_packets) {
     LOG(WARNING) << "[ReceivedFrameDataHandler] Invalid packet index " << packet_index
                  << " for frame " << frame_sequence;
     return;
+  }
+  if (frame_assembly.total_packets == 0 &&
+      packet_index >= frame_assembly.packets.size()) {
+    frame_assembly.packets.resize(packet_index + 1);
   }
 
   // Store packet payload (only if not already received)
@@ -154,7 +173,8 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
     LOG(VERBOSE) << "[ReceivedFrameDataHandler] Received packet " << (int)packet_index
                  << " for frame " << (int)frame_sequence
                  << " bytes=" << (int)payload_size
-                 << " (" << (int)frame_assembly.received_packets << "/" << (int)total_packets
+                 << " (" << (int)frame_assembly.received_packets << "/"
+                 << (int)frame_assembly.total_packets
                  << " complete)";
 
     // Send feedback for received packet. Pass the actual wire bytes received
@@ -164,7 +184,9 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
   }
 
   // Check if frame is complete
-  if (frame_assembly.received_packets == total_packets && !frame_assembly.complete) {
+  if (frame_assembly.total_packets > 0 &&
+      frame_assembly.received_packets == frame_assembly.total_packets &&
+      !frame_assembly.complete) {
     frame_assembly.complete = true;
 
     // Reassemble frame
@@ -208,6 +230,10 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
 
 void ReceivedFrameDataHandler::ReportFrameLoss(uint16_t frame_sequence,
                                                const FrameAssembly& assembly) {
+  if (assembly.total_packets == 0) {
+    return;
+  }
+
   std::vector<bool> received_mask(assembly.total_packets, false);
   for (uint8_t i = 0; i < assembly.total_packets && i < assembly.packets.size(); i++) {
     received_mask[i] = !assembly.packets[i].empty();
