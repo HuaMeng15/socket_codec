@@ -7,11 +7,13 @@
 #   CODEC=x264_slice  ./scripts/run_x264_test.sh   # slice-level control (per-slice QP)
 #
 # Other quick overrides:
-#   PHASE1_SECONDS=8       # change drop timing (default 5s)
+#   PHASE_S=8              # change drop timing (default 10s)
 #   CC_INITIAL_BITRATE_KBPS=500   # startup bitrate (default 500)
 #   CC_MAX_BITRATE_KBPS=10000     # ceiling (default 10000)
 #   FRAMES=600             # encode duration (default 600 = 20s @ 30fps)
-#   RUN_NAME=my_test       # result directory name
+#   RESULT_DIR=...         # exact result directory
+#   RECEIVER_OUTPUT_FILE=...  # decoded YUV output, default /dev/null
+#   RUN_PLOTS=0            # skip per-run plot generation
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,7 +32,7 @@ if [ ! -f "$BINARY" ]; then
   exit 1
 fi
 
-FPS=30
+FPS="${FPS:-30}"
 PORT="${PORT:-6100}"
 
 # Use real x264 encoder with actual video unless overridden.
@@ -42,6 +44,8 @@ CC_INITIAL_BITRATE_KBPS="${CC_INITIAL_BITRATE_KBPS:-500}"
 CC_MAX_BITRATE_KBPS="${CC_MAX_BITRATE_KBPS:-10000}"
 FEEDBACK_MAX_INTERVAL_MS="${FEEDBACK_MAX_INTERVAL_MS:-10}"
 RESULT_TAG="${RESULT_TAG:-$CODEC}"
+RUN_LATENCY="${RUN_LATENCY:-1}"
+RUN_PLOTS="${RUN_PLOTS:-1}"
 
 if [ ! -f "$INPUT_VIDEO" ]; then
   echo "Input video not found: $INPUT_VIDEO"
@@ -49,12 +53,14 @@ if [ ! -f "$INPUT_VIDEO" ]; then
 fi
 
 # Single phase: 10s at 10Mbps, then 10s at 1Mbps
-PHASE_S=10
-TOTAL_DURATION_S=20
-FRAMES=$((FPS * TOTAL_DURATION_S))
-SCHEDULE="0:10000,${PHASE_S}:1000"
+PHASE_S="${PHASE_S:-10}"
+TOTAL_DURATION_S="${TOTAL_DURATION_S:-20}"
+FRAMES="${FRAMES:-$((FPS * TOTAL_DURATION_S))}"
+SCHEDULE="${SCHEDULE:-0:10000,${PHASE_S}:1000}"
 
-RESULT_DIR="$PROJECT_ROOT/result/x264_test_10to1_${RESULT_TAG}"
+RESULT_DIR="${RESULT_DIR:-$PROJECT_ROOT/result/x264_test_10to1_${RESULT_TAG}}"
+RECEIVER_OUTPUT_FILE="${RECEIVER_OUTPUT_FILE:-/dev/null}"
+SENDER_OUTPUT_FILE="${SENDER_OUTPUT_FILE:-$RESULT_DIR/sent.264}"
 
 echo "=== X264 Encoder Adaptive Test: 10Mbps -> 1Mbps ==="
 echo "Duration: ${TOTAL_DURATION_S}s (${PHASE_S}s per phase)"
@@ -63,6 +69,7 @@ echo "Codec: ${CODEC} $([ "$CODEC" = "x264_slice" ] && echo "(slice-level QP con
 echo "Initial bitrate: ${CC_INITIAL_BITRATE_KBPS} kbps"
 echo "Max bitrate: ${CC_MAX_BITRATE_KBPS} kbps"
 echo "Feedback interval: ${FEEDBACK_MAX_INTERVAL_MS} ms"
+echo "Receiver output: ${RECEIVER_OUTPUT_FILE}"
 echo ""
 
 rm -rf "$RESULT_DIR"
@@ -81,7 +88,7 @@ trap cleanup EXIT
 "$BINARY" --codec="$CODEC" --fps=$FPS --port="$PORT" \
   --width=$WIDTH --height=$HEIGHT \
   --feedback_max_interval_ms="$FEEDBACK_MAX_INTERVAL_MS" \
-  --file=/dev/null > "$RESULT_DIR/recv.log" 2>&1 &
+  --file="$RECEIVER_OUTPUT_FILE" > "$RESULT_DIR/recv.log" 2>&1 &
 recv_pid=$!
 sleep 1
 
@@ -90,6 +97,7 @@ set +e
 "$BINARY" --codec="$CODEC" --fps=$FPS --port="$PORT" --ip=127.0.0.1 \
   --width=$WIDTH --height=$HEIGHT \
   --input_video_file=$INPUT_VIDEO \
+  --output_video_file="$SENDER_OUTPUT_FILE" \
   --frames_to_encode=$FRAMES \
   --sim_delay_ms=0 \
   --sim_bandwidth_schedule="$SCHEDULE" \
@@ -107,14 +115,24 @@ cleanup
 trap - EXIT
 
 echo "Sender exit=$send_status"
+echo "$send_status" > "$RESULT_DIR/send_status.txt"
 echo "Logs: $RESULT_DIR/send.log $RESULT_DIR/recv.log"
 echo ""
 
 # Analyze + plot
-"$PYTHON" "$SCRIPT_DIR/plot_gcc.py" "$RESULT_DIR" || true
-"$PYTHON" "$SCRIPT_DIR/calc_latency.py" "$RESULT_DIR" 2>/dev/null || true
-"$PYTHON" "$SCRIPT_DIR/draw.py" "$RESULT_DIR" 2>/dev/null || true
+if [ "$RUN_PLOTS" != "0" ]; then
+  "$PYTHON" "$SCRIPT_DIR/plot_gcc.py" "$RESULT_DIR" || true
+fi
+if [ "$RUN_LATENCY" != "0" ]; then
+  "$PYTHON" "$SCRIPT_DIR/calc_latency.py" "$RESULT_DIR" 2>/dev/null || true
+fi
+if [ "$RUN_PLOTS" != "0" ]; then
+  "$PYTHON" "$SCRIPT_DIR/draw.py" "$RESULT_DIR" 2>/dev/null || true
+fi
 
 echo ""
 echo "=== Test complete ==="
-echo "Figure: $RESULT_DIR/figs/gcc_behavior.png"
+if [ "$RUN_PLOTS" != "0" ]; then
+  echo "Figure: $RESULT_DIR/figs/gcc_behavior.png"
+  echo "Figure: $RESULT_DIR/figs/quality_over_time.png"
+fi

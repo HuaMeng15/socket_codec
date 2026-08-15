@@ -116,13 +116,13 @@ void VideoCaptureAndSend::Run() {
     bool frame_sent = false;
 
     if (encoder_->SupportsSliceEncoding()) {
-      clock_.SetSliceCount(encoder_->GetSliceCount());
       if (!encoder_->StartFrame(frame_buffer.get())) {
         LOG(ERROR) << "[VideoCaptureAndSend] Failed to start sliced frame";
         continue;
       }
 
       const int slice_count = encoder_->GetSliceCount();
+      clock_.SetSliceCount(slice_count);
       uint8_t next_packet_index = 0;
       bool send_ok = true;
 

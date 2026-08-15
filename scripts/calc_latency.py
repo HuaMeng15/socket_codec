@@ -91,13 +91,20 @@ def main():
     packet_latencies = []
     frame_latencies = []
     overall_latencies = []  # capture -> decode (per frame)
+    stall_100 = 0
+    stall_200 = 0
 
     for frame, (start_ts, end_ts, num_packets) in sorted(sends.items()):
         if end_ts is None:
             continue
         decode_ts = decode_frame.get(frame)
         if decode_ts is not None:
-            frame_latencies.append((frame, (decode_ts - end_ts) * 1000))
+            frame_latency = (decode_ts - end_ts) * 1000
+            frame_latencies.append((frame, frame_latency))
+            if frame_latency > 100.0:
+                stall_100 += 1
+            if frame_latency > 200.0:
+                stall_200 += 1
         capture_ts = capture_times.get(frame)
         if decode_ts is not None and capture_ts is not None:
             overall_latencies.append((frame, (decode_ts - capture_ts) * 1000))
@@ -162,6 +169,7 @@ def main():
         print(f"Frame latencies:")
         print(f"Frame latency (ms):   avg={avg_frm:.2f} max={max(frm_lats):.2f} "
               f"tail99={tail_mean(frm_lats, 0.99):.2f} tail99.9={tail_mean(frm_lats, 0.999):.2f} (n={n})")
+        print(f"Frame stalls:         >100ms={stall_100} >200ms={stall_200}")
     if overall_latencies:
         ov_lats = [x[1] for x in overall_latencies]
         n = len(ov_lats)

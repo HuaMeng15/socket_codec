@@ -297,6 +297,7 @@ void ReceivedFrameDataHandler::HandleCompleteFrame(uint32_t frame_sequence,
       if (writeYUVToFile(&output_stream_, decoded_frame, false, false) != 0) {
         LOG(ERROR) << "[ReceivedFrameDataHandler] Failed to write YUV frame to file";
       }
+      output_stream_.flush();
     }
 
     LOG(INFO) << "[ReceivedFrameDataHandler] Successfully decoded frame " << frame_sequence;

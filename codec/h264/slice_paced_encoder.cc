@@ -12,7 +12,11 @@ namespace {
 constexpr double kBandwidthUtilization = 0.9;
 constexpr double kVbvNormalRatio = 0.5;
 constexpr double kOveruseThreshold = 2.0;
-constexpr int kDefaultSliceCount = 9;
+constexpr int kLowBitrateSliceThresholdKbps = 2000;
+constexpr int kHighBitrateSliceThresholdKbps = 5000;
+constexpr int kLowBitrateSliceCount = 1;
+constexpr int kMediumBitrateSliceCount = 4;
+constexpr int kHighBitrateSliceCount = 9;
 
 void AppendEncodedData(EncodedData* dst, EncodedData* src) {
   if (!dst || !src) return;
@@ -34,9 +38,10 @@ SlicePacedEncoder::SlicePacedEncoder()
       width_(0),
       height_(0),
       fps_(0),
-      slice_count_(kDefaultSliceCount),
+      slice_count_(kLowBitrateSliceCount),
       sequence_number_(0),
       target_bitrate_kbps_(kDefaultInitialBitrateKbps),
+      pending_slice_count_(kLowBitrateSliceCount),
       network_usage_state_(0.0),
       frame_start_effective_bitrate_kbps_(
           std::max(1, static_cast<int>(kDefaultInitialBitrateKbps *
@@ -108,10 +113,13 @@ void SlicePacedEncoder::SetOutputStream(std::ofstream* output_stream) {
 
 void SlicePacedEncoder::SetTargetBitrate(int bitrate_kbps) {
   if (bitrate_kbps <= 0) return;
+  int next_slice_count = SelectSliceCountForBitrate(bitrate_kbps);
+  pending_slice_count_.store(next_slice_count);
   int old = target_bitrate_kbps_.exchange(bitrate_kbps);
   if (old != bitrate_kbps) {
     LOG(INFO) << "[SlicePacedEncoder] Target bitrate now "
-              << bitrate_kbps << " kbps";
+              << bitrate_kbps << " kbps, next frame slices="
+              << next_slice_count;
   }
 }
 
@@ -134,6 +142,33 @@ void SlicePacedEncoder::ApplyBitrateReconfig(int bitrate_kbps) {
   if (encoder_) {
     x264_encoder_reconfig(encoder_, &params_);
   }
+}
+
+int SlicePacedEncoder::SelectSliceCountForBitrate(int bitrate_kbps) const {
+  if (bitrate_kbps > kHighBitrateSliceThresholdKbps) {
+    return kHighBitrateSliceCount;
+  }
+  if (bitrate_kbps < kLowBitrateSliceThresholdKbps) {
+    return kLowBitrateSliceCount;
+  }
+  return kMediumBitrateSliceCount;
+}
+
+void SlicePacedEncoder::ApplyPendingSliceCount() {
+  int next_slice_count = pending_slice_count_.load();
+  if (next_slice_count <= 0) {
+    next_slice_count = kLowBitrateSliceCount;
+  }
+
+  if (slice_count_ != next_slice_count) {
+    LOG(INFO) << "[SlicePacedEncoder] Slice count changed "
+              << slice_count_ << " -> " << next_slice_count
+              << " for target bitrate "
+              << target_bitrate_kbps_.load() << " kbps";
+  }
+
+  slice_count_ = next_slice_count;
+  params_.i_slice_count = slice_count_;
 }
 
 bool SlicePacedEncoder::ShouldUseSliceRateControl() const {
@@ -166,6 +201,8 @@ bool SlicePacedEncoder::StartFrame(YUVBuffer* input_buffer) {
   }
 
   int current_bitrate = std::max(1, target_bitrate_kbps_.load());
+  pending_slice_count_.store(SelectSliceCountForBitrate(current_bitrate));
+  ApplyPendingSliceCount();
   ApplyBitrateReconfig(current_bitrate);
   frame_start_effective_bitrate_kbps_ = std::max(1, params_.rc.i_bitrate);
   slice_rc_active_ = false;

@@ -8,6 +8,7 @@ Usage: python3 scripts/draw.py <result_dir> [--latency] [--frame-size]
 """
 import argparse
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -47,6 +48,13 @@ def main():
 
     fig_dir.mkdir(parents=True, exist_ok=True)
     drawn = []
+
+    def _as_float(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     if do_latency:
         # Frame latency
@@ -134,6 +142,51 @@ def main():
                 fig.savefig(fig_dir / "frame_size_rate.png", dpi=150)
                 plt.close(fig)
                 drawn.append("frame_size_rate.png")
+
+    quality_csv = result_dir / "quality_frames.csv"
+    if quality_csv.exists():
+        indices = []
+        psnr_y, psnr_u, psnr_v, psnr_avg, vmaf = [], [], [], [], []
+        with open(quality_csv) as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    indices.append(int(row["frame_index"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                psnr_y.append(_as_float(row.get("psnr_y")))
+                psnr_u.append(_as_float(row.get("psnr_u")))
+                psnr_v.append(_as_float(row.get("psnr_v")))
+                psnr_avg.append(_as_float(row.get("psnr_avg")))
+                vmaf.append(_as_float(row.get("vmaf")))
+        has_quality = any(v is not None for v in psnr_y + psnr_u + psnr_v + psnr_avg + vmaf)
+        if indices and has_quality:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+            if any(v is not None for v in psnr_avg):
+                ax1.plot(indices, psnr_avg, label="PSNR avg", color="C0")
+            if any(v is not None for v in psnr_y):
+                ax1.plot(indices, psnr_y, label="PSNR Y", color="C1", alpha=0.8)
+            if any(v is not None for v in psnr_u):
+                ax1.plot(indices, psnr_u, label="PSNR U", color="C2", alpha=0.8)
+            if any(v is not None for v in psnr_v):
+                ax1.plot(indices, psnr_v, label="PSNR V", color="C3", alpha=0.8)
+            ax1.set_ylabel("PSNR (dB)")
+            ax1.set_title("Per-frame PSNR and VMAF")
+            ax1.grid(True, alpha=0.3)
+            if ax1.get_legend_handles_labels()[0]:
+                ax1.legend(loc="upper right")
+
+            if any(v is not None for v in vmaf):
+                ax2.plot(indices, vmaf, label="VMAF", color="C4")
+            ax2.set_xlabel("Frame index")
+            ax2.set_ylabel("VMAF")
+            ax2.grid(True, alpha=0.3)
+            if ax2.get_legend_handles_labels()[0]:
+                ax2.legend(loc="upper right")
+            fig.tight_layout()
+            fig.savefig(fig_dir / "quality_over_time.png", dpi=150)
+            plt.close(fig)
+            drawn.append("quality_over_time.png")
 
     if drawn:
         print(f"Plots saved to {fig_dir}/: {', '.join(drawn)}")

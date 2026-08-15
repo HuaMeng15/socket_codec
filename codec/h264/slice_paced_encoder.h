@@ -32,6 +32,8 @@ class SlicePacedEncoder : public Encoder {
  private:
   void CopyInputToPicture(YUVBuffer* input_buffer);
   void ApplyBitrateReconfig(int bitrate_kbps);
+  int SelectSliceCountForBitrate(int bitrate_kbps) const;
+  void ApplyPendingSliceCount();
   bool ShouldUseSliceRateControl() const;
 
   x264_t* encoder_;
@@ -49,6 +51,7 @@ class SlicePacedEncoder : public Encoder {
   uint16_t sequence_number_;
 
   std::atomic<int> target_bitrate_kbps_;
+  std::atomic<int> pending_slice_count_;
   std::atomic<double> network_usage_state_;
   int frame_start_effective_bitrate_kbps_;
   bool slice_rc_active_;
