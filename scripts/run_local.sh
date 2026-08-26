@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_ROOT/build/socket_codec"
 
 CODEC="${1:-mock}"
-FRAMES="${2:-300}"
+FRAMES="${2:-800}"
 FPS="${3:-30}"
 PORT="${4:-5000}"
 shift 4 2>/dev/null || true  # remaining args passed to sender

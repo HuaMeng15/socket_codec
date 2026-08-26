@@ -19,10 +19,11 @@ void InitializeFlags() {
   parser.AddIntFlag("fps", kDefaultFps, "video fps");
   parser.AddIntFlag("frames_to_encode", kDefaultFramesToEncode,
                     "number of frames to encode (0 or negative means encode all frames)");
-  parser.AddStringFlag("input_video_file", "input/Lecture_5s.yuv",
+  parser.AddStringFlag("input_video_file",
+                       "/home/menghua/Research/VideoResources/Lecture.yuv",
                        "input YUV video file for sender");
-  parser.AddStringFlag("output_video_file", "result/output.266",
-                       "output encoded video file for receiver");
+  parser.AddStringFlag("output_video_file", "",
+                       "optional sender-side encoded bitstream dump; empty disables");
   parser.AddStringFlag("codec", "mock",
                        "codec type: 'vvenc', 'x264', 'x264_slice', or 'mock'");
 

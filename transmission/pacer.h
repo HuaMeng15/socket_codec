@@ -9,6 +9,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 /**
@@ -82,9 +83,19 @@ class Pacer {
     uint8_t packet_index;
   };
 
+  struct FrameSendState {
+    int sent_packets = 0;
+    int expected_packets = 0;
+  };
+
   void Run();                 // drain-thread body
   double EffectiveRateBps();  // current pace rate in bits/s (probe-aware)
   void SendPadding(size_t payload_bytes);
+  bool NoteFramePacketSent(uint16_t frame_sequence,
+                           uint8_t packet_index,
+                           uint8_t total_packets,
+                           int* sent_packets,
+                           int* expected_packets);
 
   SendFn send_fn_;
   RecordFn record_fn_;
@@ -92,6 +103,7 @@ class Pacer {
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<QueuedPacket> queue_;
+  std::unordered_map<uint16_t, FrameSendState> frame_send_states_;
 
   // Wire bytes sent since the last ConsumeBytesSent() (real + padding).
   size_t bytes_sent_since_consume_ = 0;

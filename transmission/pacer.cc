@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cstring>
 
 #include "config/config.h"
 #include "log_system/log_system.h"
@@ -94,6 +95,32 @@ void Pacer::SendPadding(size_t payload_bytes) {
   if (send_fn_) send_fn_(pkt.data(), pkt.size());
 }
 
+bool Pacer::NoteFramePacketSent(uint16_t frame_sequence,
+                                uint8_t packet_index,
+                                uint8_t total_packets,
+                                int* sent_packets,
+                                int* expected_packets) {
+  if (frame_sequence == kPaddingFrameSequence) return false;
+
+  auto& state = frame_send_states_[frame_sequence];
+  state.sent_packets++;
+  if (total_packets > 0) {
+    state.expected_packets = total_packets;
+  }
+
+  const bool final_packet =
+      state.expected_packets > 0 &&
+      static_cast<int>(packet_index) + 1 == state.expected_packets;
+  if (final_packet && state.sent_packets >= state.expected_packets) {
+    if (sent_packets) *sent_packets = state.sent_packets;
+    if (expected_packets) *expected_packets = state.expected_packets;
+    frame_send_states_.erase(frame_sequence);
+    return true;
+  }
+
+  return false;
+}
+
 // Drain-thread body: a bounded token bucket. Tokens (send credit, in bits)
 // refill continuously at EffectiveRateBps() and are capped at burst_cap_ms of
 // data so an idle gap can never bank enough credit to dump a whole frame at
@@ -133,9 +160,29 @@ void Pacer::Run() {
         queue_.pop_front();
         tokens_bits_ -= need_bits;
         bytes_sent_since_consume_ += p.data.size();
+        uint8_t total_packets = 0;
+        if (p.data.size() >= sizeof(FramePacketHeader)) {
+          FramePacketHeader header;
+          std::memcpy(&header, p.data.data(), sizeof(header));
+          total_packets = header.total_packets;
+        }
         lock.unlock();
         if (record_fn_) record_fn_(p.frame_sequence, p.packet_index);
         if (send_fn_) send_fn_(p.data.data(), p.data.size());
+        lock.lock();
+        int sent_packets = 0;
+        int expected_packets = 0;
+        bool frame_complete = NoteFramePacketSent(p.frame_sequence,
+                                                  p.packet_index,
+                                                  total_packets,
+                                                  &sent_packets,
+                                                  &expected_packets);
+        lock.unlock();
+        if (frame_complete) {
+          LOG(INFO) << "[Pacer] Pacer sent all packets for frame "
+                    << p.frame_sequence << " sent_packets=" << sent_packets
+                    << " total_packets=" << expected_packets;
+        }
         lock.lock();
         continue;  // immediately try the next packet
       }

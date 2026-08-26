@@ -39,7 +39,8 @@ PORT_BASE=6000
 # a live VBR encoder (frame sizes fluctuate, encoder undershoots target) for
 # comparison against sparkrtc. Override CODEC=mock for the synthetic encoder.
 CODEC="${CODEC:-x264}"
-INPUT_VIDEO="${INPUT_VIDEO:-$PROJECT_ROOT/input/Lecture_concat.yuv}"
+VIDEO_DIR="${VIDEO_DIR:-/home/menghua/Research/VideoResources}"
+INPUT_VIDEO="${INPUT_VIDEO:-$VIDEO_DIR/Lecture.yuv}"
 WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
 

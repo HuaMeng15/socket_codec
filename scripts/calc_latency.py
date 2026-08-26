@@ -26,6 +26,10 @@ def parse_send_log(path: Path):
     re_sent = re.compile(
         r"\[" + _TS + r"\].*\[DataSender\] Successfully sent frame (\d+) (?:fragment )?in (\d+) packets"
     )
+    re_pacer_sent = re.compile(
+        r"\[" + _TS + r"\].*\[Pacer\] Pacer sent all packets for frame "
+        r"(\d+) sent_packets=(\d+) total_packets=(\d+)"
+    )
     re_capture = re.compile(
         r"\[" + _TS + r"\].*\[VideoCaptureAndSend\] Read frame (\d+)"
     )
@@ -36,6 +40,7 @@ def parse_send_log(path: Path):
     # this reduces to the original behavior.
     starts = {}       # frame -> first send ts
     ends = {}         # frame -> last sent ts
+    pacer_ends = {}   # frame -> timestamp when final packet leaves pacer
     npackets = {}     # frame -> total packets summed across fragments
     for m in re_send.finditer(text):
         ts, frame, np = parse_ts(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -45,6 +50,9 @@ def parse_send_log(path: Path):
     for m in re_sent.finditer(text):
         ts, frame = parse_ts(m.group(1)), int(m.group(2))
         ends[frame] = ts  # keep overwriting -> last fragment wins
+    for m in re_pacer_sent.finditer(text):
+        ts, frame = parse_ts(m.group(1)), int(m.group(2))
+        pacer_ends[frame] = ts
     sends = {}
     for frame, start in starts.items():
         sends[frame] = (start, ends.get(frame), npackets.get(frame, 0))
@@ -52,7 +60,7 @@ def parse_send_log(path: Path):
     for m in re_capture.finditer(text):
         ts, frame = m.group(1), int(m.group(2))
         capture_times[frame] = parse_ts(ts)
-    return sends, capture_times
+    return sends, capture_times, pacer_ends
 
 
 def parse_recv_log(path: Path):
@@ -85,11 +93,13 @@ def main():
         print(f"Missing {send_log} or {recv_log}", file=sys.stderr)
         sys.exit(1)
 
-    sends, capture_times = parse_send_log(send_log)
+    sends, capture_times, pacer_ends = parse_send_log(send_log)
     recv_packets, decode_frame = parse_recv_log(recv_log)
 
     packet_latencies = []
     frame_latencies = []
+    pacer_frame_latencies = []
+    pacer_queue_delays = []
     overall_latencies = []  # capture -> decode (per frame)
     stall_100 = 0
     stall_200 = 0
@@ -108,6 +118,13 @@ def main():
         capture_ts = capture_times.get(frame)
         if decode_ts is not None and capture_ts is not None:
             overall_latencies.append((frame, (decode_ts - capture_ts) * 1000))
+        pacer_end_ts = pacer_ends.get(frame)
+        if pacer_end_ts is not None:
+            pacer_queue_delays.append((frame, (pacer_end_ts - end_ts) * 1000))
+            if decode_ts is not None:
+                pacer_frame_latencies.append(
+                    (frame, (decode_ts - pacer_end_ts) * 1000)
+                )
 
         for p in range(num_packets):
             recv_ts = recv_packets.get((frame, p))
@@ -132,6 +149,20 @@ def main():
         f.write("frame_index,packet_index,packet_latency\n")
         for fidx, pidx, lat in packet_latencies:
             f.write(f"{fidx},{pidx},{lat:.2f}\n")
+
+    # Write pacer_queue_delay.csv: DataSender enqueue done -> final packet leaves pacer
+    pacer_queue_csv = result_dir / "pacer_queue_delay.csv"
+    with open(pacer_queue_csv, "w") as f:
+        f.write("frame_index,pacer_queue_delay\n")
+        for fidx, lat in pacer_queue_delays:
+            f.write(f"{fidx},{lat:.2f}\n")
+
+    # Write pacer_frame_latency.csv: final packet leaves pacer -> decode done
+    pacer_frame_csv = result_dir / "pacer_frame_latency.csv"
+    with open(pacer_frame_csv, "w") as f:
+        f.write("frame_index,pacer_frame_latency\n")
+        for fidx, lat in pacer_frame_latencies:
+            f.write(f"{fidx},{lat:.2f}\n")
 
     # Write overall_latency.csv: frame_index, overall_latency (capture -> decode, ms)
     overall_csv = result_dir / "overall_latency.csv"
@@ -177,7 +208,21 @@ def main():
         print(f"Overall latencies:")
         print(f"Overall latency (ms):  avg={avg_ov:.2f} max={max(ov_lats):.2f} "
               f"tail99={tail_mean(ov_lats, 0.99):.2f} tail99.9={tail_mean(ov_lats, 0.999):.2f} (n={n})")
-    print(f"Wrote {frame_csv}, {packet_csv}, {overall_csv}")
+    if pacer_queue_delays:
+        pq_lats = [x[1] for x in pacer_queue_delays]
+        n = len(pq_lats)
+        avg_pq = sum(pq_lats) / n
+        print(f"Pacer queue delays:")
+        print(f"Pacer queue delay (ms): avg={avg_pq:.2f} max={max(pq_lats):.2f} "
+              f"tail99={tail_mean(pq_lats, 0.99):.2f} tail99.9={tail_mean(pq_lats, 0.999):.2f} (n={n})")
+    if pacer_frame_latencies:
+        pfl_lats = [x[1] for x in pacer_frame_latencies]
+        n = len(pfl_lats)
+        avg_pfl = sum(pfl_lats) / n
+        print(f"Pacer frame latencies:")
+        print(f"Pacer frame latency (ms): avg={avg_pfl:.2f} max={max(pfl_lats):.2f} "
+              f"tail99={tail_mean(pfl_lats, 0.99):.2f} tail99.9={tail_mean(pfl_lats, 0.999):.2f} (n={n})")
+    print(f"Wrote {frame_csv}, {packet_csv}, {overall_csv}, {pacer_queue_csv}, {pacer_frame_csv}")
 
 
 if __name__ == "__main__":

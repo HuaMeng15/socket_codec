@@ -158,7 +158,6 @@ Start a sender:
 ```bash
 ./build/socket_codec --codec=x264 --ip=127.0.0.1 --port=8888 \
   --input_video_file=input/Lecture_5s.yuv \
-  --output_video_file=result/output.264 \
   --width=1920 --height=1080 --fps=30 --frames_to_encode=150
 ```
 

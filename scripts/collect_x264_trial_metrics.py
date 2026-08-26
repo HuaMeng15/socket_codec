@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import json
 import math
 import re
 import shutil
@@ -58,6 +59,16 @@ def run_ffmpeg(cmd, log_path):
     result = subprocess.run(cmd, text=True, capture_output=True)
     log_path.write_text((result.stdout or "") + (result.stderr or ""))
     return result
+
+
+def ffmpeg_supports_libvmaf(ffmpeg):
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-h", "filter=libvmaf"],
+        text=True,
+        capture_output=True,
+    )
+    text = (result.stdout or "") + (result.stderr or "")
+    return "Unknown filter" not in text
 
 
 def parse_metric(text, name):
@@ -142,6 +153,129 @@ def parse_vmaf_frames(path):
                 }
             )
     return rows
+
+
+def parse_easyvmaf_json(path):
+    path = Path(path)
+    if not path.exists():
+        return "", []
+    data = json.loads(path.read_text())
+    frames = []
+    for frame in data.get("frames", []):
+        metrics = frame.get("metrics", {})
+        if "vmaf" not in metrics:
+            continue
+        frames.append(
+            {
+                "frame_index": int(frame.get("frameNum", len(frames))),
+                "vmaf": parse_number(metrics["vmaf"]),
+            }
+        )
+    mean = data.get("pooled_metrics", {}).get("vmaf", {}).get("mean", "")
+    return parse_number(mean), frames
+
+
+def write_vmaf_frames_csv(rows, path):
+    with Path(path).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["Frame", "vmaf"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "Frame": row.get("frame_index", ""),
+                    "vmaf": row.get("vmaf", ""),
+                }
+            )
+
+
+def raw_yuv_to_mp4(ffmpeg, raw_path, mp4_path, width, height, fps, frames, log_path):
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-f", "rawvideo",
+        "-pix_fmt", "yuv420p",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", str(raw_path),
+        "-frames:v", str(frames),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "0",
+        "-pix_fmt", "yuv420p",
+        "-y",
+        str(mp4_path),
+    ]
+    return run_ffmpeg(cmd, log_path)
+
+
+def run_docker_vmaf(args, ffmpeg, result_dir, frames_compared):
+    if frames_compared <= 0:
+        return "", []
+    docker = shutil.which(args.docker_bin)
+    if not docker:
+        (result_dir / "vmaf_docker.log").write_text("docker not found\n")
+        return "", []
+
+    work_dir = result_dir / "vmaf_docker"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    ref_mp4 = work_dir / "reference.mp4"
+    dist_mp4 = work_dir / "distorted.mp4"
+
+    ref_result = raw_yuv_to_mp4(
+        ffmpeg,
+        args.reference,
+        ref_mp4,
+        args.width,
+        args.height,
+        args.fps,
+        frames_compared,
+        result_dir / "vmaf_reference_mp4_ffmpeg.log",
+    )
+    dist_result = raw_yuv_to_mp4(
+        ffmpeg,
+        args.decoded,
+        dist_mp4,
+        args.width,
+        args.height,
+        args.fps,
+        frames_compared,
+        result_dir / "vmaf_distorted_mp4_ffmpeg.log",
+    )
+    if ref_result.returncode != 0 or dist_result.returncode != 0:
+        if not args.keep_vmaf_workdir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        return "", []
+
+    cmd = [
+        docker,
+        "run",
+        "--rm",
+        "-v",
+        f"{work_dir.resolve()}:/socket",
+        args.vmaf_docker_image,
+        "-r",
+        "/socket/reference.mp4",
+        "-d",
+        "/socket/distorted.mp4",
+        "-endsync",
+    ]
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    (result_dir / "vmaf_docker.log").write_text(
+        (result.stdout or "") + (result.stderr or "")
+    )
+    if result.returncode != 0:
+        if not args.keep_vmaf_workdir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        return "", []
+
+    json_path = work_dir / "distorted_vmaf.json"
+    mean, frame_rows = parse_easyvmaf_json(json_path)
+    if frame_rows:
+        write_vmaf_frames_csv(frame_rows, result_dir / "vmaf_frames.csv")
+        (result_dir / "vmaf_docker.json").write_text(json_path.read_text())
+    if not args.keep_vmaf_workdir:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    return mean, frame_rows
 
 
 def write_quality_frames(result_dir, frames_compared):
@@ -265,27 +399,39 @@ def calc_quality(args):
     row["psnr_v"] = parse_metric(psnr_text, "v")
     row["psnr_avg"] = parse_metric(psnr_text, "average")
 
-    # Same ordering as x264_experiments/tests/slice_division_cost/test_slice_cost.sh:
-    # distorted first, reference second.
-    vmaf_cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-s", size,
-        "-pix_fmt", "yuv420p",
-        "-i", str(decoded),
-        "-s", size,
-        "-pix_fmt", "yuv420p",
-        "-i", str(args.reference),
-        "-frames:v", str(frames_compared),
-        "-filter_complex", f"[0:v][1:v]libvmaf=log_fmt=csv:log_path={vmaf_csv_path}",
-        "-f", "null",
-        "-",
-    ]
-    vmaf_result = run_ffmpeg(vmaf_cmd, result_dir / "vmaf_ffmpeg.log")
-    vmaf_text = vmaf_result.stdout + vmaf_result.stderr
-    match = re.search(r"VMAF score:\s*([0-9.]+)", vmaf_text)
-    if match:
-        row["vmaf"] = match.group(1)
+    use_ffmpeg_vmaf = args.vmaf_method in ("auto", "ffmpeg")
+    use_docker_vmaf = args.vmaf_method in ("auto", "docker")
+    if use_ffmpeg_vmaf and ffmpeg_supports_libvmaf(ffmpeg):
+        # Same ordering as x264_experiments/tests/slice_division_cost/test_slice_cost.sh:
+        # distorted first, reference second.
+        vmaf_cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-s", size,
+            "-pix_fmt", "yuv420p",
+            "-i", str(decoded),
+            "-s", size,
+            "-pix_fmt", "yuv420p",
+            "-i", str(args.reference),
+            "-frames:v", str(frames_compared),
+            "-filter_complex", f"[0:v][1:v]libvmaf=log_fmt=csv:log_path={vmaf_csv_path}",
+            "-f", "null",
+            "-",
+        ]
+        vmaf_result = run_ffmpeg(vmaf_cmd, result_dir / "vmaf_ffmpeg.log")
+        vmaf_text = vmaf_result.stdout + vmaf_result.stderr
+        match = re.search(r"VMAF score:\s*([0-9.]+)", vmaf_text)
+        if match:
+            row["vmaf"] = match.group(1)
+    elif use_ffmpeg_vmaf:
+        (result_dir / "vmaf_ffmpeg.log").write_text(
+            f"{ffmpeg} does not provide filter=libvmaf\n"
+        )
+
+    if not row["vmaf"] and use_docker_vmaf:
+        docker_mean, _ = run_docker_vmaf(args, ffmpeg, result_dir, frames_compared)
+        if docker_mean != "":
+            row["vmaf"] = docker_mean
 
     with quality_csv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
@@ -515,6 +661,7 @@ def main():
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--frames", type=int)
+    parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--codec")
     parser.add_argument("--slice-number", default="")
     parser.add_argument("--trial", type=int)
@@ -522,6 +669,19 @@ def main():
     parser.add_argument("--send-status", type=int)
     parser.add_argument("--trials-csv")
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument(
+        "--vmaf-method",
+        choices=["auto", "ffmpeg", "docker", "none"],
+        default="auto",
+        help="VMAF backend: auto tries FFmpeg libvmaf, then Docker easyvmaf",
+    )
+    parser.add_argument("--docker-bin", default="docker")
+    parser.add_argument("--vmaf-docker-image", default="gfdavila/easyvmaf")
+    parser.add_argument(
+        "--keep-vmaf-workdir",
+        action="store_true",
+        help="Keep temporary Docker VMAF MP4 inputs for debugging",
+    )
     args = parser.parse_args()
 
     if args.summarize:

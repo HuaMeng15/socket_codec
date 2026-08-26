@@ -88,6 +88,7 @@ void VideoCaptureAndSend::Run() {
   clock_.SetFps(fps_);
   clock_.Start();
   bool is_eof = false;
+  int frames_sent = 0;
 
   while (!stop_requested_) {
     int frame_idx = clock_.WaitForNextFrameTick();
@@ -109,6 +110,7 @@ void VideoCaptureAndSend::Run() {
       LOG(ERROR) << "[VideoCaptureAndSend] Failed to read next frame";
       break;
     } else {
+      clock_.MarkFrameReadComplete();
       LOG(INFO) << "[VideoCaptureAndSend] Read frame " << frame_buffer->sequence_number;
     }
 
@@ -208,9 +210,9 @@ void VideoCaptureAndSend::Run() {
       continue;
     }
 
-    // Check if max frames reached (sequence_number is 0-based)
-    if (max_frames_ > 0 &&
-        static_cast<int>(sent_sequence) + 1 >= max_frames_) {
+    frames_sent++;
+
+    if (max_frames_ > 0 && frames_sent >= max_frames_) {
       LOG(INFO) << "[VideoCaptureAndSend] Max frames limit reached: " << max_frames_;
       break;
     }

@@ -35,14 +35,20 @@ def parse_send_log(path: Path):
     re_send_end = re.compile(
         r"\[" + TS_PATTERN + r"\].*\[DataSender\] Successfully sent frame (\d+) in (\d+) packets"
     )
-    re_bitrate = re.compile(
+    re_initial_bitrate = re.compile(
+        r"\[" + TS_PATTERN + r"\].*\[Encoder\] Initial bitrate (\d+) kbps"
+    )
+    re_set_bitrate = re.compile(
         r"\[" + TS_PATTERN + r"\].*\[Encoder\] Set target bitrate to (\d+) kbps"
+    )
+    re_slice_set_bitrate = re.compile(
+        r"\[" + TS_PATTERN + r"\].*\[SlicePacedEncoder\] Target bitrate now (\d+) kbps"
     )
     re_feedback = re.compile(
         r"\[" + TS_PATTERN + r"\].*\[FeedbackHandler\] Received feedback: frame=(\d+) packet=(\d+)"
     )
     re_send_size = re.compile(
-        r"\[" + TS_PATTERN + r"\].*\[DataSender\] Sending frame (\d+) size=(\d+) bytes"
+        r"\[" + TS_PATTERN + r"\].*\[DataSender\] Sending frame (\d+) (?:fragment )?size=(\d+) bytes"
     )
     re_sent_packet = re.compile(
         r"\[" + TS_PATTERN + r"\].*\[DataSender\] Sent packet (\d+) for frame (\d+)"
@@ -71,9 +77,16 @@ def parse_send_log(path: Path):
         ts_str, pkt, frame = m.group(1), int(m.group(2)), int(m.group(3))
         packet_send_events.append((parse_ts(ts_str), frame, pkt))
     bitrate_events = []
-    for m in re_bitrate.finditer(text):
+    for m in re_initial_bitrate.finditer(text):
         ts_str, kbps = m.group(1), int(m.group(2))
         bitrate_events.append((parse_ts(ts_str), kbps))
+    for m in re_set_bitrate.finditer(text):
+        ts_str, kbps = m.group(1), int(m.group(2))
+        bitrate_events.append((parse_ts(ts_str), kbps))
+    for m in re_slice_set_bitrate.finditer(text):
+        ts_str, kbps = m.group(1), int(m.group(2))
+        bitrate_events.append((parse_ts(ts_str), kbps))
+    bitrate_events.sort(key=lambda x: x[0])
     feedback_times = []
     for m in re_feedback.finditer(text):
         ts_str, frame, pkt = m.group(1), int(m.group(2)), int(m.group(3))

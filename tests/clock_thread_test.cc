@@ -69,6 +69,27 @@ TEST_F(ClockThreadTest, WaitForNextFrameTickTimingAccuracy) {
   EXPECT_LE(elapsed_ms, 70);
 }
 
+TEST_F(ClockThreadTest, NextTickWaitsFromReadCompletionAfterStall) {
+  clock.SetFps(100);  // 10ms intervals
+  clock.Start();
+
+  EXPECT_EQ(clock.WaitForNextFrameTick(), 0);
+
+  // Simulate a slow raw-frame read. Under the old absolute epoch schedule,
+  // frame 1's 10ms deadline would already be in the past and return instantly.
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  clock.MarkFrameReadComplete();
+
+  auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(clock.WaitForNextFrameTick(), 1);
+  auto end = std::chrono::steady_clock::now();
+  clock.Stop();
+
+  auto waited_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  EXPECT_GE(waited_ms, 8);
+}
+
 TEST_F(ClockThreadTest, StopUnblocksWait) {
   clock.SetFps(1);  // 1 second per frame — frame 1 would block ~1s without stop
   clock.Start();

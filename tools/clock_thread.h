@@ -12,7 +12,10 @@
  *
  * Provides:
  * - Monotonic microsecond timestamps (GetCurrentTimeUs)
- * - Frame-tick mechanism: blocks caller until the next frame boundary
+ * - Frame-tick mechanism: blocks caller until the next frame boundary.
+ *   After MarkFrameReadComplete(), the next boundary is scheduled relative to
+ *   the successful frame-read completion, so a late frame does not trigger a
+ *   burst of immediate catch-up reads.
  * - Slice-deadline calculation: given N slices per frame, returns the
  *   timestamp by which slice K should be complete
  *
@@ -21,6 +24,7 @@
  *   GetCurrentFrameIndex(): safe to call from any thread concurrently.
  * - WaitForNextFrameTick(): single-consumer only (the capture/encode loop).
  *   Multiple waiters would produce duplicate frame indexes.
+ * - MarkFrameReadComplete(): called by that same loop after a successful read.
  * - Start()/Stop(): call from owner thread.
  */
 class ClockThread {
@@ -50,11 +54,20 @@ class ClockThread {
   int WaitForNextFrameTick();
 
   /**
+   * Record that the current frame's raw input read has completed. This anchors
+   * the next frame tick and sliced-frame deadlines to real producer progress
+   * instead of the original clock epoch.
+   */
+  void MarkFrameReadComplete();
+
+  /**
    * Get the absolute timestamp (us since Start) by which the given slice
    * should be encoded and sent. Spreads slices evenly across the frame interval.
    *
    * For frame N with S slices, slice K's deadline is:
-   *   frame_start + (K+1) * (frame_interval / S)
+   *   frame_read_done + (K+1) * (frame_interval / S)
+   * If frame N has not reported read completion, falls back to the legacy
+   * epoch-based frame_start for compatibility.
    */
   int64_t GetSliceDeadline(int frame_index, int slice_index) const;
 
@@ -70,8 +83,13 @@ class ClockThread {
   int64_t frame_interval_us_;
 
   std::chrono::steady_clock::time_point epoch_;
+  std::chrono::steady_clock::time_point last_tick_time_;
+  std::chrono::steady_clock::time_point last_frame_read_done_time_;
   std::atomic<bool> running_;
   std::atomic<int> frame_index_;
+  bool has_frame_read_done_;
+  int read_done_frame_index_;
+  int64_t read_done_us_;
 
   mutable std::mutex mutex_;
   std::condition_variable tick_cv_;

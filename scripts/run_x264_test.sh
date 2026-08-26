@@ -10,9 +10,10 @@
 #   PHASE_S=8              # change drop timing (default 10s)
 #   CC_INITIAL_BITRATE_KBPS=500   # startup bitrate (default 500)
 #   CC_MAX_BITRATE_KBPS=10000     # ceiling (default 10000)
-#   FRAMES=600             # encode duration (default 600 = 20s @ 30fps)
+#   FRAMES=800             # encode duration (default 800 frames)
 #   RESULT_DIR=...         # exact result directory
 #   RECEIVER_OUTPUT_FILE=...  # decoded YUV output, default /dev/null
+#   SENDER_OUTPUT_FILE=...    # optional encoded bitstream dump, default disabled
 #   RUN_PLOTS=0            # skip per-run plot generation
 set -e
 
@@ -37,7 +38,8 @@ PORT="${PORT:-6100}"
 
 # Use real x264 encoder with actual video unless overridden.
 CODEC="${CODEC:-x264_slice}"
-INPUT_VIDEO="${INPUT_VIDEO:-$PROJECT_ROOT/input/Lecture_concat.yuv}"
+VIDEO_DIR="${VIDEO_DIR:-/home/menghua/Research/VideoResources}"
+INPUT_VIDEO="${INPUT_VIDEO:-$VIDEO_DIR/Lecture.yuv}"
 WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
 CC_INITIAL_BITRATE_KBPS="${CC_INITIAL_BITRATE_KBPS:-500}"
@@ -54,13 +56,13 @@ fi
 
 # Single phase: 10s at 10Mbps, then 10s at 1Mbps
 PHASE_S="${PHASE_S:-10}"
-TOTAL_DURATION_S="${TOTAL_DURATION_S:-20}"
-FRAMES="${FRAMES:-$((FPS * TOTAL_DURATION_S))}"
+FRAMES="${FRAMES:-800}"
+TOTAL_DURATION_S="${TOTAL_DURATION_S:-$(((FRAMES + FPS - 1) / FPS))}"
 SCHEDULE="${SCHEDULE:-0:10000,${PHASE_S}:1000}"
 
 RESULT_DIR="${RESULT_DIR:-$PROJECT_ROOT/result/x264_test_10to1_${RESULT_TAG}}"
 RECEIVER_OUTPUT_FILE="${RECEIVER_OUTPUT_FILE:-/dev/null}"
-SENDER_OUTPUT_FILE="${SENDER_OUTPUT_FILE:-$RESULT_DIR/sent.264}"
+SENDER_OUTPUT_FILE="${SENDER_OUTPUT_FILE:-}"
 
 echo "=== X264 Encoder Adaptive Test: 10Mbps -> 1Mbps ==="
 echo "Duration: ${TOTAL_DURATION_S}s (${PHASE_S}s per phase)"
@@ -70,6 +72,11 @@ echo "Initial bitrate: ${CC_INITIAL_BITRATE_KBPS} kbps"
 echo "Max bitrate: ${CC_MAX_BITRATE_KBPS} kbps"
 echo "Feedback interval: ${FEEDBACK_MAX_INTERVAL_MS} ms"
 echo "Receiver output: ${RECEIVER_OUTPUT_FILE}"
+if [ -n "$SENDER_OUTPUT_FILE" ]; then
+  echo "Sender bitstream output: ${SENDER_OUTPUT_FILE}"
+else
+  echo "Sender bitstream output: disabled"
+fi
 echo ""
 
 rm -rf "$RESULT_DIR"
@@ -93,20 +100,28 @@ recv_pid=$!
 sleep 1
 
 # Sender with 10->1 Mbps schedule
+sender_args=(
+  --codec="$CODEC"
+  --fps=$FPS
+  --port="$PORT"
+  --ip=127.0.0.1
+  --width=$WIDTH
+  --height=$HEIGHT
+  --input_video_file="$INPUT_VIDEO"
+  --frames_to_encode=$FRAMES
+  --sim_delay_ms=0
+  --sim_bandwidth_schedule="$SCHEDULE"
+  --encoder_variable_mode=0
+  --cc_initial_bitrate_kbps="$CC_INITIAL_BITRATE_KBPS"
+  --cc_max_bitrate_kbps="$CC_MAX_BITRATE_KBPS"
+  --cc_cwnd_queue_size_ms=100
+  --cc_cwnd_min_bitrate_kbps=100
+)
+if [ -n "$SENDER_OUTPUT_FILE" ]; then
+  sender_args+=(--output_video_file="$SENDER_OUTPUT_FILE")
+fi
 set +e
-"$BINARY" --codec="$CODEC" --fps=$FPS --port="$PORT" --ip=127.0.0.1 \
-  --width=$WIDTH --height=$HEIGHT \
-  --input_video_file=$INPUT_VIDEO \
-  --output_video_file="$SENDER_OUTPUT_FILE" \
-  --frames_to_encode=$FRAMES \
-  --sim_delay_ms=0 \
-  --sim_bandwidth_schedule="$SCHEDULE" \
-  --encoder_variable_mode=0 \
-  --cc_initial_bitrate_kbps="$CC_INITIAL_BITRATE_KBPS" \
-  --cc_max_bitrate_kbps="$CC_MAX_BITRATE_KBPS" \
-  --cc_cwnd_queue_size_ms=100 \
-  --cc_cwnd_min_bitrate_kbps=100 \
-  > "$RESULT_DIR/send.log" 2>&1
+"$BINARY" "${sender_args[@]}" > "$RESULT_DIR/send.log" 2>&1
 send_status=$?
 set -e
 

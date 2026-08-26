@@ -104,6 +104,8 @@ int SlicePacedEncoder::Initialize(int width, int height, int fps,
   sequence_number_ = 0;
   LOG(INFO) << "[SlicePacedEncoder] Initialized " << width << "x" << height
             << " fps=" << fps << " slices=" << slice_count_;
+  LOG(INFO) << "[Encoder] Initial bitrate " << target_bitrate_kbps_.load()
+            << " kbps";
   return 0;
 }
 
