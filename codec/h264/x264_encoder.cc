@@ -128,17 +128,15 @@ void X264Encoder::SetNetworkUsageState(double network_usage_state) {
 int X264Encoder::EffectiveBitrateKbps(int target_bitrate_kbps) const {
   // CBR is the only mode intended to emit exactly the CC allocation. Other
   // modes retain the existing 10% encoder headroom.
-  double utilization = rate_control_mode_ == EncoderRateControlMode::kCbr
-                           ? 1.0
-                           : BANDWIDTH_UTILIZATION;
+  double utilization = BANDWIDTH_UTILIZATION;
   return std::max(1, static_cast<int>(target_bitrate_kbps * utilization));
 }
 
 double X264Encoder::VbvRatio() const {
   switch (rate_control_mode_) {
     case EncoderRateControlMode::kSalsify:
-      return std::ceil((1 / (double)fps_) * 100) / 100;
     case EncoderRateControlMode::kCbr:
+      return std::ceil((1 / (double)fps_) * 100) / 100;
     case EncoderRateControlMode::kWebRtcNoMae:
       return VBV_NORMAL_RATIO;
     case EncoderRateControlMode::kWebRtcMae:
