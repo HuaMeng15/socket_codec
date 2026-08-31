@@ -10,3 +10,4 @@ result
 third_party/
 .venv/
 x264_experiments/
+scripts/__pycache__/
