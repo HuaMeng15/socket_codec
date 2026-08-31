@@ -113,7 +113,13 @@ void VideoCaptureAndSend::Run() {
       break;
     } else {
       clock_.MarkFrameReadComplete();
-      LOG(INFO) << "[VideoCaptureAndSend] Read frame " << frame_buffer->sequence_number;
+      const int64_t capture_time_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      LOG(INFO) << "[VideoCaptureAndSend] Read frame "
+                << frame_buffer->sequence_number
+                << " capture_time_us=" << capture_time_us;
     }
 
     uint16_t sent_sequence = 0;
@@ -132,10 +138,19 @@ void VideoCaptureAndSend::Run() {
 
       for (int slice = 0; slice < slice_count; slice++) {
         const int64_t slice_deadline_us = clock_.GetSliceDeadline(frame_idx, slice);
+        // GetSliceDeadline() is the time by which this slice should be
+        // complete. Start it at the beginning of its allocation instead of
+        // waiting until the completion deadline before encoding. This is
+        // especially important when adaptive slicing selects one slice: the
+        // single slice must start immediately, not one full frame interval
+        // after capture.
+        const int64_t slice_interval_us =
+            clock_.GetFrameIntervalUs() / std::max(1, slice_count);
+        const int64_t slice_start_us = slice_deadline_us - slice_interval_us;
         const int64_t now_us = clock_.GetCurrentTimeUs();
-        if (slice_deadline_us > now_us) {
+        if (slice_start_us > now_us) {
           std::this_thread::sleep_for(
-              std::chrono::microseconds(slice_deadline_us - now_us));
+              std::chrono::microseconds(slice_start_us - now_us));
         }
         auto slice_data = encoder_->EncodeSlice(slice);
         if (!slice_data) {

@@ -179,10 +179,6 @@ void SlicePacedEncoder::ApplyPendingSliceCount() {
 }
 
 bool SlicePacedEncoder::ShouldUseSliceRateControl() const {
-  std::cout << "[SlicePacedEncoder] Network usage state: "
-            << network_usage_state_.load() << std::endl;
-  std::cout << "[SlicePacedEncoder] Overuse threshold: " << kOveruseThreshold
-            << std::endl;
   return network_usage_state_.load() >= kOveruseThreshold;
 }
 
@@ -273,11 +269,26 @@ std::unique_ptr<EncodedData> SlicePacedEncoder::EncodeSlice(int slice_idx) {
 
   auto end_time = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double, std::milli> duration = end_time - start_time;
+  const int vbv_max_bitrate_kbps =
+      std::max(1, params_.rc.i_vbv_max_bitrate);
+  const int vbv_buffer_kbits = params_.rc.i_vbv_buffer_size;
+  const double vbv_ratio =
+      static_cast<double>(vbv_buffer_kbits) / vbv_max_bitrate_kbps;
+  const double frame_budget_bytes =
+      static_cast<double>(rc_bitrate) * 1000.0 /
+      (8.0 * std::max(1, fps_));
+  const double frame_budget_ratio = frame_budget_bytes > 0.0
+      ? static_cast<double>(encoded_data->size) / frame_budget_bytes
+      : 0.0;
   LOG(INFO) << "[SlicePacedEncoder] Frame " << sequence_number_
             << " slice=" << slice_idx
             << " bitrate=" << current_bitrate
             << " rc_mode=" << (slice_rc_active_ ? "slice" : "frame")
             << " rc_bitrate=" << rc_bitrate
+            << " vbv_ratio=" << vbv_ratio
+            << " vbv_buffer_kbits=" << vbv_buffer_kbits
+            << " frame_budget_bytes=" << frame_budget_bytes
+            << " frame_budget_ratio=" << frame_budget_ratio
             << " usage_state=" << network_usage_state_.load()
             << " size=" << encoded_data->size
             << " bytes time=" << duration.count() << " ms";

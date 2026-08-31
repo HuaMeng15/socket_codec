@@ -6,7 +6,6 @@ ClockThread::ClockThread()
       frame_interval_us_(33333),
       running_(false),
       frame_index_(-1),
-      has_frame_read_done_(false),
       read_done_frame_index_(-1),
       read_done_us_(0) {
 }
@@ -31,7 +30,6 @@ void ClockThread::Start() {
   last_tick_time_ = now;
   last_frame_read_done_time_ = now;
   frame_index_.store(-1);
-  has_frame_read_done_ = false;
   read_done_frame_index_ = -1;
   read_done_us_ = 0;
   running_.store(true);
@@ -55,14 +53,15 @@ int ClockThread::WaitForNextFrameTick() {
 
   std::unique_lock<std::mutex> lock(mutex_);
   int next_frame = frame_index_.load() + 1;
-  // Keep capture on the configured media timeline. Scheduling the next tick
-  // relative to read completion accumulates a few milliseconds of I/O and
-  // encode overhead on every frame; over an 8000-frame real-trace run that
-  // stretched 266.7 seconds of video to 286-358 seconds and caused Mahimahi to
-  // replay the beginning of a 270-second trace.
-  auto target_time = epoch_ +
-      std::chrono::microseconds(
-          static_cast<int64_t>(next_frame) * frame_interval_us_);
+  auto target_time = epoch_;
+  if (next_frame > 0) {
+    // Re-anchor every tick to the preceding tick, not the original epoch.
+    // This starts the raw read early enough that its I/O time does not get
+    // added to every frame interval, while a late frame can never cause a
+    // multi-frame epoch catch-up burst.
+    target_time = last_tick_time_ +
+        std::chrono::microseconds(frame_interval_us_);
+  }
 
   tick_cv_.wait_until(lock, target_time, [this]() {
     return !running_.load();
@@ -74,23 +73,34 @@ int ClockThread::WaitForNextFrameTick() {
 
   last_tick_time_ = std::chrono::steady_clock::now();
   frame_index_.store(next_frame);
-  has_frame_read_done_ = false;
   return next_frame;
 }
 
 void ClockThread::MarkFrameReadComplete() {
   auto now = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (read_done_frame_index_ >= 0) {
+    const auto earliest_read_done = last_frame_read_done_time_ +
+        std::chrono::microseconds(frame_interval_us_);
+    if (now < earliest_read_done) {
+      lock.unlock();
+      std::this_thread::sleep_until(earliest_read_done);
+      now = std::chrono::steady_clock::now();
+      lock.lock();
+    }
+  }
   last_frame_read_done_time_ = now;
   read_done_us_ =
       std::chrono::duration_cast<std::chrono::microseconds>(now - epoch_).count();
   read_done_frame_index_ = frame_index_.load();
-  has_frame_read_done_ = true;
 }
 
 int64_t ClockThread::GetSliceDeadline(int frame_index, int slice_index) const {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t frame_start = static_cast<int64_t>(frame_index) * frame_interval_us_;
+  if (read_done_frame_index_ == frame_index) {
+    frame_start = read_done_us_;
+  }
   int64_t slice_deadline = frame_start +
       (static_cast<int64_t>(slice_index) + 1) * (frame_interval_us_ / slice_count_);
   return slice_deadline;

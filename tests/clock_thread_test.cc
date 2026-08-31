@@ -69,26 +69,27 @@ TEST_F(ClockThreadTest, WaitForNextFrameTickTimingAccuracy) {
   EXPECT_LE(elapsed_ms, 70);
 }
 
-TEST_F(ClockThreadTest, NextTickRemainsOnAbsoluteMediaTimelineAfterStall) {
+TEST_F(ClockThreadTest, ReadCompletionMaintainsIntervalAfterStall) {
   clock.SetFps(100);  // 10ms intervals
   clock.Start();
 
   EXPECT_EQ(clock.WaitForNextFrameTick(), 0);
 
-  // Simulate a slow raw-frame read. Frame 1's absolute 10ms deadline is already
-  // in the past, so it must return immediately instead of adding another 10ms
-  // and permanently slowing the configured frame rate.
+  // Simulate a late first frame. The next read may start immediately because
+  // the prior tick is already late, but its reported completion must remain a
+  // full frame interval after the previous completion.
   std::this_thread::sleep_for(std::chrono::milliseconds(30));
   clock.MarkFrameReadComplete();
 
-  auto start = std::chrono::steady_clock::now();
   EXPECT_EQ(clock.WaitForNextFrameTick(), 1);
+  auto start = std::chrono::steady_clock::now();
+  clock.MarkFrameReadComplete();
   auto end = std::chrono::steady_clock::now();
   clock.Stop();
 
   auto waited_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-  EXPECT_LE(waited_ms, 5);
+  EXPECT_GE(waited_ms, 8);
 }
 
 TEST_F(ClockThreadTest, StopUnblocksWait) {

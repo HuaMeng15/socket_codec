@@ -1,10 +1,15 @@
 #ifndef TRANSMISSION_RECEIVED_FRAME_DATA_HANDLER_H
 #define TRANSMISSION_RECEIVED_FRAME_DATA_HANDLER_H
 
-#include <map>
-#include <string>
-#include <vector>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <fstream>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "message_handler.h"
 #include "data_receiver.h"
@@ -54,7 +59,9 @@ class ReceivedFrameDataHandler : public MessageHandler {
 
   void HandleCompleteFrame(uint32_t frame_sequence, const std::vector<uint8_t>& frame_data);
 
-  void WriteYUVFrameToFile(YUVBuffer* yuv_buffer);
+  std::vector<uint8_t> CopyYUVFrame(const YUVBuffer* yuv_buffer) const;
+  void OutputWriterLoop();
+  void StopOutputWriter();
 
   bool InitializeFeedbackSender();
 
@@ -79,6 +86,12 @@ class ReceivedFrameDataHandler : public MessageHandler {
   // Output file for writing decoded frames
   std::string output_file_;
   std::ofstream output_stream_;
+  std::mutex output_mutex_;
+  std::condition_variable output_cv_;
+  std::deque<std::vector<uint8_t>> output_queue_;
+  std::thread output_thread_;
+  bool output_stopping_ = false;
+  bool output_write_failed_ = false;
 };
 
 #endif  // TRANSMISSION_RECEIVED_FRAME_DATA_HANDLER_H

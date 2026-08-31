@@ -2,9 +2,8 @@
 import re
 import sys
 from datetime import datetime
+from math import ceil
 from pathlib import Path
-
-import numpy as np
 
 # Only match our app's timestamp (YYYY-MM-DD HH:MM:SS.fff) so x264 "[info]" etc. are not captured when logs are interleaved.
 _TS = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)"
@@ -24,7 +23,8 @@ def parse_send_log(path: Path):
         r"\[" + _TS + r"\].*\[DataSender\] Sending frame (\d+) (?:fragment )?.* in (\d+) packets"
     )
     re_sent = re.compile(
-        r"\[" + _TS + r"\].*\[DataSender\] Successfully sent frame (\d+) (?:fragment )?in (\d+) packets"
+        r"\[" + _TS + r"\].*\[DataSender\] Successfully sent frame (\d+) "
+        r"(?:fragment )?in (\d+) packets([^\n]*)"
     )
     re_pacer_sent = re.compile(
         r"\[" + _TS + r"\].*\[Pacer\] Pacer sent all packets for frame "
@@ -35,7 +35,7 @@ def parse_send_log(path: Path):
         r"send_time_us=(\d+)"
     )
     re_capture = re.compile(
-        r"\[" + _TS + r"\].*\[VideoCaptureAndSend\] Read frame (\d+)"
+        r"\[" + _TS + r"\].*\[VideoCaptureAndSend\] Read frame (\d+)([^\n]*)"
     )
     text = path.read_text()
     # Accumulate across fragments: keep the FIRST "Sending" timestamp as the frame
@@ -54,20 +54,34 @@ def parse_send_log(path: Path):
         npackets[frame] = npackets.get(frame, 0) + np
     for m in re_sent.finditer(text):
         ts, frame = parse_ts(m.group(1)), int(m.group(2))
-        ends[frame] = ts  # keep overwriting -> last fragment wins
+        exact_match = re.search(r"enqueue_done_us=(\d+)", m.group(4))
+        ends[frame] = (
+            int(exact_match.group(1)) / 1_000_000.0 if exact_match else ts
+        )  # keep overwriting -> last fragment wins
     for m in re_pacer_sent.finditer(text):
         ts, frame = parse_ts(m.group(1)), int(m.group(2))
         pacer_ends[frame] = ts
     for m in re_pacer_packet.finditer(text):
         packet, frame, send_time_us = int(m.group(2)), int(m.group(3)), int(m.group(4))
         packet_sends[(frame, packet)] = send_time_us / 1_000_000.0
+    # Prefer the actual final packet-send event over the informational
+    # "pacer sent all" log prefix, which may be delayed by synchronous logging.
+    exact_pacer_ends = {}
+    for (frame, _packet), send_ts in packet_sends.items():
+        exact_pacer_ends[frame] = max(exact_pacer_ends.get(frame, send_ts), send_ts)
+    pacer_ends.update(exact_pacer_ends)
     sends = {}
     for frame, start in starts.items():
         sends[frame] = (start, ends.get(frame), npackets.get(frame, 0))
     capture_times = {}
     for m in re_capture.finditer(text):
         ts, frame = m.group(1), int(m.group(2))
-        capture_times[frame] = parse_ts(ts)
+        exact_match = re.search(r"capture_time_us=(\d+)", m.group(3))
+        capture_times[frame] = (
+            int(exact_match.group(1)) / 1_000_000.0
+            if exact_match
+            else parse_ts(ts)
+        )
     return sends, capture_times, pacer_ends, packet_sends
 
 
@@ -77,7 +91,8 @@ def parse_recv_log(path: Path):
         r"(\d+) for frame (\d+)([^\n]*)"
     )
     re_dec = re.compile(
-        r"\[" + _TS + r"\].*\[ReceivedFrameDataHandler\] Successfully decoded frame (\d+)"
+        r"\[" + _TS + r"\].*\[ReceivedFrameDataHandler\] Successfully decoded "
+        r"frame (\d+)([^\n]*)"
     )
     text = path.read_text()
     recv_packets = {}
@@ -95,7 +110,12 @@ def parse_recv_log(path: Path):
         )
     for m in re_dec.finditer(text):
         ts, frame = m.group(1), int(m.group(2))
-        decode_frame[frame] = parse_ts(ts)
+        exact_match = re.search(r"decode_done_us=(\d+)", m.group(3))
+        decode_frame[frame] = (
+            int(exact_match.group(1)) / 1_000_000.0
+            if exact_match
+            else parse_ts(ts)
+        )
     return recv_packets, decode_frame
 
 
@@ -195,18 +215,16 @@ def main():
         """Mean of the tail (1 - ratio) of data. ratio=0.99 -> mean of top 1%."""
         if not data:
             return 0.0
-        data = np.array(data)
-        data.sort()
-        data_len = len(data)
-        tail_data = data[int(data_len * ratio):data_len]
-        return float(np.mean(tail_data))
+        ordered = sorted(data)
+        tail_data = ordered[int(len(ordered) * ratio):]
+        return sum(tail_data) / len(tail_data)
 
     def nearest_rank(data, ratio):
         """Nearest-rank percentile, matching collect_x264_trial_metrics.py."""
         if not data:
             return 0.0
         ordered = sorted(data)
-        index = int(np.ceil(ratio * len(ordered))) - 1
+        index = ceil(ratio * len(ordered)) - 1
         return float(ordered[min(max(index, 0), len(ordered) - 1)])
 
     # Keep percentiles and conditional tail means explicitly distinct. The old

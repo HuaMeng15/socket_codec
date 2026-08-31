@@ -32,6 +32,7 @@ ReceivedFrameDataHandler::~ReceivedFrameDataHandler() {
   // Stop the feedback deadline thread before closing the socket captured by
   // its send callback.
   feedback_collector_.Stop();
+  StopOutputWriter();
   if (decoder_) {
     decoder_->Cleanup();
   }
@@ -75,6 +76,9 @@ int ReceivedFrameDataHandler::Initialize() {
       return -1;
     }
     LOG(VERBOSE) << "[ReceivedFrameDataHandler] Output file opened: " << output_file_;
+    output_stopping_ = false;
+    output_write_failed_ = false;
+    output_thread_ = std::thread(&ReceivedFrameDataHandler::OutputWriterLoop, this);
   }
 
   frame_assemblies_.clear();
@@ -324,24 +328,105 @@ void ReceivedFrameDataHandler::HandleCompleteFrame(uint32_t frame_sequence,
     return;
   }
 
-  // Decode the complete frame
+  const auto decode_start = std::chrono::steady_clock::now();
   YUVBuffer* decoded_frame = decoder_->DecodeFrame(frame_data.data(), frame_data.size());
   
   if (decoded_frame) {
-    // Write decoded frame to file if output stream is set
-    if (output_stream_.is_open()) {
-      if (writeYUVToFile(&output_stream_, decoded_frame, false, false) != 0) {
-        LOG(ERROR) << "[ReceivedFrameDataHandler] Failed to write YUV frame to file";
+    // Capture decode completion before logging, copying, or raw-file I/O. This
+    // is the event used by latency analysis, so slow diagnostics cannot move it.
+    const int64_t decode_done_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    const double decode_time_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - decode_start)
+            .count();
+
+    LOG(INFO) << "[ReceivedFrameDataHandler] Successfully decoded frame "
+              << frame_sequence << " decode_done_us=" << decode_done_us
+              << " decode_time_ms=" << decode_time_ms;
+
+    // Copy the decoded pixels into an in-memory queue. The writer thread owns
+    // only plain bytes, so decoder frame release remains on this thread and is
+    // safe for every decoder implementation.
+    if (!output_file_.empty()) {
+      auto bytes = CopyYUVFrame(decoded_frame);
+      {
+        std::lock_guard<std::mutex> lock(output_mutex_);
+        output_queue_.push_back(std::move(bytes));
       }
-      output_stream_.flush();
+      output_cv_.notify_one();
     }
 
-    LOG(INFO) << "[ReceivedFrameDataHandler] Successfully decoded frame " << frame_sequence;
-
-    // Release the decoded frame
     decoder_->ReleaseFrame(decoded_frame);
   } else {
     LOG(WARNING) << "[ReceivedFrameDataHandler] Failed to decode frame " << frame_sequence;
+  }
+}
+
+std::vector<uint8_t> ReceivedFrameDataHandler::CopyYUVFrame(
+    const YUVBuffer* yuv_buffer) const {
+  size_t total_size = 0;
+  for (const auto& plane : yuv_buffer->planes) {
+    if (plane.ptr && plane.width > 0 && plane.height > 0) {
+      total_size += static_cast<size_t>(plane.width) * plane.height;
+    }
+  }
+
+  std::vector<uint8_t> bytes;
+  bytes.reserve(total_size);
+  for (const auto& plane : yuv_buffer->planes) {
+    if (!plane.ptr || plane.width <= 0 || plane.height <= 0) {
+      continue;
+    }
+    for (int row = 0; row < plane.height; ++row) {
+      const uint8_t* begin = plane.ptr + row * plane.stride;
+      bytes.insert(bytes.end(), begin, begin + plane.width);
+    }
+  }
+  return bytes;
+}
+
+void ReceivedFrameDataHandler::OutputWriterLoop() {
+  for (;;) {
+    std::vector<uint8_t> bytes;
+    {
+      std::unique_lock<std::mutex> lock(output_mutex_);
+      output_cv_.wait(lock, [this] {
+        return output_stopping_ || !output_queue_.empty();
+      });
+      if (output_queue_.empty()) {
+        if (output_stopping_) {
+          break;
+        }
+        continue;
+      }
+      bytes = std::move(output_queue_.front());
+      output_queue_.pop_front();
+    }
+
+    output_stream_.write(reinterpret_cast<const char*>(bytes.data()),
+                         static_cast<std::streamsize>(bytes.size()));
+    if (output_stream_.fail()) {
+      std::lock_guard<std::mutex> lock(output_mutex_);
+      output_write_failed_ = true;
+    }
+  }
+}
+
+void ReceivedFrameDataHandler::StopOutputWriter() {
+  if (output_thread_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(output_mutex_);
+      output_stopping_ = true;
+    }
+    output_cv_.notify_all();
+    output_thread_.join();
+  }
+  if (output_write_failed_) {
+    LOG(ERROR) << "[ReceivedFrameDataHandler] Failed to write one or more "
+                  "decoded frames to the YUV output";
   }
 }
 

@@ -72,7 +72,7 @@ if [ "$periodic_alr_probing" != "-1" ] &&
   exit 1
 fi
 
-RESULT_DIR="${result_base}/${PREFIX}_${experiment_label}"
+RESULT_DIR="${RESULT_DIR:-${result_base}/${PREFIX}_${experiment_label}}"
 if [ -z "$trials_csv" ]; then
   trials_csv="${RESULT_DIR}/trials.csv"
 fi

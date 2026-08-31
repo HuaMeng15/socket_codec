@@ -1,6 +1,94 @@
 #include "log_system.h"
 
+#include <cerrno>
+#include <condition_variable>
+#include <deque>
+#include <utility>
 #include <unistd.h>
+
+namespace {
+
+class AsyncLogSink {
+ public:
+  static AsyncLogSink& Instance() {
+    static AsyncLogSink sink;
+    return sink;
+  }
+
+  void Enqueue(std::string line) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      queue_.push_back(std::move(line));
+    }
+    cv_.notify_one();
+  }
+
+  void Flush() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    drained_cv_.wait(lock, [this] { return queue_.empty() && !writing_; });
+  }
+
+  ~AsyncLogSink() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+ private:
+  AsyncLogSink() : worker_(&AsyncLogSink::Run, this) {}
+
+  static void WriteAll(const std::string& line) {
+    size_t offset = 0;
+    while (offset < line.size()) {
+      ssize_t written =
+          ::write(STDERR_FILENO, line.data() + offset, line.size() - offset);
+      if (written > 0) {
+        offset += static_cast<size_t>(written);
+      } else if (written < 0 && errno == EINTR) {
+        continue;
+      } else {
+        break;
+      }
+    }
+  }
+
+  void Run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+      cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (queue_.empty() && stopping_) {
+        break;
+      }
+
+      std::string line = std::move(queue_.front());
+      queue_.pop_front();
+      writing_ = true;
+      lock.unlock();
+      WriteAll(line);
+      lock.lock();
+      writing_ = false;
+      if (queue_.empty()) {
+        drained_cv_.notify_all();
+      }
+    }
+    drained_cv_.notify_all();
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::condition_variable drained_cv_;
+  std::deque<std::string> queue_;
+  std::thread worker_;
+  bool stopping_ = false;
+  bool writing_ = false;
+};
+
+}  // namespace
 
 // Initialize static mutex for thread safety
 std::mutex LogStream::log_mutex;
@@ -80,11 +168,14 @@ LogStream::~LogStream() {
                          logLevelToString(level_) + "] " + "[TID:" +
                          getThreadId() + "] " + log_ss.str() + "\n";
 
-  // Output to standard error (common for logs, but can change to std::cout)
-  std::cerr << log_line;
+  // Logging must never block capture, feedback, pacing, or receiver processing.
+  // A dedicated sink thread owns the potentially blocking file descriptor.
+  AsyncLogSink& sink = AsyncLogSink::Instance();
+  sink.Enqueue(std::move(log_line));
 
   // For FATAL level, exit the program after logging
   if (level_ == LogLevel::FATAL) {
+    sink.Flush();
     std::exit(EXIT_FAILURE);
   }
 }

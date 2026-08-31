@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -231,9 +232,13 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
     }
   }
 
+  const int64_t enqueue_done_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
   LOG(VERBOSE) << "[DataSender] Successfully sent frame " << frame_sequence
                << " fragment in " << (int)(packet_index - first_packet_index)
-               << " packets";
+               << " packets enqueue_done_us=" << enqueue_done_us;
 
   uint8_t sent_count = packet_index - first_packet_index;
   if (packets_sent) {
