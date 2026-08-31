@@ -48,6 +48,11 @@ def main():
     re_set_bitrate = re.compile(
         r"\[" + _TS + r"\].*\[Encoder\] Set target bitrate to (\d+) kbps"
     )
+    # Current experiment-mode log format:
+    # [Encoder] mode=default target=X kbps encoder_bitrate=Y ...
+    re_mode_target_bitrate = re.compile(
+        r"\[" + _TS + r"\].*\[Encoder\] mode=\S+ target=(\d+) kbps"
+    )
     # [SlicePacedEncoder] Target bitrate now X kbps, next frame slices=Y
     re_slice_set_bitrate = re.compile(
         r"\[" + _TS + r"\].*\[SlicePacedEncoder\] Target bitrate now (\d+) kbps"
@@ -86,6 +91,9 @@ def main():
         ts_str, rate = m.group(1), int(m.group(2))
         bitrate_events.append((parse_ts(ts_str), rate))
     for m in re_set_bitrate.finditer(text):
+        ts_str, rate = m.group(1), int(m.group(2))
+        bitrate_events.append((parse_ts(ts_str), rate))
+    for m in re_mode_target_bitrate.finditer(text):
         ts_str, rate = m.group(1), int(m.group(2))
         bitrate_events.append((parse_ts(ts_str), rate))
     for m in re_slice_set_bitrate.finditer(text):

@@ -1,6 +1,7 @@
 #include "data_receiver.h"
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <sys/select.h>
@@ -35,6 +36,27 @@ int DataReceiver::Initialize(int listen_port) {
     LOG(ERROR) << "[DataReceiver] Failed to create socket: " << strerror(errno);
     return -1;
   }
+
+  // Keep enough queued datagrams to survive a short decoder/logger scheduling
+  // pause without losing packets. Linux doubles this value internally.
+  int receive_buffer_bytes = 4 * 1024 * 1024;
+  if (setsockopt(socket_fd_, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes,
+                 sizeof(receive_buffer_bytes)) < 0) {
+    LOG(WARNING) << "[DataReceiver] Failed to enlarge receive buffer: "
+                 << strerror(errno);
+  }
+
+#if defined(__linux__) && defined(SO_TIMESTAMPNS)
+  // Ask the kernel to timestamp each datagram when it enters the socket queue.
+  // This timestamp remains correct even if userspace is briefly descheduled or
+  // blocked writing logs before it calls recvmsg().
+  int enable_timestamp = 1;
+  if (setsockopt(socket_fd_, SOL_SOCKET, SO_TIMESTAMPNS, &enable_timestamp,
+                 sizeof(enable_timestamp)) < 0) {
+    LOG(WARNING) << "[DataReceiver] Kernel receive timestamps unavailable: "
+                 << strerror(errno);
+  }
+#endif
 
   // Set up local address for binding
   struct sockaddr_in local_addr;
@@ -123,23 +145,29 @@ void DataReceiver::Run() {
       continue;
     }
 
-    // Data available, receive packet
+    // Data available. Drain the socket queue before returning to select(); this
+    // reduces queueing and overflow when several packets become ready together.
     if (FD_ISSET(socket_fd_, &read_fds)) {
-      ssize_t bytes_received = 0;
-      int ret = ReceivePacket(buffer.data(), buffer_size, bytes_received);
+      while (!stop_requested_) {
+        ssize_t bytes_received = 0;
+        int64_t arrival_time_us = 0;
+        int ret = ReceivePacket(buffer.data(), buffer_size, bytes_received,
+                                arrival_time_us);
 
-      if (ret == 0 && bytes_received > 0) {
-        // Pass packet directly to message handler
-        if (message_handler_) {
-          message_handler_->HandlePacketMessage(buffer.data(),
-                                               static_cast<size_t>(bytes_received));
+        if (ret == 0 && bytes_received > 0) {
+          if (message_handler_) {
+            message_handler_->HandlePacketMessageWithTimestamp(
+                buffer.data(), static_cast<size_t>(bytes_received),
+                arrival_time_us);
+          }
+          continue;
         }
-      } else if (ret < 0 && !stop_requested_) {
-        // Error receiving, but continue if not stopped
-        // EAGAIN/EWOULDBLOCK is expected with non-blocking socket
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-          LOG(WARNING) << "[DataReceiver] Error receiving packet: " << strerror(errno);
+        if (ret < 0 && !stop_requested_ && errno != EAGAIN &&
+            errno != EWOULDBLOCK) {
+          LOG(WARNING) << "[DataReceiver] Error receiving packet: "
+                       << strerror(errno);
         }
+        break;
       }
     }
   }
@@ -148,16 +176,29 @@ void DataReceiver::Run() {
 }
 
 int DataReceiver::ReceivePacket(uint8_t* buffer, size_t buffer_size,
-                                    ssize_t& bytes_received) {
+                                ssize_t& bytes_received,
+                                int64_t& arrival_time_us) {
   if (socket_fd_ < 0) {
     return -1;
   }
 
   struct sockaddr_in sender_addr;
-  socklen_t sender_addr_len = sizeof(sender_addr);
+  memset(&sender_addr, 0, sizeof(sender_addr));
+  struct iovec iov;
+  iov.iov_base = buffer;
+  iov.iov_len = buffer_size;
+  char control[CMSG_SPACE(sizeof(struct timespec))];
+  memset(control, 0, sizeof(control));
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_name = &sender_addr;
+  msg.msg_namelen = sizeof(sender_addr);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
 
-  bytes_received = recvfrom(socket_fd_, buffer, buffer_size, 0,
-                            (struct sockaddr*)&sender_addr, &sender_addr_len);
+  bytes_received = recvmsg(socket_fd_, &msg, 0);
 
   if (bytes_received < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -165,10 +206,27 @@ int DataReceiver::ReceivePacket(uint8_t* buffer, size_t buffer_size,
       return 0;
     }
     if (!stop_requested_) {
-      LOG(ERROR) << "[DataReceiver] recvfrom() failed: " << strerror(errno);
+      LOG(ERROR) << "[DataReceiver] recvmsg() failed: " << strerror(errno);
     }
     return -1;
   }
+
+  // Fallback uses CLOCK_REALTIME's C++ equivalent, matching SO_TIMESTAMPNS's
+  // clock domain. Only relative deltas are put on the wire.
+  arrival_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+#if defined(__linux__) && defined(SO_TIMESTAMPNS)
+  for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+       cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+    if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+      const auto* ts = reinterpret_cast<const struct timespec*>(CMSG_DATA(cmsg));
+      arrival_time_us = static_cast<int64_t>(ts->tv_sec) * 1000000LL +
+                        static_cast<int64_t>(ts->tv_nsec) / 1000LL;
+      break;
+    }
+  }
+#endif
 
   // Store sender information for feedback
   char ip_str[INET_ADDRSTRLEN];
@@ -213,4 +271,3 @@ bool DataReceiver::GetLastSenderInfo(std::string& sender_ip,
   sender_port = last_sender_port_;
   return true;
 }
-

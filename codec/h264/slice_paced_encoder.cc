@@ -86,11 +86,14 @@ int SlicePacedEncoder::Initialize(int width, int height, int fps,
   params_.i_fps_den = 1;
   params_.i_fps_num = fps_;
   params_.b_vfr_input = 0;
+  // Match the default X264Encoder's entropy coding.  The old forced Baseline
+  // profile disabled CABAC, so the comparison changed both slice pacing and
+  // coding efficiency.  Per-slice mode itself requires single-threaded,
+  // non-sliced-thread operation, but it does not require Baseline/CAVLC.
+  params_.b_cabac = 1;
 
   params_.rc.i_rc_method = X264_RC_ABR;
   ApplyBitrateReconfig(target_bitrate_kbps_.load());
-
-  x264_param_apply_profile(&params_, "baseline");
 
   encoder_ = x264_encoder_open(&params_);
   if (!encoder_) {
@@ -135,9 +138,10 @@ void SlicePacedEncoder::ApplyBitrateReconfig(int bitrate_kbps) {
   params_.rc.i_bitrate = effective_bitrate;
   params_.rc.i_vbv_max_bitrate = effective_bitrate;
 
-  double vbv_ratio = network_usage_state_.load() >= kOveruseThreshold
-                         ? 1.0 / std::max(1, fps_)
-                         : kVbvNormalRatio;
+  double vbv_ratio = kVbvNormalRatio;
+  if (network_usage_state_.load() >= kOveruseThreshold) {
+    vbv_ratio = std::ceil((1 / (double)params_.i_fps_num) * 100) / 100;
+  }
   params_.rc.i_vbv_buffer_size =
       std::max(1, static_cast<int>(effective_bitrate * vbv_ratio));
 

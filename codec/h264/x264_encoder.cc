@@ -1,5 +1,6 @@
 #include "x264_encoder.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -12,6 +13,7 @@ static const int INITIAL_BITRATE = kDefaultInitialBitrateKbps;
 static const int SLICE_MAX_SIZE = 0;
 static const double BANDWIDTH_UTILIZATION = 0.9;
 static const double VBV_NORMAL_RATIO = 0.5;   // normal: vbv_buffer = this * bitrate (kbits)
+static const double OVERUSE_THRESHOLD = 2.0;
 // VBV_REDUCED_RATIO and VBV_RECOVERY_FRAMES removed - now using network_usage_state_
 
 
@@ -24,6 +26,7 @@ X264Encoder::X264Encoder()
       width_(0),
       height_(0),
       fps_(0),
+      rate_control_mode_(EncoderRateControlMode::kWebRtcMae),
       network_usage_state_(0.0) {
   memset(&params_, 0, sizeof(params_));
   memset(&pic_in_, 0, sizeof(pic_in_));
@@ -64,18 +67,10 @@ int X264Encoder::Initialize(int width, int height, int fps, int /* framesToBeEnc
   params_.i_log_level = X264_LOG_INFO;
   params_.i_slice_max_size = SLICE_MAX_SIZE;
 
-  // ABR
   params_.rc.i_rc_method = X264_RC_ABR;
-  double bitrate = INITIAL_BITRATE * BANDWIDTH_UTILIZATION;
-  params_.rc.i_bitrate = bitrate;
-
-  params_.rc.i_vbv_max_bitrate = bitrate;
-
-  params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * VBV_NORMAL_RATIO);
+  ApplyRateControl(target_bitrate_kbps_, true);
 
   LOG(INFO) << "bitrate: " << params_.rc.i_bitrate << " vbv_max_bitrate: " << params_.rc.i_vbv_max_bitrate << " vbv_buffer_size: " << params_.rc.i_vbv_buffer_size;
-
-  // param.rc.b_filler = 1;
 
   params_.i_bframe = 0;
   params_.b_open_gop = 0;
@@ -111,47 +106,95 @@ void X264Encoder::SetTargetBitrate(int bitrate_kbps) {
     return;
   }
 
-  if (bitrate_kbps == target_bitrate_kbps_) {
-    return;  // Same as last time, ignore
+  if (bitrate_kbps <= 0) return;
+  ApplyRateControl(bitrate_kbps, false);
+}
+
+void X264Encoder::SetRateControlMode(EncoderRateControlMode mode) {
+  if (initialized_) {
+    LOG(ERROR) << "[X264Encoder] Rate-control mode must be set before Initialize";
+    return;
   }
-
-  target_bitrate_kbps_ = bitrate_kbps;
-  double bitrate = bitrate_kbps * BANDWIDTH_UTILIZATION;
-
-  params_.rc.i_bitrate = static_cast<int>(bitrate);
-  params_.rc.i_vbv_max_bitrate = static_cast<int>(bitrate);
-
-  // VBV adaptation based on network usage state (sparkrtc-aligned):
-  // When network_usage_state >= 2.0 (overuse), use tight VBV = bitrate/fps
-  // Otherwise (normal/underuse), use relaxed VBV = bitrate/2
-  double vbv_ratio;
-  const double kOveruseThreshold = 2.0;
-
-  if (network_usage_state_ >= kOveruseThreshold) {
-    // Overuse: tight VBV for fast adaptation (sparkrtc: bitrate/fps)
-    vbv_ratio = 1.0 / fps_;
-    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * vbv_ratio);
-    if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
-    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps
-              << " kbps (OVERUSE VBV=" << params_.rc.i_vbv_buffer_size
-              << " kbits, usage_state=" << network_usage_state_ << ")";
-  } else {
-    // Normal/underuse: relaxed VBV (sparkrtc: bitrate/2)
-    vbv_ratio = 0.5;
-    params_.rc.i_vbv_buffer_size = static_cast<int>(bitrate * vbv_ratio);
-    if (params_.rc.i_vbv_buffer_size < 1) params_.rc.i_vbv_buffer_size = 1;
-    LOG(INFO) << "[Encoder] Set target bitrate to " << bitrate_kbps
-              << " kbps (NORMAL VBV=" << params_.rc.i_vbv_buffer_size
-              << " kbits, usage_state=" << network_usage_state_ << ")";
-  }
-
-  x264_encoder_reconfig(encoder_, &params_);
+  rate_control_mode_ = mode;
 }
 
 void X264Encoder::SetNetworkUsageState(double network_usage_state) {
   // Store the network usage state from GCC for VBV adaptation in SetTargetBitrate.
   // This is called by VideoCaptureAndSend before each SetTargetBitrate call.
   network_usage_state_ = network_usage_state;
+}
+
+int X264Encoder::EffectiveBitrateKbps(int target_bitrate_kbps) const {
+  // CBR is the only mode intended to emit exactly the CC allocation. Other
+  // modes retain the existing 10% encoder headroom.
+  double utilization = rate_control_mode_ == EncoderRateControlMode::kCbr
+                           ? 1.0
+                           : BANDWIDTH_UTILIZATION;
+  return std::max(1, static_cast<int>(target_bitrate_kbps * utilization));
+}
+
+double X264Encoder::VbvRatio() const {
+  switch (rate_control_mode_) {
+    case EncoderRateControlMode::kSalsify:
+      return 1.0 / std::max(1, fps_);
+    case EncoderRateControlMode::kCbr:
+    case EncoderRateControlMode::kWebRtcNoMae:
+      return VBV_NORMAL_RATIO;
+    case EncoderRateControlMode::kWebRtcMae:
+    default:
+      double vbv_ratio = kVbvNormalRatio;
+      if (network_usage_state_.load() >= kOveruseThreshold) {
+        vbv_ratio = std::ceil((1 / (double)params_.i_fps_num) * 100) / 100;
+      }
+      return vbv_ratio;
+  }
+}
+
+const char* X264Encoder::RateControlModeName() const {
+  switch (rate_control_mode_) {
+    case EncoderRateControlMode::kSalsify:
+      return "salsify";
+    case EncoderRateControlMode::kCbr:
+      return "cbr";
+    case EncoderRateControlMode::kWebRtcNoMae:
+      return "webrtc_no_mae";
+    case EncoderRateControlMode::kWebRtcMae:
+    default:
+      return "default";
+  }
+}
+
+void X264Encoder::ApplyRateControl(int target_bitrate_kbps, bool force) {
+  int effective_bitrate = EffectiveBitrateKbps(target_bitrate_kbps);
+  double vbv_ratio = VbvRatio();
+  int vbv_buffer_size =
+      std::max(1, static_cast<int>(effective_bitrate * vbv_ratio));
+  int filler = rate_control_mode_ == EncoderRateControlMode::kCbr ? 1 : 0;
+
+  bool changed = force || target_bitrate_kbps_ != target_bitrate_kbps ||
+                 params_.rc.i_bitrate != effective_bitrate ||
+                 params_.rc.i_vbv_buffer_size != vbv_buffer_size ||
+                 params_.rc.b_filler != filler;
+  target_bitrate_kbps_ = target_bitrate_kbps;
+  if (!changed) return;
+
+  params_.rc.i_rc_method = X264_RC_ABR;
+  params_.rc.i_bitrate = effective_bitrate;
+  params_.rc.i_vbv_max_bitrate = effective_bitrate;
+  params_.rc.i_vbv_buffer_size = vbv_buffer_size;
+  params_.rc.b_filler = filler;
+
+  LOG(INFO) << "[Encoder] mode=" << RateControlModeName()
+            << " target=" << target_bitrate_kbps
+            << " kbps encoder_bitrate=" << effective_bitrate
+            << " kbps vbv_ratio=" << vbv_ratio
+            << " vbv_buffer=" << vbv_buffer_size
+            << " kbits filler=" << filler
+            << " usage_state=" << network_usage_state_;
+
+  if (encoder_) {
+    x264_encoder_reconfig(encoder_, &params_);
+  }
 }
 
 std::unique_ptr<EncodedData> X264Encoder::EncodeFrame(YUVBuffer* input_buffer) {
@@ -274,4 +317,3 @@ void X264Encoder::PrintSummary() const {
 
   LOG(INFO) << "[X264Encoder] Summary: Encoded " << sequence_number_ << " frames";
 }
-

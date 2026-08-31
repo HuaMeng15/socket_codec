@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -107,17 +108,53 @@ TEST(TransportFeedbackTest, TimeTriggerSendsBeforeCountReached) {
   // At low bitrate the count interval is far from reached, but a packet aging
   // past the max interval must still flush — this is what bounds feedback
   // latency when the link is slow.
+  std::atomic<int> sends{0};
   FeedbackCollector collector;
   collector.SetFeedbackInterval(20);        // count trigger far off
   collector.SetFeedbackMaxIntervalMs(20);   // 20ms time bound
-  int sends = 0;
   collector.SetSendCallback([&](const uint8_t*, size_t) { sends++; });
 
   collector.OnPacketReceived(1, 0, 1200);   // starts the clock
-  EXPECT_EQ(sends, 0);
+  EXPECT_EQ(sends.load(), 0);
   std::this_thread::sleep_for(std::chrono::milliseconds(30));  // exceed window
-  collector.OnPacketReceived(1, 1, 1200);   // 2 pkts (<20) but oldest is >20ms
-  EXPECT_EQ(sends, 1);  // time trigger fired despite count not reached
+  EXPECT_EQ(sends.load(), 1);  // timer fired without requiring another packet
+}
+
+TEST(TransportFeedbackTest, DeadlineTimerDoesNotWaitForNextPacket) {
+  std::atomic<int> sends{0};
+  FeedbackCollector collector;
+  collector.SetFeedbackInterval(20);
+  collector.SetFeedbackMaxIntervalMs(10);
+  collector.SetSendCallback([&](const uint8_t*, size_t) { sends++; });
+
+  collector.OnPacketReceived(1, 0, 1200);
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+  EXPECT_EQ(sends.load(), 1);
+}
+
+TEST(TransportFeedbackTest, PreservesProvidedKernelArrivalGap) {
+  FeedbackCollector collector;
+  collector.SetFeedbackMaxIntervalMs(0);
+  collector.SetFeedbackInterval(2);
+  std::vector<uint8_t> sent;
+  collector.SetSendCallback([&](const uint8_t* data, size_t size) {
+    sent.assign(data, data + size);
+  });
+
+  // These calls happen back-to-back in userspace, but their socket arrival
+  // timestamps are 1.1357s apart. Feedback must preserve the kernel-observed
+  // gap instead of replacing it with handler/log processing time.
+  collector.OnPacketReceived(398, 9, 1460, 5000000);
+  collector.OnPacketReceived(398, 10, 500, 6135700);
+
+  ASSERT_FALSE(sent.empty());
+  auto* records = reinterpret_cast<const PacketArrivalRecord*>(
+      sent.data() + sizeof(FeedbackMessageHeader));
+  EXPECT_EQ(ntohl(records[0].arrival_time_us), 0u);
+  EXPECT_EQ(ntohl(records[1].arrival_time_us), 1135700u);
+  EXPECT_EQ(ntohs(records[0].recv_size), 1460);
+  EXPECT_EQ(ntohs(records[1].recv_size), 500);
 }
 
 TEST(TransportFeedbackTest, LossDetection) {

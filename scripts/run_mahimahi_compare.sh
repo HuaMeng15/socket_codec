@@ -8,6 +8,8 @@
 #   FPS=30
 #   TRACE_FILE=input/traces/15s_10to1_until_300s.log
 #   INPUT_VIDEO=/home/menghua/Research/VideoResources/Lecture.yuv
+#   FEEDBACK_MAX_INTERVAL_MS=1
+#   FEEDBACK_TRACE_INTERVAL_MS=1
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +29,10 @@ WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
 BASE_PORT="${BASE_PORT:-8800}"
 PORT_STRIDE="${PORT_STRIDE:-100}"
+FEEDBACK_MAX_INTERVAL_MS="${FEEDBACK_MAX_INTERVAL_MS:-1}"
+FEEDBACK_TRACE_INTERVAL_MS="${FEEDBACK_TRACE_INTERVAL_MS:-1}"
+FEEDBACK_BANDWIDTH_FILE="${FEEDBACK_BANDWIDTH_FILE:-}"
+CC_CWND_QUEUE_SIZE_MS="${CC_CWND_QUEUE_SIZE_MS:-50}"
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
 RESULT_ROOT="${RESULT_ROOT:-$PROJECT_ROOT/result/mahimahi_compare_$timestamp}"
@@ -48,6 +54,17 @@ fi
 
 read -r -a CODECS <<< "$CODECS_STR"
 
+if ! [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TRIALS must be a positive integer"
+  exit 1
+fi
+for codec in "${CODECS[@]}"; do
+  if [ "$codec" != "x264" ] && [ "$codec" != "x264_slice" ]; then
+    echo "Unsupported comparison codec: $codec (expected x264 or x264_slice)"
+    exit 1
+  fi
+done
+
 mkdir -p "$RESULT_ROOT"
 rm -f "$TRIALS_CSV" "$SUMMARY_CSV"
 
@@ -57,13 +74,22 @@ echo "Codecs: ${CODECS[*]}"
 echo "Trials per codec: $TRIALS"
 echo "Input: $INPUT_VIDEO"
 echo "Trace: $TRACE_FILE"
+echo "Feedback batching: ${FEEDBACK_MAX_INTERVAL_MS} ms"
+echo "Congestion-window queue allowance: ${CC_CWND_QUEUE_SIZE_MS} ms"
+if [ -n "$FEEDBACK_BANDWIDTH_FILE" ]; then
+  echo "Feedback trace: $FEEDBACK_BANDWIDTH_FILE"
+else
+  echo "Feedback trace: generated ${FEEDBACK_TRACE_INTERVAL_MS} ms reverse slots"
+fi
 echo "Resolution/FPS: ${WIDTH}x${HEIGHT} @ ${FPS}"
 echo "Frames: $FRAMES"
 echo ""
 
-codec_index=0
-for codec in "${CODECS[@]}"; do
-  for trial in $(seq 1 "$TRIALS"); do
+# Interleave codecs within each trial number. This keeps paired x264 and
+# x264_slice runs close in time instead of putting all baseline runs first.
+for trial in $(seq 1 "$TRIALS"); do
+  codec_index=0
+  for codec in "${CODECS[@]}"; do
     port=$((BASE_PORT + codec_index * PORT_STRIDE + trial * 2))
     prefix="$codec/trial_$trial"
 
@@ -79,9 +105,13 @@ for codec in "${CODECS[@]}"; do
       TRIALS_CSV="$TRIALS_CSV" \
       PYTHON="$PYTHON" \
       FFMPEG_BIN="${FFMPEG_BIN:-ffmpeg}" \
+      FEEDBACK_MAX_INTERVAL_MS="$FEEDBACK_MAX_INTERVAL_MS" \
+      FEEDBACK_TRACE_INTERVAL_MS="$FEEDBACK_TRACE_INTERVAL_MS" \
+      FEEDBACK_BANDWIDTH_FILE="$FEEDBACK_BANDWIDTH_FILE" \
+      CC_CWND_QUEUE_SIZE_MS="$CC_CWND_QUEUE_SIZE_MS" \
       "$RUN_ONE" "$prefix" "$codec" "" "$FRAMES" "$TRACE_FILE" "$FPS" "$INPUT_VIDEO"
+    codec_index=$((codec_index + 1))
   done
-  codec_index=$((codec_index + 1))
 done
 
 "$PYTHON" "$METRICS" \

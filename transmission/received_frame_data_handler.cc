@@ -29,6 +29,9 @@ ReceivedFrameDataHandler::ReceivedFrameDataHandler(CodecType codec_type,
 }
 
 ReceivedFrameDataHandler::~ReceivedFrameDataHandler() {
+  // Stop the feedback deadline thread before closing the socket captured by
+  // its send callback.
+  feedback_collector_.Stop();
   if (decoder_) {
     decoder_->Cleanup();
   }
@@ -89,11 +92,23 @@ int ReceivedFrameDataHandler::HandlePacketMessage(const uint8_t* packet_data,
     return -1;
   }
 
-  ProcessPacket(packet_data, packet_size);
+  ProcessPacket(packet_data, packet_size, -1);
   return 0;
 }
 
-void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t packet_size) {
+int ReceivedFrameDataHandler::HandlePacketMessageWithTimestamp(
+    const uint8_t* packet_data, size_t packet_size, int64_t arrival_time_us) {
+  if (!initialized_) {
+    LOG(ERROR) << "[ReceivedFrameDataHandler] Not initialized";
+    return -1;
+  }
+  ProcessPacket(packet_data, packet_size, arrival_time_us);
+  return 0;
+}
+
+void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data,
+                                             size_t packet_size,
+                                             int64_t arrival_time_us) {
   if (packet_size < sizeof(FramePacketHeader)) {
     LOG(WARNING) << "[ReceivedFrameDataHandler] Packet too small, ignoring";
     return;
@@ -114,7 +129,7 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
   // skips it (send_time_us stays -1). See kPaddingFrameSequence.
   if (frame_sequence == kPaddingFrameSequence) {
     SendFeedback(frame_sequence, packet_index,
-                 static_cast<uint16_t>(packet_size));
+                 static_cast<uint16_t>(packet_size), arrival_time_us);
     return;
   }
 
@@ -170,17 +185,32 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data, size_t 
     frame_assembly.packets[packet_index].assign(payload, payload + payload_size);
     frame_assembly.received_packets++;
 
+    // Feed congestion control before any verbose logging or decoding can block.
+    // The timestamp itself was captured by the kernel when the datagram entered
+    // the socket queue, so delayed userspace processing cannot create a fake
+    // network latency spike.
+    SendFeedback(frame_sequence, packet_index,
+                 static_cast<uint16_t>(packet_size), arrival_time_us);
+
+    int64_t handler_lag_us = -1;
+    if (arrival_time_us >= 0) {
+      int64_t processing_time_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      handler_lag_us = std::max<int64_t>(0, processing_time_us - arrival_time_us);
+    }
+
     LOG(VERBOSE) << "[ReceivedFrameDataHandler] Received packet " << (int)packet_index
                  << " for frame " << (int)frame_sequence
                  << " bytes=" << (int)payload_size
+                 << " socket_arrival_us=" << arrival_time_us
+                 << " handler_lag_ms="
+                 << (handler_lag_us >= 0 ? handler_lag_us / 1000.0 : -1.0)
                  << " (" << (int)frame_assembly.received_packets << "/"
                  << (int)frame_assembly.total_packets
                  << " complete)";
 
-    // Send feedback for received packet. Pass the actual wire bytes received
-    // (header + payload) so the acked-throughput estimator uses real sizes.
-    SendFeedback(frame_sequence, packet_index,
-                 static_cast<uint16_t>(packet_size));
   }
 
   // Check if frame is complete
@@ -252,7 +282,8 @@ void ReceivedFrameDataHandler::SetFeedbackMaxIntervalMs(int ms) {
 }
 
 void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
-                                            uint16_t recv_size) {
+                                            uint16_t recv_size,
+                                            int64_t arrival_time_us) {
   // Try to initialize feedback sender if not already initialized
   if (!feedback_sender_initialized_) {
     if (InitializeFeedbackSender()) {
@@ -278,7 +309,12 @@ void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t pac
   // This is what the GCC delay-based estimator consumes. Report the actual
   // wire bytes received (header + payload) so the acked-throughput estimator
   // uses real sizes, not a fixed-MTU assumption.
-  feedback_collector_.OnPacketReceived(frame_sequence, packet_index, recv_size);
+  if (arrival_time_us >= 0) {
+    feedback_collector_.OnPacketReceived(frame_sequence, packet_index, recv_size,
+                                         arrival_time_us);
+  } else {
+    feedback_collector_.OnPacketReceived(frame_sequence, packet_index, recv_size);
+  }
 }
 
 void ReceivedFrameDataHandler::HandleCompleteFrame(uint32_t frame_sequence,

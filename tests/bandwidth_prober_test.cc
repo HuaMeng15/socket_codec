@@ -172,40 +172,67 @@ TEST_F(StartupStageTest, OveruseEndsStage) {
   EXPECT_EQ(rate, 2000);  // no startup probe — AIMD owns it now
 }
 
-TEST_F(BandwidthProberTest, AlrProbeChainsUpToHopCap) {
-  // An ALR (periodic) probe MAY chain (unlike a seed), but only up to
-  // kMaxChainHops (2) further hops, and each hop explores at most 1.5x the
-  // measured rate (WebRTC AimdRateControl increase limit). Bounding both the
-  // hop count and the per-hop multiple stops one probe session from running to
-  // ~2x the link capacity and flooding the pipe. Fires only while app-limited.
+TEST_F(BandwidthProberTest, PeriodicProbeIsQualifiedAndDoesNotChain) {
+  // Periodic discovery takes one conservative, measurement-based step per ALR
+  // interval. It must not compound several increases in one probe session.
   prober.SetMaxBitrate(30000);
   prober.SetEstimatedBitrate(2000);
   prober.OnOveruseDetected();     // finish initial probing
-  prober.OnApplicationLimited();  // encoder under-producing -> ALR
+  prober.SetApplicationLimited(true);  // encoder under-producing -> ALR
 
-  // Trigger the ALR probe: 1.5x estimate = 3000.
+  // Trigger the ALR probe after both the interval and ALR qualification time:
+  // 1.25x estimate = 2500.
   AdvanceMs(5100);
   int r = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(r, 3000);
+  EXPECT_EQ(r, 2500);
   prober.GetPendingProbes();
 
-  // Hop 1: strong result 2700/3000 = 0.9 → chain to 1.5x = 4050.
-  prober.OnProbeResult(2700, true);
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-  auto p2 = prober.GetPendingProbes();
-  ASSERT_EQ(p2.size(), 1u);
-  EXPECT_EQ(p2[0].target_bitrate_kbps, 4050);
-
-  // Hop 2: strong result 3645/4050 = 0.9 → chain to 1.5x = 5467 (last hop).
-  prober.OnProbeResult(3645, true);
-  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
-  auto p3 = prober.GetPendingProbes();
-  ASSERT_EQ(p3.size(), 1u);
-  EXPECT_EQ(p3[0].target_bitrate_kbps, 5467);
-
-  // Hop cap reached: even a strong result 4920/5467 = 0.9 must NOT chain.
-  prober.OnProbeResult(4920, true);
+  prober.OnProbeResult(2400, true);
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  EXPECT_TRUE(prober.GetPendingProbes().empty());
+}
+
+TEST_F(BandwidthProberTest, TransientAlrDoesNotArmDelayedProbe) {
+  prober.OnOveruseDetected();
+  AdvanceMs(5100);  // periodic interval is ready
+
+  prober.SetApplicationLimited(true);
+  AdvanceMs(250);  // shorter than qualification time
+  EXPECT_EQ(prober.GetEffectiveBitrateKbps(), 5000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+
+  prober.SetApplicationLimited(false);
+  AdvanceMs(1000);
+  EXPECT_EQ(prober.GetEffectiveBitrateKbps(), 5000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+}
+
+TEST_F(BandwidthProberTest, PeriodicProbeRequiresHealthyNetworkState) {
+  prober.OnOveruseDetected();
+  prober.SetApplicationLimited(true);
+  prober.SetPeriodicProbingAllowed(false);
+  AdvanceMs(5100);
+
+  EXPECT_EQ(prober.GetEffectiveBitrateKbps(), 5000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+
+  // Once the measured cwnd/queue state recovers, the already-qualified ALR
+  // may take exactly one conservative measurement-driven step.
+  prober.SetPeriodicProbingAllowed(true);
+  EXPECT_EQ(prober.GetEffectiveBitrateKbps(), 6250);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+}
+
+TEST_F(BandwidthProberTest, UnhealthyStateCancelsOnlyPeriodicProbe) {
+  prober.OnOveruseDetected();
+  prober.SetApplicationLimited(true);
+  AdvanceMs(5100);
+  prober.GetEffectiveBitrateKbps();
+  ASSERT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+
+  prober.SetPeriodicProbingAllowed(false);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+  EXPECT_TRUE(prober.GetPendingProbes().empty());
 }
 
 TEST_F(BandwidthProberTest, ChainStopsWhenLinkSaturates) {
@@ -272,12 +299,12 @@ TEST_F(BandwidthProberTest, AlrProbingOnlyWhileApplicationLimited) {
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
 
   // Now the AlrDetector reports application-limited (encoder under-producing).
-  prober.OnApplicationLimited();
+  prober.SetApplicationLimited(true);
 
-  // Interval elapsed since the last probe → ALR probe at 1.5x = 7500.
+  // Interval and qualification elapsed → conservative 1.25x probe.
   AdvanceMs(5100);
   rate = prober.GetEffectiveBitrateKbps();
-  EXPECT_EQ(rate, 7500);  // 1.5x estimate
+  EXPECT_EQ(rate, 6250);  // 1.25x estimate
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
 }
 

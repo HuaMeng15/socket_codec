@@ -30,6 +30,10 @@ def parse_send_log(path: Path):
         r"\[" + _TS + r"\].*\[Pacer\] Pacer sent all packets for frame "
         r"(\d+) sent_packets=(\d+) total_packets=(\d+)"
     )
+    re_pacer_packet = re.compile(
+        r"\[" + _TS + r"\].*\[Pacer\] Sent packet (\d+) for frame (\d+) "
+        r"send_time_us=(\d+)"
+    )
     re_capture = re.compile(
         r"\[" + _TS + r"\].*\[VideoCaptureAndSend\] Read frame (\d+)"
     )
@@ -41,6 +45,7 @@ def parse_send_log(path: Path):
     starts = {}       # frame -> first send ts
     ends = {}         # frame -> last sent ts
     pacer_ends = {}   # frame -> timestamp when final packet leaves pacer
+    packet_sends = {} # (frame, packet) -> exact CLOCK_REALTIME send timestamp
     npackets = {}     # frame -> total packets summed across fragments
     for m in re_send.finditer(text):
         ts, frame, np = parse_ts(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -53,6 +58,9 @@ def parse_send_log(path: Path):
     for m in re_pacer_sent.finditer(text):
         ts, frame = parse_ts(m.group(1)), int(m.group(2))
         pacer_ends[frame] = ts
+    for m in re_pacer_packet.finditer(text):
+        packet, frame, send_time_us = int(m.group(2)), int(m.group(3)), int(m.group(4))
+        packet_sends[(frame, packet)] = send_time_us / 1_000_000.0
     sends = {}
     for frame, start in starts.items():
         sends[frame] = (start, ends.get(frame), npackets.get(frame, 0))
@@ -60,12 +68,13 @@ def parse_send_log(path: Path):
     for m in re_capture.finditer(text):
         ts, frame = m.group(1), int(m.group(2))
         capture_times[frame] = parse_ts(ts)
-    return sends, capture_times, pacer_ends
+    return sends, capture_times, pacer_ends, packet_sends
 
 
 def parse_recv_log(path: Path):
     re_pkt = re.compile(
-        r"\[" + _TS + r"\].*\[ReceivedFrameDataHandler\] Received packet (\d+) for frame (\d+)"
+        r"\[" + _TS + r"\].*\[ReceivedFrameDataHandler\] Received packet "
+        r"(\d+) for frame (\d+)([^\n]*)"
     )
     re_dec = re.compile(
         r"\[" + _TS + r"\].*\[ReceivedFrameDataHandler\] Successfully decoded frame (\d+)"
@@ -75,7 +84,15 @@ def parse_recv_log(path: Path):
     decode_frame = {}
     for m in re_pkt.finditer(text):
         ts, pkt, frame = m.group(1), int(m.group(2)), int(m.group(3))
-        recv_packets[(frame, pkt)] = parse_ts(ts)
+        # New logs expose the kernel socket timestamp in CLOCK_REALTIME us.
+        # Fall back to the log prefix for compatibility with older trials.
+        arrival_match = re.search(r"socket_arrival_us=(\d+)", m.group(4))
+        socket_arrival_us = arrival_match.group(1) if arrival_match else None
+        recv_packets[(frame, pkt)] = (
+            int(socket_arrival_us) / 1_000_000.0
+            if socket_arrival_us
+            else parse_ts(ts)
+        )
     for m in re_dec.finditer(text):
         ts, frame = m.group(1), int(m.group(2))
         decode_frame[frame] = parse_ts(ts)
@@ -93,7 +110,7 @@ def main():
         print(f"Missing {send_log} or {recv_log}", file=sys.stderr)
         sys.exit(1)
 
-    sends, capture_times, pacer_ends = parse_send_log(send_log)
+    sends, capture_times, pacer_ends, packet_sends = parse_send_log(send_log)
     recv_packets, decode_frame = parse_recv_log(recv_log)
 
     packet_latencies = []
@@ -130,7 +147,10 @@ def main():
             recv_ts = recv_packets.get((frame, p))
             if recv_ts is None:
                 continue
-            if num_packets <= 1:
+            exact_send_ts = packet_sends.get((frame, p))
+            if exact_send_ts is not None:
+                send_ts = exact_send_ts
+            elif num_packets <= 1:
                 send_ts = start_ts
             else:
                 send_ts = start_ts + (end_ts - start_ts) * p / (num_packets - 1)
@@ -178,28 +198,38 @@ def main():
         data = np.array(data)
         data.sort()
         data_len = len(data)
-        print(f"Data length: {data_len} tail_length: {int(data_len * (1 - ratio))}")
         tail_data = data[int(data_len * ratio):data_len]
-        print(f"tail_data_length: {len(tail_data)}")
-        if len(tail_data) < 20:
-          print(f"Tail data for ratio {ratio}: {tail_data}")
         return float(np.mean(tail_data))
 
-    # Terminal: average, max, tail 99 (mean of top 1%), tail 99.9 (mean of top 0.1%)
+    def nearest_rank(data, ratio):
+        """Nearest-rank percentile, matching collect_x264_trial_metrics.py."""
+        if not data:
+            return 0.0
+        ordered = sorted(data)
+        index = int(np.ceil(ratio * len(ordered))) - 1
+        return float(ordered[min(max(index, 0), len(ordered) - 1)])
+
+    # Keep percentiles and conditional tail means explicitly distinct. The old
+    # "tail99" label was easy to misread as p99 even though it meant the mean
+    # of the worst 1%.
     if packet_latencies:
         pkt_lats = [x[2] for x in packet_latencies]
         n = len(pkt_lats)
         avg_pkt = sum(pkt_lats) / n
         print(f"Packet latencies:")
         print(f"Packet latency (ms): avg={avg_pkt:.2f} max={max(pkt_lats):.2f} "
-              f"tail99={tail_mean(pkt_lats, 0.99):.2f} tail99.9={tail_mean(pkt_lats, 0.999):.2f} (n={n})")
+              f"p95={nearest_rank(pkt_lats, 0.95):.2f} p99={nearest_rank(pkt_lats, 0.99):.2f} "
+              f"top1pct_mean={tail_mean(pkt_lats, 0.99):.2f} "
+              f"top0.1pct_mean={tail_mean(pkt_lats, 0.999):.2f} (n={n})")
     if frame_latencies:
         frm_lats = [x[1] for x in frame_latencies]
         n = len(frm_lats)
         avg_frm = sum(frm_lats) / n
         print(f"Frame latencies:")
         print(f"Frame latency (ms):   avg={avg_frm:.2f} max={max(frm_lats):.2f} "
-              f"tail99={tail_mean(frm_lats, 0.99):.2f} tail99.9={tail_mean(frm_lats, 0.999):.2f} (n={n})")
+              f"p95={nearest_rank(frm_lats, 0.95):.2f} p99={nearest_rank(frm_lats, 0.99):.2f} "
+              f"top1pct_mean={tail_mean(frm_lats, 0.99):.2f} "
+              f"top0.1pct_mean={tail_mean(frm_lats, 0.999):.2f} (n={n})")
         print(f"Frame stalls:         >100ms={stall_100} >200ms={stall_200}")
     if overall_latencies:
         ov_lats = [x[1] for x in overall_latencies]
@@ -207,21 +237,27 @@ def main():
         avg_ov = sum(ov_lats) / n
         print(f"Overall latencies:")
         print(f"Overall latency (ms):  avg={avg_ov:.2f} max={max(ov_lats):.2f} "
-              f"tail99={tail_mean(ov_lats, 0.99):.2f} tail99.9={tail_mean(ov_lats, 0.999):.2f} (n={n})")
+              f"p95={nearest_rank(ov_lats, 0.95):.2f} p99={nearest_rank(ov_lats, 0.99):.2f} "
+              f"top1pct_mean={tail_mean(ov_lats, 0.99):.2f} "
+              f"top0.1pct_mean={tail_mean(ov_lats, 0.999):.2f} (n={n})")
     if pacer_queue_delays:
         pq_lats = [x[1] for x in pacer_queue_delays]
         n = len(pq_lats)
         avg_pq = sum(pq_lats) / n
         print(f"Pacer queue delays:")
         print(f"Pacer queue delay (ms): avg={avg_pq:.2f} max={max(pq_lats):.2f} "
-              f"tail99={tail_mean(pq_lats, 0.99):.2f} tail99.9={tail_mean(pq_lats, 0.999):.2f} (n={n})")
+              f"p95={nearest_rank(pq_lats, 0.95):.2f} p99={nearest_rank(pq_lats, 0.99):.2f} "
+              f"top1pct_mean={tail_mean(pq_lats, 0.99):.2f} "
+              f"top0.1pct_mean={tail_mean(pq_lats, 0.999):.2f} (n={n})")
     if pacer_frame_latencies:
         pfl_lats = [x[1] for x in pacer_frame_latencies]
         n = len(pfl_lats)
         avg_pfl = sum(pfl_lats) / n
         print(f"Pacer frame latencies:")
         print(f"Pacer frame latency (ms): avg={avg_pfl:.2f} max={max(pfl_lats):.2f} "
-              f"tail99={tail_mean(pfl_lats, 0.99):.2f} tail99.9={tail_mean(pfl_lats, 0.999):.2f} (n={n})")
+              f"p95={nearest_rank(pfl_lats, 0.95):.2f} p99={nearest_rank(pfl_lats, 0.99):.2f} "
+              f"top1pct_mean={tail_mean(pfl_lats, 0.99):.2f} "
+              f"top0.1pct_mean={tail_mean(pfl_lats, 0.999):.2f} (n={n})")
     print(f"Wrote {frame_csv}, {packet_csv}, {overall_csv}, {pacer_queue_csv}, {pacer_frame_csv}")
 
 

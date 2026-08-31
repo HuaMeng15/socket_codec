@@ -26,6 +26,15 @@ void InitializeFlags() {
                        "optional sender-side encoded bitstream dump; empty disables");
   parser.AddStringFlag("codec", "mock",
                        "codec type: 'vvenc', 'x264', 'x264_slice', or 'mock'");
+  parser.AddStringFlag(
+      "experiment_mode", "auto",
+      "experiment policy: auto, default, x264_slice, salsify, cbr, or "
+      "webrtc_no_mae (alias: webrtc_disable_mae); explicit modes select the "
+      "matching x264 encoder path and override --codec");
+  parser.AddIntFlag(
+      "periodic_alr_probing", -1,
+      "periodic ALR probe policy: -1=experiment default, 0=disabled, "
+      "1=enabled; startup probing is unaffected");
 
   // Network simulator flags (sender-side, 0 = disabled)
   parser.AddIntFlag("sim_bandwidth_kbps", 0,
@@ -89,7 +98,7 @@ void InitializeFlags() {
   // time bound keeps feedback fast at low bitrates, where the packet-count
   // trigger alone would lag ~one window of arrivals (20 pkts @ 1 Mbps ≈ 192ms),
   // starving the sender's congestion controller. <=0 disables the time trigger.
-  parser.AddIntFlag("feedback_max_interval_ms", 25,
+  parser.AddIntFlag("feedback_max_interval_ms", 10,
                     "max time (ms) a packet waits before its feedback batch is "
                     "sent; bounds feedback latency at low bitrate; <=0 disables");
 

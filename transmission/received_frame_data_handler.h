@@ -24,6 +24,9 @@ class ReceivedFrameDataHandler : public MessageHandler {
 
   int HandlePacketMessage(const uint8_t* packet_data,
                           size_t packet_size) override;
+  int HandlePacketMessageWithTimestamp(const uint8_t* packet_data,
+                                       size_t packet_size,
+                                       int64_t arrival_time_us) override;
 
   // Initialize the handler (creates and initializes decoder)
   int Initialize();
@@ -41,10 +44,11 @@ class ReceivedFrameDataHandler : public MessageHandler {
     bool complete;                              // Frame is complete
   };
 
-  void ProcessPacket(const uint8_t* packet_data, size_t packet_size);
+  void ProcessPacket(const uint8_t* packet_data, size_t packet_size,
+                     int64_t arrival_time_us);
 
   void SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
-                    uint16_t recv_size);
+                    uint16_t recv_size, int64_t arrival_time_us);
 
   void ReportFrameLoss(uint16_t frame_sequence, const FrameAssembly& assembly);
 
@@ -78,4 +82,3 @@ class ReceivedFrameDataHandler : public MessageHandler {
 };
 
 #endif  // TRANSMISSION_RECEIVED_FRAME_DATA_HANDLER_H
-

@@ -38,7 +38,8 @@ class DataReceiver {
 
  private:
   // Receive a single packet
-  int ReceivePacket(uint8_t* buffer, size_t buffer_size, ssize_t& bytes_received);
+  int ReceivePacket(uint8_t* buffer, size_t buffer_size, ssize_t& bytes_received,
+                    int64_t& arrival_time_us);
 
   int socket_fd_;
   int listen_port_;
@@ -54,4 +55,3 @@ class DataReceiver {
 };
 
 #endif  // TRANSMISSION_DATA_RECEIVER_H
-

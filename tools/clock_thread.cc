@@ -55,12 +55,14 @@ int ClockThread::WaitForNextFrameTick() {
 
   std::unique_lock<std::mutex> lock(mutex_);
   int next_frame = frame_index_.load() + 1;
-  auto target_time = epoch_;
-  if (next_frame > 0) {
-    const auto base_time =
-        has_frame_read_done_ ? last_frame_read_done_time_ : last_tick_time_;
-    target_time = base_time + std::chrono::microseconds(frame_interval_us_);
-  }
+  // Keep capture on the configured media timeline. Scheduling the next tick
+  // relative to read completion accumulates a few milliseconds of I/O and
+  // encode overhead on every frame; over an 8000-frame real-trace run that
+  // stretched 266.7 seconds of video to 286-358 seconds and caused Mahimahi to
+  // replay the beginning of a 270-second trace.
+  auto target_time = epoch_ +
+      std::chrono::microseconds(
+          static_cast<int64_t>(next_frame) * frame_interval_us_);
 
   tick_cv_.wait_until(lock, target_time, [this]() {
     return !running_.load();
@@ -89,9 +91,6 @@ void ClockThread::MarkFrameReadComplete() {
 int64_t ClockThread::GetSliceDeadline(int frame_index, int slice_index) const {
   std::lock_guard<std::mutex> lock(mutex_);
   int64_t frame_start = static_cast<int64_t>(frame_index) * frame_interval_us_;
-  if (read_done_frame_index_ == frame_index) {
-    frame_start = read_done_us_;
-  }
   int64_t slice_deadline = frame_start +
       (static_cast<int64_t>(slice_index) + 1) * (frame_interval_us_ / slice_count_);
   return slice_deadline;

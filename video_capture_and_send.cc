@@ -25,7 +25,8 @@ int VideoCaptureAndSend::Initialize(const std::string& input_file,
                                      int height,
                                      int fps,
                                      int frames_to_encode,
-                                     CodecType codec_type) {
+                                     CodecType codec_type,
+                                     EncoderRateControlMode rate_control_mode) {
   if (initialized_) {
     LOG(WARNING) << "[VideoCaptureAndSend] Already initialized";
     return 0;
@@ -52,6 +53,7 @@ int VideoCaptureAndSend::Initialize(const std::string& input_file,
   }
 
   encoder_ = CodecFactory::CreateEncoder(codec_type);
+  encoder_->SetRateControlMode(rate_control_mode);
   if (0 != encoder_->Initialize(width, height, fps, frames_to_encode)) {
     LOG(ERROR) << "[VideoCaptureAndSend] Failed to initialize encoder";
     return -1;

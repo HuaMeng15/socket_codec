@@ -30,7 +30,8 @@ class VideoCaptureAndSend {
                   int height,
                   int fps,
                   int frames_to_encode,
-                  CodecType codec_type);
+                  CodecType codec_type,
+                  EncoderRateControlMode rate_control_mode);
 
   // Run the capture and send loop (single thread)
   void Run();
@@ -75,4 +76,3 @@ class VideoCaptureAndSend {
 };
 
 #endif  // VIDEO_CAPTURE_AND_SEND_H
-

@@ -42,9 +42,15 @@ class Pacer {
   // NOT called for padding. Both are invoked from the pacer thread.
   using SendFn = std::function<void(const uint8_t* data, size_t size)>;
   using RecordFn = std::function<void(uint16_t frame_sequence, uint8_t packet_index)>;
+  using PacketSentFn = std::function<void(uint16_t frame_sequence,
+                                          uint8_t packet_index,
+                                          size_t wire_bytes)>;
 
   void SetSendCallback(SendFn fn) { send_fn_ = std::move(fn); }
   void SetRecordCallback(RecordFn fn) { record_fn_ = std::move(fn); }
+  void SetPacketSentCallback(PacketSentFn fn) {
+    packet_sent_fn_ = std::move(fn);
+  }
 
   /** Pace at this multiple of target (bursts) outside probes. Default 2.5. */
   void SetPaceMultiplier(double m);
@@ -99,6 +105,7 @@ class Pacer {
 
   SendFn send_fn_;
   RecordFn record_fn_;
+  PacketSentFn packet_sent_fn_;
 
   std::mutex mutex_;
   std::condition_variable cv_;

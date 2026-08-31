@@ -13,9 +13,8 @@
  * Provides:
  * - Monotonic microsecond timestamps (GetCurrentTimeUs)
  * - Frame-tick mechanism: blocks caller until the next frame boundary.
- *   After MarkFrameReadComplete(), the next boundary is scheduled relative to
- *   the successful frame-read completion, so a late frame does not trigger a
- *   burst of immediate catch-up reads.
+ *   Boundaries remain anchored to the clock epoch, so file-read and encoding
+ *   overhead do not silently lower the configured frame rate.
  * - Slice-deadline calculation: given N slices per frame, returns the
  *   timestamp by which slice K should be complete
  *
@@ -54,9 +53,8 @@ class ClockThread {
   int WaitForNextFrameTick();
 
   /**
-   * Record that the current frame's raw input read has completed. This anchors
-   * the next frame tick and sliced-frame deadlines to real producer progress
-   * instead of the original clock epoch.
+   * Record that the current frame's raw input read has completed. Kept as a
+   * pipeline progress marker; frame and slice scheduling remain epoch-based.
    */
   void MarkFrameReadComplete();
 
@@ -65,9 +63,7 @@ class ClockThread {
    * should be encoded and sent. Spreads slices evenly across the frame interval.
    *
    * For frame N with S slices, slice K's deadline is:
-   *   frame_read_done + (K+1) * (frame_interval / S)
-   * If frame N has not reported read completion, falls back to the legacy
-   * epoch-based frame_start for compatibility.
+   *   N * frame_interval + (K+1) * (frame_interval / S)
    */
   int64_t GetSliceDeadline(int frame_index, int slice_index) const;
 

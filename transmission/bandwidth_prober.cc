@@ -23,8 +23,9 @@ BandwidthProber::BandwidthProber()
       startup_stage_(true),
       last_startup_probe_ms_(0),
       current_probe_type_(ProbeType::kSeed),
-      chain_hops_(0),
       application_limited_(false),
+      periodic_probing_allowed_(true),
+      application_limited_since_ms_(-1),
       last_alr_probe_ms_(0),
       probe_target_kbps_(0),
       next_cluster_id_(0),
@@ -105,16 +106,10 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
     LOG(INFO) << "[Prober] Probe succeeded: target=" << probe_target_kbps_
               << " estimated=" << estimated_kbps << " kbps";
 
-    // Chaining rule (aligned with the WebRTC reference curve):
-    //   - Seed probes (3x/6x startup cluster) do NOT chain. They commit their
-    //     measured rate and hand control to AIMD, which is why the reference
-    //     jumps once to ~4 Mbps at startup and then climbs slowly — rather than
-    //     chaining straight to the ceiling and flooding the link.
-    //   - Periodic (ALR) probes MAY chain, but only up to kMaxChainHops hops,
-    //     AND each hop is capped at 1.5× the just-measured rate (CapProbeTarget).
-    //     Bounding both the hop count and the per-hop multiple stops a single
-    //     probe session from running to ~2× the link capacity — the runaway
-    //     that flooded the pipe and caused the overuse→"drop"→re-probe cycle.
+    // Seed, startup, and periodic probes all commit at most one measured step.
+    // In particular, a periodic ALR probe must not immediately chain: trial 5
+    // showed that three individually plausible 1.5x hops can compound from
+    // 3.9 Mbps to 13 Mbps in under 100 ms, just before a capacity cliff.
     double ratio = static_cast<double>(estimated_kbps) / probe_target_kbps_;
 
     // Startup accelerator: a strong result keeps the stage going (the settle
@@ -131,23 +126,10 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
       return;
     }
 
-    // Only ALR (periodic) probes chain within OnProbeResult.
-    bool chainable = (current_probe_type_ == ProbeType::kPeriodic);
-    if (chainable && chain_hops_ < kMaxChainHops &&
-        ratio >= kFurtherProbeThreshold &&
-        estimated_kbps < max_bitrate_kbps_ * 0.95) {
-      chain_hops_++;
-      // Cap against the freshly measured rate (estimated_bitrate_kbps_ hasn't
-      // been updated with this probe's result yet), so the next hop explores at
-      // most 1.5× what the link just demonstrated it can carry.
-      probe_target_kbps_ =
-          std::min(static_cast<int>(estimated_kbps * kMaxProbeIncreaseLimit),
-                   max_bitrate_kbps_);
-      state_ = State::kProbing;
-      probe_start_ms_ = NowMs();
-      pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
-      LOG(INFO) << "[Prober] Further probe (" << chain_hops_ << "/"
-                << kMaxChainHops << ") at " << probe_target_kbps_ << " kbps";
+    if (current_probe_type_ == ProbeType::kPeriodic) {
+      LOG(INFO) << "[Prober] Periodic probe completed at one-step target="
+                << probe_target_kbps_ << " kbps measured=" << estimated_kbps
+                << " kbps";
     }
   } else {
     LOG(INFO) << "[Prober] Probe failed or no improvement: target="
@@ -173,6 +155,8 @@ void BandwidthProber::OnOveruseDetected() {
   // Latency rising ends the startup stage — we've found the ceiling; let normal
   // AIMD take over from here.
   startup_stage_ = false;
+  application_limited_ = false;
+  application_limited_since_ms_ = -1;
 
   if (state_ != State::kIdle) {
     LOG(INFO) << "[Prober] Overuse during probe, cancelling";
@@ -186,9 +170,23 @@ void BandwidthProber::OnUnderuseDetected() {
   // Kept so GccController's existing call site needs no change.
 }
 
-void BandwidthProber::OnApplicationLimited() {
+void BandwidthProber::SetApplicationLimited(bool limited) {
   std::lock_guard<std::mutex> lock(mutex_);
-  application_limited_ = true;
+  if (application_limited_ == limited) return;
+  application_limited_ = limited;
+  application_limited_since_ms_ = limited ? NowMs() : -1;
+}
+
+void BandwidthProber::SetPeriodicProbingAllowed(bool allowed) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  periodic_probing_allowed_ = allowed;
+  if (!allowed && current_probe_type_ == ProbeType::kPeriodic &&
+      state_ != State::kIdle) {
+    LOG(INFO) << "[Prober] Network state became unhealthy during periodic "
+                 "probe, cancelling";
+    state_ = State::kIdle;
+    pending_probes_.clear();
+  }
 }
 
 BandwidthProber::State BandwidthProber::GetState() const {
@@ -246,8 +244,10 @@ void BandwidthProber::MaybeInitiateProbe() {
   //    The application_limited_ flag is driven by the real AlrDetector
   //    (bytes-sent vs. target), so a greedy encoder never trips it — exactly
   //    like WebRTC.
-  if (application_limited_) {
-    if (now - last_alr_probe_ms_ >= kAlrProbeIntervalMs) {
+  if (periodic_probing_allowed_ && application_limited_ &&
+      application_limited_since_ms_ >= 0) {
+    if (now - application_limited_since_ms_ >= kAlrQualificationMs &&
+        now - last_alr_probe_ms_ >= kAlrProbeIntervalMs) {
       InitiateAlrProbe();
       return;
     }
@@ -281,7 +281,6 @@ void BandwidthProber::InitiateExponentialProbe() {
   }
 
   current_probe_type_ = ProbeType::kSeed;
-  chain_hops_ = 0;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
@@ -308,7 +307,6 @@ void BandwidthProber::InitiateStartupProbe() {
   }
 
   current_probe_type_ = ProbeType::kStartup;
-  chain_hops_ = 0;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   last_startup_probe_ms_ = probe_start_ms_;
@@ -328,24 +326,24 @@ void BandwidthProber::InitiateAlrProbe() {
   }
 
   current_probe_type_ = ProbeType::kPeriodic;
-  chain_hops_ = 0;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
   last_alr_probe_ms_ = probe_start_ms_;
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
-  application_limited_ = false;
 
   LOG(INFO) << "[Prober] ALR probe at " << probe_target_kbps_
             << " kbps (est=" << estimated_bitrate_kbps_ << ")";
 }
 
 int BandwidthProber::CapProbeTarget(int target_kbps) const {
-  // WebRTC AimdRateControl caps every increase at 1.5×throughput. We apply the
-  // same bound to probe targets: a probe explores at most 50% above the current
-  // estimate, so it can't overshoot to ~2× capacity and flood the bottleneck.
+  // Periodic discovery is intentionally gentler than startup: explore at most
+  // 25% above the current measured line, then wait for another qualified ALR
+  // interval before exploring again. The target remains fully measurement-
+  // driven; there is no fixed bitrate or trace-specific ceiling.
   if (estimated_bitrate_kbps_ <= 0) {
     return target_kbps;
   }
-  int cap = static_cast<int>(estimated_bitrate_kbps_ * kMaxProbeIncreaseLimit);
+  int cap = static_cast<int>(estimated_bitrate_kbps_ *
+                             kMaxPeriodicProbeIncreaseLimit);
   return std::min(target_kbps, cap);
 }

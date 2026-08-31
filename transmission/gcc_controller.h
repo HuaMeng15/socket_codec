@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,8 +19,9 @@
  * GccController: Google Congestion Control aligned with WebRTC implementation.
  *
  * Delay-based component (references: trendline_estimator.cc, delay_based_bwe.cc):
- *   - Per-packet inter-arrival delta (recv_delta - send_delta), accumulated
- *     and EWMA-smoothed (coeff 0.9)
+ *   - Packets are first aggregated into 5ms send-time groups, then group
+ *     inter-arrival delta (recv_delta - send_delta) is accumulated and
+ *     EWMA-smoothed (coeff 0.9). Grouping avoids packet-size/pacing noise.
  *   - Trendline estimator: least-squares slope over a duration-based window
  *     (<= kTrendlineWindowMs of arrival span), refit when the window is trimmed
  *   - Overuse detection: modified_trend = min(num_deltas, 60) * slope * gain(4)
@@ -59,6 +61,9 @@ class GccController : public CongestionController {
    */
   void SetCongestionWindowConfig(int queue_size_ms, int min_bitrate_kbps);
 
+  /** Enable or disable periodic ALR discovery probes (startup probes remain). */
+  void SetPeriodicAlrProbingEnabled(bool enabled);
+
   /**
    * True while the bandwidth prober is actively probing (send rate elevated
    * above the estimate to test for headroom). The pacer uses this to fill idle
@@ -84,6 +89,14 @@ class GccController : public CongestionController {
   void OnBytesSent(size_t bytes_sent);
 
   /**
+   * Record a packet at the instant it is put on the wire. Congestion-window
+   * accounting is packet based so an ACK or loss report can retire the exact
+   * bytes instead of relying on cumulative sent-minus-received totals.
+   */
+  void OnPacketSent(uint16_t frame_sequence, uint8_t packet_index,
+                    size_t wire_bytes);
+
+  /**
    * Inject a fake clock for deterministic testing. When set, all internal
    * time reads use this value instead of steady_clock. Advance it manually.
    * Pass nullptr to revert to real clock.
@@ -101,6 +114,7 @@ class GccController : public CongestionController {
   // Read the current acknowledged-throughput estimate (the sliding-window
   // measured received rate). Test-only.
   double GetAckedBitrateKbpsForTesting() const;
+  int64_t GetOutstandingBytesForTesting() const;
   // Re-enable the real sliding-window acked estimator after a prior
   // SetAckedBitrateForTesting froze it. Resets the window. Test-only.
   void EnableAckedEstimatorForTesting();
@@ -122,10 +136,27 @@ class GccController : public CongestionController {
     double smoothed_delay;    // EWMA-smoothed accumulated delay (ms)
   };
 
-  // Process all packets in a feedback batch; returns the latest bandwidth-usage
-  // hypothesis (matches WebRTC, which calls Detect per packet).
+  struct PacketGroup {
+    bool valid = false;
+    double first_send_ms = 0.0;
+    double last_send_ms = 0.0;
+    double first_arrival_ms = 0.0;
+    double last_arrival_ms = 0.0;
+    int64_t bytes = 0;
+    int packets = 0;
+    uint16_t last_frame_sequence = 0;
+    uint8_t last_packet_index = 0;
+  };
+
+  // Process all packets in a feedback batch and return the strongest hypothesis
+  // observed. Because this controller updates its rate once per feedback batch,
+  // an early overuse sample must not be overwritten by a later normal sample.
   enum class BandwidthUsage { kUnderuse, kNormal, kOveruse };
   BandwidthUsage UpdateTrendline(const TransportFeedback& feedback);
+  BandwidthUsage ApplyByteDeliverySignal(BandwidthUsage delay_usage,
+                                         int64_t now_ms);
+  bool ShouldIgnoreSourceLimitedOveruse(int64_t now_ms) const;
+  void ResetTrendlineAfterDiscontinuity();
   double ComputeTrendlineSlope() const;
 
   // --- Overuse detector ---
@@ -163,8 +194,9 @@ class GccController : public CongestionController {
   double accumulated_delay_;
   double smoothed_delay_;
   int64_t first_arrival_ms_;
-  double prev_send_ms_d_;       // previous packet send time (ms)
-  double prev_arrival_ms_d_;    // previous packet arrival time (ms)
+  bool first_arrival_set_;
+  PacketGroup current_group_;
+  PacketGroup previous_group_;
   int num_deltas_;
 
   // WebRTC trendline constants (trendline_estimator.cc)
@@ -172,7 +204,13 @@ class GccController : public CongestionController {
   static constexpr double kThresholdGain = 4.0;
   static constexpr int kMinNumDeltas = 60;       // modified_trend scale cap
   static constexpr int kDeltaCounterMax = 1000;  // num_deltas saturation
-  static constexpr double kTrendlineWindowMs = 100.0;  // duration-based window
+  // A 50ms horizon starts fitting within roughly two feedback intervals while
+  // still spanning enough 5ms send-time groups to reject isolated jitter. The
+  // previous 100ms horizon imposed a hard ~90-100ms capacity-drop discovery
+  // delay before the first meaningful slope could be calculated.
+  static constexpr double kTrendlineWindowMs = 50.0;  // duration-based window
+  static constexpr double kSendTimeGroupMs = 5.0;
+  static constexpr double kTrendlineDiscontinuityMs = 1000.0;
   static constexpr double kMaxAdaptOffsetMs = 15.0;    // threshold spike guard
 
   // Adaptive threshold state
@@ -234,12 +272,54 @@ class GccController : public CongestionController {
   static constexpr int64_t kAckedWindowUs = 100000;  // 100ms sliding window
   static constexpr int kAckedMinSamples = 2;          // need ≥2 for a span
 
+  // Secondary, byte-aware congestion signal. Delay trendlines correctly
+  // measure queue growth, while this compares actual wire bytes sent against
+  // actual bytes delivered. A smaller packet taking the same time lowers the
+  // delivered bitrate and is therefore visible here. It must be sustained and
+  // the sender must be filling its target, which avoids false positives for an
+  // application-limited encoder.
+  struct SentSample {
+    int64_t time_ms;
+    int64_t bytes;
+  };
+  std::deque<SentSample> sent_rate_window_;
+  int64_t sent_rate_window_bytes_ = 0;
+  double sent_rate_kbps_ = 0.0;
+  int64_t low_delivery_start_ms_ = -1;
+  bool byte_delivery_overuse_ = false;
+  bool severe_capacity_cliff_active_ = false;
+  static constexpr int64_t kSentRateWindowMs = 200;
+  static constexpr int64_t kByteEstimatorMinSpanMs = 50;
+  static constexpr int64_t kByteSignalMinSpanMs = 100;
+  static constexpr double kByteDeliveryRatioThreshold = 0.85;
+  // A 10->1 Mbps-style cliff should not wait for the ordinary 100ms byte
+  // confirmation or a second trendline group. Require three independent
+  // signals before taking the fast path: delivery collapses below half the
+  // offered rate, the delay trend is already over threshold, and accumulated
+  // queue growth is substantial. A latch prevents a persistent cliff from
+  // applying one multiplicative decrease per feedback packet.
+  static constexpr double kSevereDeliveryRatioThreshold = 0.50;
+  static constexpr double kSevereQueueGrowthMs = 20.0;
+  static constexpr double kSenderUtilizationThreshold = 0.80;
+  // A source-limited timing event is considered healthy only while its
+  // outstanding bytes represent at most this much media time at the actual
+  // send rate. This adapts to bitrate and remains independent of the separate
+  // congestion-window queue allowance.
+  static constexpr double kSourceLimitedOutstandingTimeMs = 50.0;
+
   // When overuse is detected we switch the AIMD decrease/increase-cap to use
   // the INSTANTANEOUS per-batch received rate instead of the windowed acked
   // rate — the instant rate reflects the collapsed capacity immediately (the
   // window still averages in pre-drop throughput). We hold this mode until the
   // queue drains enough to register underuse, then switch back to the window.
   bool use_instant_acked_ = false;
+  // True only when the recent cross-batch arrival history contains enough span
+  // to form a meaningful fast byte-rate estimate. A strict receiver feedback
+  // timer can legitimately produce one-packet batches at low bandwidth, so
+  // this estimate must be continuous across feedback message boundaries.
+  bool instant_acked_sample_valid_ = false;
+  static constexpr int64_t kInstantAckedWindowUs = 50000;
+  static constexpr int64_t kMinInstantAckedSpanUs = 5000;
 
   // Loss-based rate control (WebRTC send_side_bandwidth_estimation)
   int loss_based_bitrate_kbps_;
@@ -272,6 +352,7 @@ class GccController : public CongestionController {
   // Bandwidth probing
   BandwidthProber prober_;
   AlrDetector alr_detector_;
+  bool periodic_alr_probing_enabled_;
   // Probe resolution bookkeeping (GCC side), following WebRTC's
   // ProbeBitrateEstimator: accumulate the probe traffic's received bytes and
   // arrival span across feedback batches starting when the probe begins, and
@@ -283,6 +364,10 @@ class GccController : public CongestionController {
   // makes the measured probe rate robust to that bunching.
   bool probe_active_;
   int probe_floor_kbps_;
+  // Feedback can contain packets sent before the controller activated the
+  // elevated probe rate. Exclude that codec-shaped traffic from the probe
+  // throughput sample; only later send timestamps represent the probe.
+  int64_t probe_measurement_send_cutoff_us_;
   // Accumulated probe-traffic measurement since the probe started.
   int64_t probe_first_arrival_us_;   // arrival of the first probe-window packet
   int64_t probe_last_arrival_us_;    // arrival of the most recent packet
@@ -294,7 +379,10 @@ class GccController : public CongestionController {
   // WebRTC kTargetUtilizationFraction: when the link is saturated by the probe,
   // commit slightly below the measured receive rate to avoid immediate overuse.
   static constexpr double kProbeUtilizationFraction = 0.95;
-  static constexpr double kProbeAbortDelayMs = 80.0;  // abort if queue grows past this
+  // Delay/cwnd health threshold for optional periodic probing. Startup does
+  // not terminate on this timing-only signal: its measured probe result and
+  // byte/loss confirmation are codec-independent saturation evidence.
+  static constexpr double kProbeAbortDelayMs = 20.0;
   // Minimum accumulated arrival span before a probe may commit. Below this, the
   // measurement is dominated by bunching noise, not real throughput.
   static constexpr int64_t kProbeMinSpanUs = 30000;  // 30 ms
@@ -304,14 +392,34 @@ class GccController : public CongestionController {
   // feedback-max RTT, and applies the pushback ratchet to the final target.
   // Disabled when cwnd_queue_size_ms_ <= 0 (mirrors an unset field trial).
   void UpdateCongestionWindowSize();
+  void RetireFeedbackPackets(const TransportFeedback& feedback);
+  void RetireLostPackets(const LossReport& report);
+  void ExpireStaleInflightPackets(int64_t now_ms);
+  bool RetireInflightPacket(uint16_t frame_sequence, uint8_t packet_index);
   // nullptr when pushback is disabled (mirrors WebRTC's optional controller).
   std::unique_ptr<CongestionWindowPushbackController> pushback_;
   int cwnd_queue_size_ms_ = 350;      // field-trial QueueSize (additional time)
   int cwnd_min_bitrate_kbps_ = 30;    // field-trial MinBitrate
   int64_t current_data_window_bytes_ = -1;  // <0 = unset (EWMA seed)
-  // Outstanding (in-flight) bytes = cumulative sent - cumulative acked.
-  int64_t total_sent_bytes_ = 0;
-  int64_t total_acked_bytes_ = 0;
+  // Exact packet-level in-flight accounting. Media loss reports retire packets
+  // explicitly. Probe padding has no frame-loss report, so inactive entries
+  // also have an RTT-scaled liveness timeout. The timeout is deliberately much
+  // larger than a normal feedback RTT and is evaluated using the latest RTT:
+  // a real standing queue remains represented, while orphaned bytes cannot
+  // pin pushback at its minimum forever after the queue has drained.
+  struct InflightPacket {
+    uint64_t id;
+    uint32_t key;
+    int64_t sent_time_ms;
+    int64_t bytes;
+  };
+  std::deque<InflightPacket> inflight_history_;
+  std::unordered_map<uint32_t, std::deque<uint64_t>> inflight_ids_by_key_;
+  std::unordered_map<uint64_t, int64_t> active_inflight_bytes_;
+  uint64_t next_inflight_id_ = 1;
+  int64_t outstanding_bytes_ = 0;
+  static constexpr int64_t kMinInflightTimeoutMs = 2000;
+  static constexpr int64_t kInflightTimeoutRttMultiplier = 4;
   // Feedback-max-RTT window (ms). Each batch contributes its max sample; the
   // congestion window uses the MIN across the window (WebRTC semantics).
   std::deque<std::pair<int64_t, int64_t>> feedback_max_rtts_;  // (time_ms, rtt_ms)

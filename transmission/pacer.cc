@@ -93,6 +93,9 @@ void Pacer::SendPadding(size_t payload_bytes) {
   h->total_packets = 0;  // padding sentinel: not a real assemblable frame
   h->payload_size = htons(static_cast<uint16_t>(payload_bytes));
   if (send_fn_) send_fn_(pkt.data(), pkt.size());
+  if (packet_sent_fn_) {
+    packet_sent_fn_(kPaddingFrameSequence, h->packet_index, pkt.size());
+  }
 }
 
 bool Pacer::NoteFramePacketSent(uint16_t frame_sequence,
@@ -168,7 +171,21 @@ void Pacer::Run() {
         }
         lock.unlock();
         if (record_fn_) record_fn_(p.frame_sequence, p.packet_index);
+        // Record the wall-clock timestamp immediately before the UDP send.
+        // The receiver logs the kernel SO_TIMESTAMPNS arrival in the same
+        // CLOCK_REALTIME domain, allowing offline latency analysis to use the
+        // real per-packet send time instead of interpolating across a frame.
+        const int64_t send_time_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
         if (send_fn_) send_fn_(p.data.data(), p.data.size());
+        if (packet_sent_fn_) {
+          packet_sent_fn_(p.frame_sequence, p.packet_index, p.data.size());
+        }
+        LOG(VERBOSE) << "[Pacer] Sent packet "
+                     << static_cast<int>(p.packet_index) << " for frame "
+                     << p.frame_sequence << " send_time_us=" << send_time_us;
         lock.lock();
         int sent_packets = 0;
         int expected_packets = 0;

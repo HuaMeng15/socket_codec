@@ -11,3 +11,4 @@ third_party/
 .venv/
 x264_experiments/
 scripts/__pycache__/
+scripts/

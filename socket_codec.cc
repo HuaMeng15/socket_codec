@@ -1,7 +1,9 @@
 #include <unistd.h>
+#include <algorithm>
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <sstream>
 #include <vector>
 
@@ -33,6 +35,64 @@ static std::vector<std::pair<int64_t, int>> ParseBandwidthSchedule(
   return steps;
 }
 
+struct ExperimentConfig {
+  std::string name;
+  CodecType codec_type;
+  EncoderRateControlMode encoder_rate_control;
+  bool periodic_alr_probing;
+};
+
+static bool ResolveExperimentConfig(const std::string& requested_mode,
+                                    const std::string& codec_name,
+                                    ExperimentConfig* config) {
+  if (!config) return false;
+  std::string mode = requested_mode;
+  std::transform(mode.begin(), mode.end(), mode.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  std::replace(mode.begin(), mode.end(), '-', '_');
+
+  if (mode.empty() || mode == "auto") {
+    config->codec_type = CodecFactory::ParseCodecType(codec_name);
+    config->name = config->codec_type == CodecType::X264_SLICE
+                       ? "x264_slice"
+                       : "auto";
+    config->encoder_rate_control = EncoderRateControlMode::kWebRtcMae;
+    config->periodic_alr_probing = true;
+    return true;
+  }
+
+  config->name = mode;
+  config->codec_type = CodecType::X264;
+  config->encoder_rate_control = EncoderRateControlMode::kWebRtcMae;
+  config->periodic_alr_probing = true;
+
+  if (mode == "default") {
+    return true;
+  }
+  if (mode == "x264_slice") {
+    config->codec_type = CodecType::X264_SLICE;
+    return true;
+  }
+  if (mode == "salsify") {
+    config->encoder_rate_control = EncoderRateControlMode::kSalsify;
+    // Salsify's one-frame VBV routinely appears application-limited. Disable
+    // only periodic ALR discovery so it receives no extra probe opportunities;
+    // startup probing and all non-ALR congestion signals remain unchanged.
+    config->periodic_alr_probing = false;
+    return true;
+  }
+  if (mode == "cbr") {
+    config->encoder_rate_control = EncoderRateControlMode::kCbr;
+    return true;
+  }
+  if (mode == "webrtc_no_mae" || mode == "webrtc_disable_mae") {
+    config->name = "webrtc_no_mae";
+    config->encoder_rate_control = EncoderRateControlMode::kWebRtcNoMae;
+    return true;
+  }
+  return false;
+}
+
 
 /* Sender has two key components:
 *  1. Video Capture and Send (frame capture + encoding + sending in one thread)
@@ -51,7 +111,27 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   int fps = parser.GetFlag<int>("fps");
   int framesToBeEncoded = parser.GetFlag<int>("frames_to_encode");
   std::string codec_name = parser.GetFlag<std::string>("codec");
-  CodecType codec_type = CodecFactory::ParseCodecType(codec_name);
+  std::string experiment_mode =
+      parser.GetFlag<std::string>("experiment_mode");
+  ExperimentConfig experiment;
+  if (!ResolveExperimentConfig(experiment_mode, codec_name, &experiment)) {
+    LOG(ERROR) << "[socket_codec_main] Unknown experiment mode: "
+               << experiment_mode;
+    return -1;
+  }
+  int periodic_alr_override =
+      parser.GetFlag<int>("periodic_alr_probing");
+  if (periodic_alr_override < -1 || periodic_alr_override > 1) {
+    LOG(ERROR) << "[socket_codec_main] periodic_alr_probing must be -1, 0, or 1";
+    return -1;
+  }
+  if (periodic_alr_override >= 0) {
+    experiment.periodic_alr_probing = periodic_alr_override == 1;
+  }
+  CodecType codec_type = experiment.codec_type;
+  LOG(INFO) << "[socket_codec_main] Experiment mode=" << experiment.name
+            << " requested_codec=" << codec_name
+            << " periodic_alr_probing=" << experiment.periodic_alr_probing;
 
   if (width <= 0 || height <= 0 || width > 7680 || height > 4320) {
     LOG(ERROR) << "[socket_codec_main] Invalid width/height: " << width << "x" << height;
@@ -127,7 +207,8 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
                                              height,
                                              fps,
                                              framesToBeEncoded,
-                                             codec_type)) {
+                                             codec_type,
+                                             experiment.encoder_rate_control)) {
     LOG(ERROR) << "[socket_codec_main] Failed to initialize video capture and send";
     return -1;
   }
@@ -143,6 +224,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
 
   // Set up GCC congestion controller
   GccController gcc;
+  gcc.SetPeriodicAlrProbingEnabled(experiment.periodic_alr_probing);
   int cc_initial = parser.GetFlag<int>("cc_initial_bitrate_kbps");
   int cc_min = parser.GetFlag<int>("cc_min_bitrate_kbps");
   int cc_max = parser.GetFlag<int>("cc_max_bitrate_kbps");
@@ -166,6 +248,11 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   // Apply pacer tuning from config. Note SetPacer() already started the pacer
   // thread inside Initialize(); these setters are safe to call while it runs.
   if (pacer_ptr) {
+    pacer_ptr->SetPacketSentCallback(
+        [&gcc](uint16_t frame_sequence, uint8_t packet_index,
+               size_t wire_bytes) {
+          gcc.OnPacketSent(frame_sequence, packet_index, wire_bytes);
+        });
     pacer_ptr->SetPaceMultiplier(
         parser.GetFlag<int>("cc_pace_multiplier_x100") / 100.0);
     pacer_ptr->SetBurstCapMs(parser.GetFlag<int>("cc_pace_burst_cap_ms"));

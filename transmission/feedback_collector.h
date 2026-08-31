@@ -2,9 +2,11 @@
 #define TRANSMISSION_FEEDBACK_COLLECTOR_H
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "transport_feedback.h"
@@ -27,7 +29,10 @@ class FeedbackCollector {
   using SendCallback = std::function<void(const uint8_t* data, size_t size)>;
 
   FeedbackCollector();
-  ~FeedbackCollector() = default;
+  ~FeedbackCollector();
+
+  FeedbackCollector(const FeedbackCollector&) = delete;
+  FeedbackCollector& operator=(const FeedbackCollector&) = delete;
 
   /** Set callback for sending feedback bytes. */
   void SetSendCallback(SendCallback cb);
@@ -51,6 +56,10 @@ class FeedbackCollector {
   void OnPacketReceived(uint16_t frame_sequence, uint8_t packet_index,
                         uint16_t recv_size);
 
+  /** Record a packet using a socket/kernel-provided arrival timestamp. */
+  void OnPacketReceived(uint16_t frame_sequence, uint8_t packet_index,
+                        uint16_t recv_size, int64_t arrival_time_us);
+
   /**
    * Detect lost packets: checks for gaps in expected sequence within a frame.
    * Call after a frame is complete or timed out.
@@ -63,17 +72,21 @@ class FeedbackCollector {
   /** Force-send any accumulated feedback (e.g. on frame completion). */
   void Flush();
 
+  /** Stop the deadline timer. Safe to call more than once. */
+  void Stop();
+
   /** Send a loss report for the given lost packets. */
   void SendLossReport(const std::vector<LossReport::LostPacket>& lost_packets);
 
  private:
   void SendTransportFeedback();
+  void TimerLoop();
 
   struct ArrivalEntry {
     uint16_t frame_sequence;
     uint8_t packet_index;
     uint16_t recv_size;
-    std::chrono::steady_clock::time_point arrival_time;
+    int64_t arrival_time_us;
   };
 
   std::mutex mutex_;
@@ -81,9 +94,13 @@ class FeedbackCollector {
   SendCallback send_cb_;
   int feedback_interval_;  // send after this many packets
   int feedback_max_interval_ms_;  // or after this much time since last feedback (<=0 off)
-  std::chrono::steady_clock::time_point epoch_;
+  int64_t epoch_us_;
   bool epoch_set_;
   std::chrono::steady_clock::time_point last_feedback_time_;  // time of last feedback send
+  std::chrono::steady_clock::time_point pending_since_;
+  std::condition_variable timer_cv_;
+  std::thread timer_thread_;
+  bool stopping_;
 };
 
 #endif  // TRANSMISSION_FEEDBACK_COLLECTOR_H

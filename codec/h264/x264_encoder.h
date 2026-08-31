@@ -18,9 +18,15 @@ class X264Encoder : public Encoder {
   void Cleanup() override;
   void PrintSummary() const override;
   void SetTargetBitrate(int bitrate_kbps) override;
+  void SetRateControlMode(EncoderRateControlMode mode) override;
   void SetNetworkUsageState(double network_usage_state) override;
 
  private:
+  int EffectiveBitrateKbps(int target_bitrate_kbps) const;
+  double VbvRatio() const;
+  const char* RateControlModeName() const;
+  void ApplyRateControl(int target_bitrate_kbps, bool force);
+
   x264_t* encoder_;
   x264_param_t params_;
   x264_picture_t pic_in_;
@@ -33,9 +39,9 @@ class X264Encoder : public Encoder {
   int width_;
   int height_;
   int fps_;
+  EncoderRateControlMode rate_control_mode_;
   /** Current network usage state from GCC (for sparkrtc-aligned VBV adaptation). */
   double network_usage_state_;
 };
 
 #endif  // CODEC_X264_ENCODER_H
-

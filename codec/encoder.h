@@ -11,6 +11,15 @@
 class FrameCapture;
 class DataSender;
 
+// x264 rate-control policy selected by the experiment mode. Non-x264 encoders
+// may keep the default no-op implementation of SetRateControlMode().
+enum class EncoderRateControlMode {
+  kWebRtcMae,
+  kSalsify,
+  kCbr,
+  kWebRtcNoMae,
+};
+
 // Common YUV buffer structure (codec-agnostic)
 struct YUVBuffer {
   struct Plane {
@@ -109,6 +118,11 @@ class Encoder {
   virtual void PrintSummary() const = 0;
 
   virtual void SetTargetBitrate(int bitrate_kbps) = 0;
+
+  /** Configure the encoder policy before Initialize() opens the codec. */
+  virtual void SetRateControlMode(EncoderRateControlMode mode) {
+    (void)mode;
+  }
 
   /**
    * Notify encoder of network usage state for adaptive VBV control.

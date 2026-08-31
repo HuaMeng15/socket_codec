@@ -167,6 +167,38 @@ For the slice-level encoder:
 ./build/socket_codec --codec=x264_slice ...
 ```
 
+The sender also accepts one experiment-level switch. Explicit modes select the
+matching x264 path, so scripts do not need to coordinate several low-level
+flags:
+
+| `--experiment_mode` | Encoder behavior | Periodic ALR probes |
+| --- | --- | --- |
+| `default` | WebRTC/MAE adaptive VBV: `0.5`, tightened to `1/fps` on overuse | enabled |
+| `x264_slice` | default behavior plus adaptive x264 slice-level rate control | enabled |
+| `salsify` | VBV ratio fixed at `1/fps` | disabled |
+| `cbr` | x264 ABR with filler, using 100% of the CC bitrate | enabled |
+| `webrtc_no_mae` | VBV ratio fixed at `0.5` | enabled |
+
+`auto` is the compatibility default and keeps the encoder selected by
+`--codec`. For a Mahimahi run, set the mode as a script parameter:
+
+```bash
+EXPERIMENT_MODE=salsify ./run.sh salsify_trial x264
+```
+
+Salsify disables periodic ALR discovery by default. To remove periodic ALR as
+an experimental variable for every mode, set `PERIODIC_ALR_PROBING=0`; use
+`-1` (the default) for the per-mode policy or `1` to force it on. Startup probes
+are unchanged by this override.
+
+The long-trace runner can interleave any subset or all five modes:
+
+```bash
+EXPERIMENT_MODES="default x264_slice salsify cbr webrtc_no_mae" \
+  TRACE_FILE=/path/to/trace.log \
+  ./scripts/run_mahimahi_real_trace.sh
+```
+
 ## Experiment Scripts
 
 Single x264/x264_slice run:

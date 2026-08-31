@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 TRIAL_COLUMNS = [
+    "experiment_mode",
     "codec",
     "slice_number",
     "trial",
@@ -35,6 +36,8 @@ TRIAL_COLUMNS = [
     "overall_latency_max_ms",
     "overall_latency_p95_ms",
     "overall_latency_p99_ms",
+    "overall_stall_100ms_count",
+    "overall_stall_200ms_count",
     "packet_latency_count",
     "packet_latency_avg_ms",
     "packet_latency_max_ms",
@@ -43,8 +46,8 @@ TRIAL_COLUMNS = [
     "frame_stall_100ms_count",
     "frame_stall_200ms_count",
 ]
-TRIAL_TEXT_COLUMNS = {"codec", "slice_number", "result_dir"}
-SUMMARY_TEXT_COLUMNS = {"codec", "slice_number"}
+TRIAL_TEXT_COLUMNS = {"experiment_mode", "codec", "slice_number", "result_dir"}
+SUMMARY_TEXT_COLUMNS = {"experiment_mode", "codec", "slice_number"}
 QUALITY_FRAME_COLUMNS = [
     "frame_index",
     "psnr_y",
@@ -53,6 +56,7 @@ QUALITY_FRAME_COLUMNS = [
     "psnr_avg",
     "vmaf",
 ]
+DECODED_FRAME_RE = re.compile(r"Successfully decoded frame (\d+)")
 
 
 def run_ffmpeg(cmd, log_path):
@@ -188,27 +192,122 @@ def write_vmaf_frames_csv(rows, path):
             )
 
 
-def raw_yuv_to_mp4(ffmpeg, raw_path, mp4_path, width, height, fps, frames, log_path):
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
+def raw_yuv_input_args(raw_path, width, height, fps, loop_count=1):
+    args = [
         "-f", "rawvideo",
         "-pix_fmt", "yuv420p",
         "-s", f"{width}x{height}",
         "-r", str(fps),
-        "-i", str(raw_path),
-        "-frames:v", str(frames),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "0",
-        "-pix_fmt", "yuv420p",
-        "-y",
-        str(mp4_path),
     ]
+    if loop_count > 1:
+        # -stream_loop is an input option and rewinds the raw YUV demuxer
+        # without materializing a multi-gigabyte repeated reference file.
+        args.extend(["-stream_loop", str(loop_count - 1)])
+    args.extend(["-i", str(raw_path)])
+    return args
+
+
+def read_decoded_frame_ids(result_dir, frames_compared):
+    """Return decoded source frame IDs when recv.log can map every raw frame."""
+    recv_log = Path(result_dir) / "recv.log"
+    if not recv_log.exists() or frames_compared <= 0:
+        return [], "unavailable"
+
+    frame_ids = []
+    with recv_log.open(errors="replace") as handle:
+        for line in handle:
+            match = DECODED_FRAME_RE.search(line)
+            if match:
+                frame_ids.append(int(match.group(1)))
+
+    if len(frame_ids) < frames_compared:
+        return frame_ids, "incomplete"
+    frame_ids = frame_ids[:frames_compared]
+    if any(right <= left for left, right in zip(frame_ids, frame_ids[1:])):
+        return frame_ids, "non_monotonic"
+    return frame_ids, "mapped"
+
+
+def select_expression(frame_ids):
+    """Compress increasing frame IDs into an FFmpeg select expression."""
+    if not frame_ids:
+        return ""
+    spans = []
+    start = previous = frame_ids[0]
+    for frame_id in frame_ids[1:]:
+        if frame_id == previous + 1:
+            previous = frame_id
+            continue
+        spans.append((start, previous))
+        start = previous = frame_id
+    spans.append((start, previous))
+
+    terms = []
+    for start, end in spans:
+        if start == end:
+            terms.append(f"eq(n\\,{start})")
+        else:
+            terms.append(f"between(n\\,{start}\\,{end})")
+    return "+".join(terms)
+
+
+def comparison_filter(frame_ids, fps, metric_filter, reference_input_first):
+    """Align the repeated reference to the decoded source IDs before scoring."""
+    expression = select_expression(frame_ids)
+    if not expression:
+        return ""
+    reference_input = 0 if reference_input_first else 1
+    distorted_input = 1 if reference_input_first else 0
+    metric_inputs = "[ref][dist]" if reference_input_first else "[dist][ref]"
+    return (
+        f"[{reference_input}:v]select='{expression}',"
+        f"setpts=N/({fps}*TB)[ref];"
+        f"[{distorted_input}:v]setpts=N/({fps}*TB)[dist];"
+        f"{metric_inputs}{metric_filter}"
+    )
+
+
+def raw_yuv_to_mp4(
+    ffmpeg,
+    raw_path,
+    mp4_path,
+    width,
+    height,
+    fps,
+    frames,
+    log_path,
+    loop_count=1,
+    frame_ids=None,
+):
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        *raw_yuv_input_args(raw_path, width, height, fps, loop_count),
+    ]
+    if frame_ids:
+        cmd.extend(
+            [
+                "-vf",
+                f"select='{select_expression(frame_ids)}',setpts=N/({fps}*TB)",
+            ]
+        )
+    cmd.extend(
+        [
+            "-frames:v", str(frames),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "0",
+            "-pix_fmt", "yuv420p",
+            "-y",
+            str(mp4_path),
+        ]
+    )
     return run_ffmpeg(cmd, log_path)
 
 
-def run_docker_vmaf(args, ffmpeg, result_dir, frames_compared):
+def run_docker_vmaf(
+    args, ffmpeg, result_dir, frames_compared, decoded_frame_ids=None
+):
     if frames_compared <= 0:
         return "", []
     docker = shutil.which(args.docker_bin)
@@ -230,6 +329,8 @@ def run_docker_vmaf(args, ffmpeg, result_dir, frames_compared):
         args.fps,
         frames_compared,
         result_dir / "vmaf_reference_mp4_ffmpeg.log",
+        loop_count=args.reference_loop_count,
+        frame_ids=decoded_frame_ids,
     )
     dist_result = raw_yuv_to_mp4(
         ffmpeg,
@@ -278,7 +379,7 @@ def run_docker_vmaf(args, ffmpeg, result_dir, frames_compared):
     return mean, frame_rows
 
 
-def write_quality_frames(result_dir, frames_compared):
+def write_quality_frames(result_dir, frames_compared, decoded_frame_ids=None):
     psnr_rows = parse_psnr_frames(result_dir / "psnr_frames.log")
     vmaf_rows = parse_vmaf_frames(result_dir / "vmaf_frames.csv")
 
@@ -322,6 +423,9 @@ def write_quality_frames(result_dir, frames_compared):
         merged[row["frame_index"]].update(row)
 
     quality_rows = [merged[i] for i in sorted(merged)]
+    if decoded_frame_ids and len(decoded_frame_ids) >= len(quality_rows):
+        for sequence_index, row in enumerate(quality_rows):
+            row["frame_index"] = decoded_frame_ids[sequence_index]
 
     quality_csv = result_dir / "quality_frames.csv"
     with quality_csv.open("w", newline="") as f:
@@ -355,7 +459,34 @@ def calc_quality(args):
     frames_decoded = 0
     if decoded.exists() and frame_size > 0:
         frames_decoded = decoded.stat().st_size // frame_size
-    frames_compared = min(args.frames, frames_decoded)
+    reference = Path(args.reference)
+    reference_frames = 0
+    if reference.exists() and frame_size > 0:
+        reference_frames = reference.stat().st_size // frame_size
+    available_reference_frames = reference_frames * args.reference_loop_count
+    frames_compared = min(args.frames, frames_decoded, available_reference_frames)
+    decoded_frame_ids, alignment_status = read_decoded_frame_ids(
+        result_dir, frames_compared
+    )
+    can_map_frame_ids = (
+        alignment_status == "mapped"
+        and len(decoded_frame_ids) == frames_compared
+        and all(0 <= frame_id < available_reference_frames for frame_id in decoded_frame_ids)
+    )
+    needs_reference_alignment = can_map_frame_ids and decoded_frame_ids != list(
+        range(frames_compared)
+    )
+    alignment_metadata = {
+        "status": alignment_status,
+        "frames_compared": frames_compared,
+        "mapped_frame_count": len(decoded_frame_ids),
+        "reference_alignment_applied": needs_reference_alignment,
+        "first_decoded_frame_id": decoded_frame_ids[0] if decoded_frame_ids else None,
+        "last_decoded_frame_id": decoded_frame_ids[-1] if decoded_frame_ids else None,
+    }
+    (result_dir / "quality_alignment.json").write_text(
+        json.dumps(alignment_metadata, indent=2, sort_keys=True) + "\n"
+    )
 
     row = {
         "frames_requested": args.frames,
@@ -376,19 +507,27 @@ def calc_quality(args):
             writer.writerow(row)
         return row
 
-    size = f"{args.width}x{args.height}"
-
+    psnr_filter = f"[0:v][1:v]psnr=stats_file={psnr_stats_path}"
+    if needs_reference_alignment:
+        psnr_filter = comparison_filter(
+            decoded_frame_ids,
+            args.fps,
+            f"psnr=stats_file={psnr_stats_path}",
+            reference_input_first=True,
+        )
     psnr_cmd = [
         ffmpeg,
         "-hide_banner",
-        "-s", size,
-        "-pix_fmt", "yuv420p",
-        "-i", str(args.reference),
-        "-s", size,
-        "-pix_fmt", "yuv420p",
-        "-i", str(decoded),
+        *raw_yuv_input_args(
+            args.reference,
+            args.width,
+            args.height,
+            args.fps,
+            args.reference_loop_count,
+        ),
+        *raw_yuv_input_args(decoded, args.width, args.height, args.fps),
         "-frames:v", str(frames_compared),
-        "-filter_complex", f"[0:v][1:v]psnr=stats_file={psnr_stats_path}",
+        "-filter_complex", psnr_filter,
         "-f", "null",
         "-",
     ]
@@ -404,17 +543,27 @@ def calc_quality(args):
     if use_ffmpeg_vmaf and ffmpeg_supports_libvmaf(ffmpeg):
         # Same ordering as x264_experiments/tests/slice_division_cost/test_slice_cost.sh:
         # distorted first, reference second.
+        vmaf_filter = f"[0:v][1:v]libvmaf=log_fmt=csv:log_path={vmaf_csv_path}"
+        if needs_reference_alignment:
+            vmaf_filter = comparison_filter(
+                decoded_frame_ids,
+                args.fps,
+                f"libvmaf=log_fmt=csv:log_path={vmaf_csv_path}",
+                reference_input_first=False,
+            )
         vmaf_cmd = [
             ffmpeg,
             "-hide_banner",
-            "-s", size,
-            "-pix_fmt", "yuv420p",
-            "-i", str(decoded),
-            "-s", size,
-            "-pix_fmt", "yuv420p",
-            "-i", str(args.reference),
+            *raw_yuv_input_args(decoded, args.width, args.height, args.fps),
+            *raw_yuv_input_args(
+                args.reference,
+                args.width,
+                args.height,
+                args.fps,
+                args.reference_loop_count,
+            ),
             "-frames:v", str(frames_compared),
-            "-filter_complex", f"[0:v][1:v]libvmaf=log_fmt=csv:log_path={vmaf_csv_path}",
+            "-filter_complex", vmaf_filter,
             "-f", "null",
             "-",
         ]
@@ -429,7 +578,13 @@ def calc_quality(args):
         )
 
     if not row["vmaf"] and use_docker_vmaf:
-        docker_mean, _ = run_docker_vmaf(args, ffmpeg, result_dir, frames_compared)
+        docker_mean, _ = run_docker_vmaf(
+            args,
+            ffmpeg,
+            result_dir,
+            frames_compared,
+            decoded_frame_ids if needs_reference_alignment else None,
+        )
         if docker_mean != "":
             row["vmaf"] = docker_mean
 
@@ -439,7 +594,9 @@ def calc_quality(args):
         writer.writerow(row)
 
     quality_rows, quality_frames_csv, quality_frames_log = write_quality_frames(
-        result_dir, frames_compared
+        result_dir,
+        frames_compared,
+        decoded_frame_ids if can_map_frame_ids else None,
     )
     print(
         f"Wrote {quality_frames_csv} and {quality_frames_log} "
@@ -529,8 +686,15 @@ def append_trial_row(args):
     stall_200_count = read_stall_count(
         result_dir / "frame_latency.csv", "frame_latency", 200.0
     )
+    overall_stall_100_count = read_stall_count(
+        result_dir / "overall_latency.csv", "overall_latency", 100.0
+    )
+    overall_stall_200_count = read_stall_count(
+        result_dir / "overall_latency.csv", "overall_latency", 200.0
+    )
 
     row = {
+        "experiment_mode": args.experiment_mode,
         "codec": args.codec,
         "slice_number": args.slice_number,
         "trial": args.trial,
@@ -555,6 +719,8 @@ def append_trial_row(args):
         "overall_latency_max_ms": overall["max"],
         "overall_latency_p95_ms": overall["p95"],
         "overall_latency_p99_ms": overall["p99"],
+        "overall_stall_100ms_count": overall_stall_100_count,
+        "overall_stall_200ms_count": overall_stall_200_count,
         "packet_latency_count": packet["count"],
         "packet_latency_avg_ms": packet["avg"],
         "packet_latency_max_ms": packet["max"],
@@ -574,7 +740,8 @@ def append_trial_row(args):
         writer.writerow(format_row(row, TRIAL_COLUMNS, TRIAL_TEXT_COLUMNS))
 
     print(
-        f"{args.codec} slice_number={args.slice_number} trial {args.trial}: "
+        f"{args.experiment_mode} codec={args.codec} "
+        f"slice_number={args.slice_number} trial {args.trial}: "
         f"decoded={quality['frames_decoded']} compared={quality['frames_compared']} "
         f"PSNR={quality['psnr_avg'] or 'N/A'} VMAF={quality['vmaf'] or 'N/A'} "
         f"stall100={stall_100_count} stall200={stall_200_count}"
@@ -600,6 +767,8 @@ def summarize_trials(args):
         "overall_latency_max_ms",
         "overall_latency_p95_ms",
         "overall_latency_p99_ms",
+        "overall_stall_100ms_count",
+        "overall_stall_200ms_count",
         "packet_latency_avg_ms",
         "packet_latency_max_ms",
         "packet_latency_p95_ms",
@@ -610,21 +779,34 @@ def summarize_trials(args):
 
     groups = []
     for row in rows:
-        group = (row["codec"], row.get("slice_number", ""))
+        group = (
+            row.get("experiment_mode", row["codec"]),
+            row["codec"],
+            row.get("slice_number", ""),
+        )
         if group not in groups:
             groups.append(group)
 
-    summary_cols = ["codec", "slice_number", "trials", "successful_trials"]
+    summary_cols = [
+        "experiment_mode",
+        "codec",
+        "slice_number",
+        "trials",
+        "successful_trials",
+    ]
     for col in numeric_cols:
         summary_cols.append(f"avg_{col}")
 
     summary_rows = []
-    for codec, slice_number in groups:
+    for experiment_mode, codec, slice_number in groups:
         group = [
             row for row in rows
-            if row["codec"] == codec and row.get("slice_number", "") == slice_number
+            if row.get("experiment_mode", row["codec"]) == experiment_mode
+            and row["codec"] == codec
+            and row.get("slice_number", "") == slice_number
         ]
         out = {
+            "experiment_mode": experiment_mode,
             "codec": codec,
             "slice_number": slice_number,
             "trials": len(group),
@@ -657,12 +839,19 @@ def main():
     parser.add_argument("--summary-csv", default="summary.csv")
     parser.add_argument("--result-dir")
     parser.add_argument("--reference")
+    parser.add_argument(
+        "--reference-loop-count",
+        type=int,
+        default=1,
+        help="Number of consecutive passes through the raw reference YUV",
+    )
     parser.add_argument("--decoded")
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--frames", type=int)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--codec")
+    parser.add_argument("--experiment-mode", default="auto")
     parser.add_argument("--slice-number", default="")
     parser.add_argument("--trial", type=int)
     parser.add_argument("--port", type=int)
@@ -683,6 +872,9 @@ def main():
         help="Keep temporary Docker VMAF MP4 inputs for debugging",
     )
     args = parser.parse_args()
+
+    if args.reference_loop_count < 1:
+        parser.error("--reference-loop-count must be at least 1")
 
     if args.summarize:
         summarize_trials(args)

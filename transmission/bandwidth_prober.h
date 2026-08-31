@@ -30,9 +30,8 @@
  *
  * Probe bitrate targets consider current network situation:
  *   - Limited by max_bitrate (don't probe above ceiling)
- *   - Bounded by kMaxProbeIncreaseLimit × current estimate (WebRTC AimdRateControl
- *     uses 1.5×throughput as its increase limit; we cap probe targets the same
- *     way so a probe can't shoot far past what the link is actually carrying)
+ *   - Periodic ALR discovery is bounded to one conservative 1.25× step over
+ *     the current measured estimate; startup probing keeps its original policy
  *   - Further probes only if headroom exists (current < max * 0.95)
  *
  * State: Idle → Probing → WaitingForResult → (success/failure) → Idle
@@ -48,7 +47,7 @@ class BandwidthProber {
   //              link (e.g. 10 Mbps) converges in a few seconds instead of the
   //              ~16s AIMD crawl. Does not chain; the cadence is driven by the
   //              settle timer in MaybeInitiateProbe.
-  //   kPeriodic — ALR probe; the only type allowed to chain within OnProbeResult.
+  //   kPeriodic — conservative, one-step ALR discovery probe.
   enum class ProbeType { kSeed, kStartup, kPeriodic };
 
   struct ProbeCluster {
@@ -87,8 +86,19 @@ class BandwidthProber {
    */
   void OnUnderuseDetected();
 
-  /** Report that application is below estimated rate (ALR condition). */
-  void OnApplicationLimited();
+  /**
+   * Report the current ALR state. This is deliberately a level-triggered
+   * signal, not a latched event: a short VBR lull must not arm a probe that
+   * fires much later after the source has resumed filling the estimate.
+   */
+  void SetApplicationLimited(bool limited);
+
+  /**
+   * Allow periodic ALR discovery only while the controller's measured network
+   * state is healthy (no congestion-window pushback or growing queue). This
+   * gate deliberately does not affect the startup probe policy.
+   */
+  void SetPeriodicProbingAllowed(bool allowed);
 
   /** Get current state. */
   State GetState() const;
@@ -105,13 +115,11 @@ class BandwidthProber {
   void InitiateExponentialProbe();
   void InitiateStartupProbe();
   void InitiateAlrProbe();
-  // Cap a probe target to WebRTC's AimdRateControl increase limit:
-  // 1.5 × current estimate. A probe (ALR seed or a further/chained hop) can
-  // explore up to 50% above what the link is currently carrying, but no more —
-  // so it can't shoot to ~2× capacity, flood the bottleneck, and trigger the
-  // AIMD backoff that used to be misread as a fresh "bitrate drop".
+  // Cap a probe target to a conservative increase over the current measured
+  // capacity line. Startup probing has its own unchanged policy; this cap is
+  // used only by periodic ALR discovery.
   int CapProbeTarget(int target_kbps) const;
-  static constexpr double kMaxProbeIncreaseLimit = 1.5;
+  static constexpr double kMaxPeriodicProbeIncreaseLimit = 1.25;
 
   mutable std::mutex mutex_;
   State state_;
@@ -135,22 +143,19 @@ class BandwidthProber {
   // ~kStartupSettleMs, letting the new rate settle in between) so an idle
   // high-capacity link converges in a few seconds rather than the slow AIMD
   // crawl. The stage ends the first time a probe comes back weak (< 70% of
-  // target => link can't sustain it) or the delay detector signals overuse
-  // (latency rising) — after that, normal AIMD/ALR takes over.
+  // target => link can't sustain it) or byte/cwnd state confirms congestion —
+  // after that, normal AIMD/ALR takes over.
   bool startup_stage_;
   int64_t last_startup_probe_ms_;
   static constexpr int kStartupSettleMs = 1000;
   static constexpr double kStartupProbeMultiplier = 1.5;
-  // Next probe explores 1.5× the measured rate (see kMaxProbeIncreaseLimit /
-  // CapProbeTarget) — WebRTC's AimdRateControl increase limit, not a raw 2×.
+  // Startup's next probe still explores 1.5× the measured rate. The gentler
+  // periodic-ALR limit below does not alter startup behavior.
 
-  // Chain control: which probe is active, and how many further hops it has
-  // taken. A periodic/recovery probe may chain at most kMaxChainHops times so a
-  // single probe session cannot run all the way to 2x the link capacity (which
-  // is what flooded the pipe and forced the overuse→collapse cycle).
+  // Origin of the active probe. Periodic probes deliberately do not chain:
+  // capacity discovery progresses one measured step per ALR interval instead
+  // of compounding several speculative increases in a few milliseconds.
   ProbeType current_probe_type_;
-  int chain_hops_;
-  static constexpr int kMaxChainHops = 2;
 
   // ALR periodic probing. Fires only while application-limited (the encoder is
   // sending below the estimate), driven by the real AlrDetector. This is the
@@ -159,9 +164,15 @@ class BandwidthProber {
   // tracks capacity; a variable/VBR encoder goes app-limited on simple content
   // and gets a probe to keep the estimate warm for the next scene change.
   bool application_limited_;
+  bool periodic_probing_allowed_;
+  int64_t application_limited_since_ms_;
   int64_t last_alr_probe_ms_;
   static constexpr int kAlrProbeIntervalMs = 5000;
-  static constexpr double kAlrProbeMultiplier = 1.5;
+  // Require ALR to persist before probing. This rejects transient VBR gaps and
+  // makes both frame- and slice-producing encoders qualify by the same
+  // sustained under-production signal.
+  static constexpr int kAlrQualificationMs = 500;
+  static constexpr double kAlrProbeMultiplier = 1.25;
 
   // Current probe state
   int probe_target_kbps_;
