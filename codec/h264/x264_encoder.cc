@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cmath>
 
 #include "config/config.h"
 #include "log_system/log_system.h"
@@ -136,15 +137,15 @@ int X264Encoder::EffectiveBitrateKbps(int target_bitrate_kbps) const {
 double X264Encoder::VbvRatio() const {
   switch (rate_control_mode_) {
     case EncoderRateControlMode::kSalsify:
-      return 1.0 / std::max(1, fps_);
+      return std::ceil((1 / (double)fps_) * 100) / 100;
     case EncoderRateControlMode::kCbr:
     case EncoderRateControlMode::kWebRtcNoMae:
       return VBV_NORMAL_RATIO;
     case EncoderRateControlMode::kWebRtcMae:
     default:
-      double vbv_ratio = kVbvNormalRatio;
-      if (network_usage_state_.load() >= kOveruseThreshold) {
-        vbv_ratio = std::ceil((1 / (double)params_.i_fps_num) * 100) / 100;
+      double vbv_ratio = VBV_NORMAL_RATIO;
+      if (network_usage_state_ >= OVERUSE_THRESHOLD) {
+        vbv_ratio = std::ceil((1 / (double)fps_) * 100) / 100;
       }
       return vbv_ratio;
   }

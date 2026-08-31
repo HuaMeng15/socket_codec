@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cmath>
 
 #include "config/config.h"
 #include "log_system/log_system.h"
