@@ -13,7 +13,7 @@
  */
 class PacketSendTimeStore {
  public:
-  void Record(uint16_t frame_sequence, uint8_t packet_index) {
+  void Record(uint16_t frame_sequence, uint16_t packet_index) {
     double t = NowSeconds();
     uint32_t key = Key(frame_sequence, packet_index);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -24,7 +24,8 @@ class PacketSendTimeStore {
   }
 
   /** Returns send time in seconds since epoch, or empty if not found. */
-  std::optional<double> GetSendTime(uint16_t frame_sequence, uint8_t packet_index) const {
+  std::optional<double> GetSendTime(uint16_t frame_sequence,
+                                    uint16_t packet_index) const {
     uint32_t key = Key(frame_sequence, packet_index);
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = store_.find(key);
@@ -35,8 +36,8 @@ class PacketSendTimeStore {
  private:
   static const size_t kMaxEntries = 50000;
 
-  static uint32_t Key(uint16_t frame, uint8_t packet) {
-    return (static_cast<uint32_t>(frame) << 8) | packet;
+  static uint32_t Key(uint16_t frame, uint16_t packet) {
+    return (static_cast<uint32_t>(frame) << 16) | packet;
   }
 
   static double NowSeconds() {

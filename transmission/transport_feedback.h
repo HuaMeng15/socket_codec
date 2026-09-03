@@ -34,8 +34,7 @@ struct FeedbackMessageHeader {
 // Per-packet arrival record in TransportFeedback
 struct PacketArrivalRecord {
   uint16_t frame_sequence;   // Frame this packet belongs to
-  uint8_t packet_index;      // Packet index within frame
-  uint8_t padding;
+  uint16_t packet_index;     // Packet index within frame
   int32_t arrival_time_us;   // Arrival time relative to the receiver's epoch,
                              // in microseconds (int32 → ±~35 min range).
                              // Microsecond resolution avoids the quantization
@@ -47,13 +46,14 @@ struct PacketArrivalRecord {
                              // instead of assuming a fixed MTU.
   uint16_t reserved2;        // Pad to 4-byte alignment (record is 12 bytes).
 };
+static_assert(sizeof(PacketArrivalRecord) == 12);
 
 // Per-packet loss record in LossReport
 struct PacketLossRecord {
   uint16_t frame_sequence;
-  uint8_t packet_index;
-  uint8_t padding;
+  uint16_t packet_index;
 };
+static_assert(sizeof(PacketLossRecord) == 4);
 
 /**
  * TransportFeedback: high-level struct used within the sender to process
@@ -62,7 +62,7 @@ struct PacketLossRecord {
 struct TransportFeedback {
   struct PacketInfo {
     uint16_t frame_sequence;
-    uint8_t packet_index;
+    uint16_t packet_index;
     int64_t send_time_us;     // Sender clock (looked up from PacketSendTimeStore)
     int64_t arrival_time_us;  // Receiver clock (from feedback message)
     uint16_t recv_size = 0;   // Actual wire bytes received for this packet
@@ -78,7 +78,7 @@ struct TransportFeedback {
 struct LossReport {
   struct LostPacket {
     uint16_t frame_sequence;
-    uint8_t packet_index;
+    uint16_t packet_index;
   };
 
   std::vector<LostPacket> packets;

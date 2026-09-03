@@ -121,8 +121,8 @@ void ReceivedFrameDataHandler::ProcessPacket(const uint8_t* packet_data,
   // Extract header
   const FramePacketHeader* header = reinterpret_cast<const FramePacketHeader*>(packet_data);
   uint16_t frame_sequence = ntohs(header->frame_sequence);
-  uint8_t packet_index = header->packet_index;
-  uint8_t total_packets = header->total_packets;
+  uint16_t packet_index = ntohs(header->packet_index);
+  uint16_t total_packets = ntohs(header->total_packets);
   uint16_t payload_size = ntohs(header->payload_size);
 
   // Padding packet: pacer-generated filler for bandwidth probing. Report its
@@ -269,7 +269,8 @@ void ReceivedFrameDataHandler::ReportFrameLoss(uint16_t frame_sequence,
   }
 
   std::vector<bool> received_mask(assembly.total_packets, false);
-  for (uint8_t i = 0; i < assembly.total_packets && i < assembly.packets.size(); i++) {
+  for (size_t i = 0;
+       i < assembly.total_packets && i < assembly.packets.size(); i++) {
     received_mask[i] = !assembly.packets[i].empty();
   }
   auto lost = FeedbackCollector::DetectLoss(frame_sequence,
@@ -285,7 +286,8 @@ void ReceivedFrameDataHandler::SetFeedbackMaxIntervalMs(int ms) {
   feedback_collector_.SetFeedbackMaxIntervalMs(ms);
 }
 
-void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
+void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence,
+                                            uint16_t packet_index,
                                             uint16_t recv_size,
                                             int64_t arrival_time_us) {
   // Try to initialize feedback sender if not already initialized

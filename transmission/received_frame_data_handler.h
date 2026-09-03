@@ -44,15 +44,15 @@ class ReceivedFrameDataHandler : public MessageHandler {
   // Frame assembly state
   struct FrameAssembly {
     std::vector<std::vector<uint8_t>> packets;  // Packets for this frame
-    uint8_t total_packets;                      // Expected total packets
-    uint8_t received_packets;                  // Number of packets received
+    uint16_t total_packets;                    // Expected total packets
+    uint16_t received_packets;                 // Number of packets received
     bool complete;                              // Frame is complete
   };
 
   void ProcessPacket(const uint8_t* packet_data, size_t packet_size,
                      int64_t arrival_time_us);
 
-  void SendFeedback(uint16_t frame_sequence, uint8_t packet_index,
+  void SendFeedback(uint16_t frame_sequence, uint16_t packet_index,
                     uint16_t recv_size, int64_t arrival_time_us);
 
   void ReportFrameLoss(uint16_t frame_sequence, const FrameAssembly& assembly);

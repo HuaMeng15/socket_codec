@@ -43,12 +43,13 @@ class DataSender {
   // total_packets_for_header == 0 means "frame still open"; the final fragment
   // must pass the actual total packet count for the whole frame.
   int SendFrameFragment(const EncodedData* encoded_data,
-                        uint8_t first_packet_index,
-                        uint8_t total_packets_for_header,
-                        uint8_t* packets_sent);
+                        uint16_t first_packet_index,
+                        uint16_t total_packets_for_header,
+                        uint16_t* packets_sent);
 
   // Send feedback data (legacy per-packet ACK)
-  int SendFeedback(uint16_t frame_sequence, uint8_t packet_index, FeedbackType feedback_type);
+  int SendFeedback(uint16_t frame_sequence, uint16_t packet_index,
+                   FeedbackType feedback_type);
 
   // Send raw feedback bytes (for TWCC-style transport feedback / loss reports)
   int SendRawFeedback(const uint8_t* data, size_t size);

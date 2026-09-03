@@ -93,7 +93,7 @@ class GccController : public CongestionController {
    * accounting is packet based so an ACK or loss report can retire the exact
    * bytes instead of relying on cumulative sent-minus-received totals.
    */
-  void OnPacketSent(uint16_t frame_sequence, uint8_t packet_index,
+  void OnPacketSent(uint16_t frame_sequence, uint16_t packet_index,
                     size_t wire_bytes);
 
   /**
@@ -145,7 +145,7 @@ class GccController : public CongestionController {
     int64_t bytes = 0;
     int packets = 0;
     uint16_t last_frame_sequence = 0;
-    uint8_t last_packet_index = 0;
+    uint16_t last_packet_index = 0;
   };
 
   // Process all packets in a feedback batch and return the strongest hypothesis
@@ -395,7 +395,7 @@ class GccController : public CongestionController {
   void RetireFeedbackPackets(const TransportFeedback& feedback);
   void RetireLostPackets(const LossReport& report);
   void ExpireStaleInflightPackets(int64_t now_ms);
-  bool RetireInflightPacket(uint16_t frame_sequence, uint8_t packet_index);
+  bool RetireInflightPacket(uint16_t frame_sequence, uint16_t packet_index);
   // nullptr when pushback is disabled (mirrors WebRTC's optional controller).
   std::unique_ptr<CongestionWindowPushbackController> pushback_;
   int cwnd_queue_size_ms_ = 350;      // field-trial QueueSize (additional time)

@@ -38,7 +38,7 @@ void Pacer::SetProbing(bool probing) {
 }
 
 void Pacer::Enqueue(const uint8_t* data, size_t size,
-                    uint16_t frame_sequence, uint8_t packet_index) {
+                    uint16_t frame_sequence, uint16_t packet_index) {
   if (!data || size == 0) return;
   std::lock_guard<std::mutex> lock(mutex_);
   if (queue_.size() >= kMaxQueuePackets) {
@@ -89,18 +89,20 @@ void Pacer::SendPadding(size_t payload_bytes) {
   std::vector<uint8_t> pkt(header_size + payload_bytes, 0);
   auto* h = reinterpret_cast<FramePacketHeader*>(pkt.data());
   h->frame_sequence = htons(kPaddingFrameSequence);
-  h->packet_index = static_cast<uint8_t>(padding_counter_++ & 0xFF);
-  h->total_packets = 0;  // padding sentinel: not a real assemblable frame
+  const uint16_t packet_index =
+      static_cast<uint16_t>(padding_counter_++ & 0xFFFF);
+  h->packet_index = htons(packet_index);
+  h->total_packets = htons(0);  // padding sentinel: not a real assemblable frame
   h->payload_size = htons(static_cast<uint16_t>(payload_bytes));
   if (send_fn_) send_fn_(pkt.data(), pkt.size());
   if (packet_sent_fn_) {
-    packet_sent_fn_(kPaddingFrameSequence, h->packet_index, pkt.size());
+    packet_sent_fn_(kPaddingFrameSequence, packet_index, pkt.size());
   }
 }
 
 bool Pacer::NoteFramePacketSent(uint16_t frame_sequence,
-                                uint8_t packet_index,
-                                uint8_t total_packets,
+                                uint16_t packet_index,
+                                uint16_t total_packets,
                                 int* sent_packets,
                                 int* expected_packets) {
   if (frame_sequence == kPaddingFrameSequence) return false;
@@ -163,11 +165,11 @@ void Pacer::Run() {
         queue_.pop_front();
         tokens_bits_ -= need_bits;
         bytes_sent_since_consume_ += p.data.size();
-        uint8_t total_packets = 0;
+        uint16_t total_packets = 0;
         if (p.data.size() >= sizeof(FramePacketHeader)) {
           FramePacketHeader header;
           std::memcpy(&header, p.data.data(), sizeof(header));
-          total_packets = header.total_packets;
+          total_packets = ntohs(header.total_packets);
         }
         lock.unlock();
         if (record_fn_) record_fn_(p.frame_sequence, p.packet_index);

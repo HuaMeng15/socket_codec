@@ -53,11 +53,11 @@ class FeedbackCollector {
    * Record a packet arrival. Stores timestamp and the actual received byte
    * count, and triggers feedback send if interval is reached.
    */
-  void OnPacketReceived(uint16_t frame_sequence, uint8_t packet_index,
+  void OnPacketReceived(uint16_t frame_sequence, uint16_t packet_index,
                         uint16_t recv_size);
 
   /** Record a packet using a socket/kernel-provided arrival timestamp. */
-  void OnPacketReceived(uint16_t frame_sequence, uint8_t packet_index,
+  void OnPacketReceived(uint16_t frame_sequence, uint16_t packet_index,
                         uint16_t recv_size, int64_t arrival_time_us);
 
   /**
@@ -66,7 +66,7 @@ class FeedbackCollector {
    * Returns lost packets for the given frame.
    */
   static std::vector<LossReport::LostPacket> DetectLoss(
-      uint16_t frame_sequence, uint8_t total_packets,
+      uint16_t frame_sequence, uint16_t total_packets,
       const std::vector<bool>& received_mask);
 
   /** Force-send any accumulated feedback (e.g. on frame completion). */
@@ -84,7 +84,7 @@ class FeedbackCollector {
 
   struct ArrivalEntry {
     uint16_t frame_sequence;
-    uint8_t packet_index;
+    uint16_t packet_index;
     uint16_t recv_size;
     int64_t arrival_time_us;
   };

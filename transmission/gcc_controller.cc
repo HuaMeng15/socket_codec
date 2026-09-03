@@ -498,14 +498,14 @@ void GccController::OnBytesSent(size_t bytes_sent) {
 }
 
 void GccController::OnPacketSent(uint16_t frame_sequence,
-                                 uint8_t packet_index,
+                                 uint16_t packet_index,
                                  size_t wire_bytes) {
   if (wire_bytes == 0) return;
   std::lock_guard<std::mutex> lock(mutex_);
   const int64_t now_ms = NowMs();
   ExpireStaleInflightPackets(now_ms);
 
-  const uint32_t key = (static_cast<uint32_t>(frame_sequence) << 8) |
+  const uint32_t key = (static_cast<uint32_t>(frame_sequence) << 16) |
                        packet_index;
   const uint64_t id = next_inflight_id_++;
   const int64_t bytes = static_cast<int64_t>(wire_bytes);
@@ -516,8 +516,8 @@ void GccController::OnPacketSent(uint16_t frame_sequence,
 }
 
 bool GccController::RetireInflightPacket(uint16_t frame_sequence,
-                                         uint8_t packet_index) {
-  const uint32_t key = (static_cast<uint32_t>(frame_sequence) << 8) |
+                                         uint16_t packet_index) {
+  const uint32_t key = (static_cast<uint32_t>(frame_sequence) << 16) |
                        packet_index;
   auto ids_it = inflight_ids_by_key_.find(key);
   if (ids_it == inflight_ids_by_key_.end()) return false;

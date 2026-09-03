@@ -60,7 +60,7 @@ int FeedbackHandler::HandleLegacyFeedback(const uint8_t* data, size_t size) {
 
   const auto* header = reinterpret_cast<const FeedbackPacketHeader*>(data);
   uint16_t frame_sequence = ntohs(header->frame_sequence);
-  uint8_t packet_index = header->packet_index;
+  uint16_t packet_index = ntohs(header->packet_index);
   feedback_count_++;
 
   LOG(VERBOSE) << "[FeedbackHandler] Legacy ACK: frame=" << frame_sequence
@@ -118,7 +118,7 @@ int FeedbackHandler::HandleTransportFeedback(const uint8_t* data, size_t size) {
   for (uint16_t i = 0; i < record_count; i++) {
     TransportFeedback::PacketInfo info;
     info.frame_sequence = ntohs(records[i].frame_sequence);
-    info.packet_index = records[i].packet_index;
+    info.packet_index = ntohs(records[i].packet_index);
 
     // Arrival: receiver-clock offset in microseconds.
     int32_t offset_us = static_cast<int32_t>(ntohl(
@@ -175,7 +175,7 @@ int FeedbackHandler::HandleLossReport(const uint8_t* data, size_t size) {
   for (uint16_t i = 0; i < record_count; i++) {
     report.packets.push_back({
         ntohs(records[i].frame_sequence),
-        records[i].packet_index
+        ntohs(records[i].packet_index)
     });
   }
 

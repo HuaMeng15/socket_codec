@@ -38,7 +38,7 @@ void FeedbackCollector::SetFeedbackMaxIntervalMs(int ms) {
 }
 
 void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
-                                         uint8_t packet_index,
+                                         uint16_t packet_index,
                                          uint16_t recv_size) {
   int64_t arrival_time_us =
       std::chrono::duration_cast<std::chrono::microseconds>(
@@ -48,7 +48,7 @@ void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
 }
 
 void FeedbackCollector::OnPacketReceived(uint16_t frame_sequence,
-                                         uint8_t packet_index,
+                                         uint16_t packet_index,
                                          uint16_t recv_size,
                                          int64_t arrival_time_us) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -125,12 +125,12 @@ void FeedbackCollector::TimerLoop() {
 }
 
 std::vector<LossReport::LostPacket> FeedbackCollector::DetectLoss(
-    uint16_t frame_sequence, uint8_t total_packets,
+    uint16_t frame_sequence, uint16_t total_packets,
     const std::vector<bool>& received_mask) {
   std::vector<LossReport::LostPacket> lost;
-  for (uint8_t i = 0; i < total_packets; i++) {
+  for (size_t i = 0; i < total_packets; i++) {
     if (i < received_mask.size() && !received_mask[i]) {
-      lost.push_back({frame_sequence, i});
+      lost.push_back({frame_sequence, static_cast<uint16_t>(i)});
     }
   }
   return lost;
@@ -184,8 +184,7 @@ void FeedbackCollector::SendTransportFeedback() {
   for (size_t i = 0; i < record_count; i++) {
     const auto& entry = pending_entries_[i];
     records[i].frame_sequence = htons(entry.frame_sequence);
-    records[i].packet_index = entry.packet_index;
-    records[i].padding = 0;
+    records[i].packet_index = htons(entry.packet_index);
 
     int64_t delta_us = entry.arrival_time_us - epoch_us_;
     records[i].arrival_time_us = htonl(static_cast<int32_t>(delta_us));
@@ -226,8 +225,7 @@ void FeedbackCollector::SendLossReport(
 
   for (size_t i = 0; i < record_count; i++) {
     records[i].frame_sequence = htons(lost_packets[i].frame_sequence);
-    records[i].packet_index = lost_packets[i].packet_index;
-    records[i].padding = 0;
+    records[i].packet_index = htons(lost_packets[i].packet_index);
   }
 
   send_cb_(buffer.data(), buffer.size());

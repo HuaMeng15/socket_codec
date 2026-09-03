@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <thread>
 
 #include "codec/codec_factory.h"
@@ -133,7 +134,7 @@ void VideoCaptureAndSend::Run() {
 
       const int slice_count = encoder_->GetSliceCount();
       clock_.SetSliceCount(slice_count);
-      uint8_t next_packet_index = 0;
+      uint16_t next_packet_index = 0;
       bool send_ok = true;
 
       for (int slice = 0; slice < slice_count; slice++) {
@@ -164,20 +165,21 @@ void VideoCaptureAndSend::Run() {
 
         size_t fragment_packets = data_sender_->CountFramePackets(slice_data.get());
         if (fragment_packets == 0 ||
-            next_packet_index + fragment_packets > 255) {
+            static_cast<size_t>(next_packet_index) + fragment_packets >
+                std::numeric_limits<uint16_t>::max()) {
           LOG(ERROR) << "[VideoCaptureAndSend] Invalid sliced packet count";
           send_ok = false;
           break;
         }
 
         bool is_final_slice = (slice == slice_count - 1);
-        uint8_t total_packets_for_header = 0;
+        uint16_t total_packets_for_header = 0;
         if (is_final_slice) {
           total_packets_for_header =
-              static_cast<uint8_t>(next_packet_index + fragment_packets);
+              static_cast<uint16_t>(next_packet_index + fragment_packets);
         }
 
-        uint8_t packets_sent = 0;
+        uint16_t packets_sent = 0;
         int ret = data_sender_->SendFrameFragment(slice_data.get(),
                                                   next_packet_index,
                                                   total_packets_for_header,

@@ -13,12 +13,12 @@
 
 static std::vector<uint8_t> MakePacket(size_t size,
                                        uint16_t frame_seq = 1,
-                                       uint8_t pkt_idx = 0) {
+                                       uint16_t pkt_idx = 0) {
   std::vector<uint8_t> p(size, 0xAB);
   auto* h = reinterpret_cast<FramePacketHeader*>(p.data());
   h->frame_sequence = htons(frame_seq);
-  h->packet_index = pkt_idx;
-  h->total_packets = 1;
+  h->packet_index = htons(pkt_idx);
+  h->total_packets = htons(1);
   h->payload_size = htons(static_cast<uint16_t>(size - sizeof(FramePacketHeader)));
   return p;
 }
@@ -86,7 +86,7 @@ TEST(PacerTest, AverageThroughputMatchesTarget) {
   // draining early and leaving idle time in the window).
   auto pkt = MakePacket(1460, 1, 0);
   for (int i = 0; i < 300; i++) {
-    pacer.Enqueue(pkt.data(), pkt.size(), 1, static_cast<uint8_t>(i % 256));
+    pacer.Enqueue(pkt.data(), pkt.size(), 1, static_cast<uint16_t>(i));
   }
 
   auto t0 = std::chrono::steady_clock::now();
@@ -195,7 +195,7 @@ TEST(PacerTest, RecordCallbackCalledForRealPacketsNotPadding) {
 
   std::atomic<int> record_calls{0};
   pacer.SetRecordCallback(
-      [&](uint16_t, uint8_t) { record_calls++; });
+      [&](uint16_t, uint16_t) { record_calls++; });
 
   int real_count = 0;
   pacer.SetSendCallback([&](const uint8_t* data, size_t sz) {

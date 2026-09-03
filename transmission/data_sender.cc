@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
@@ -96,7 +97,7 @@ void DataSender::SetPacer(Pacer* pacer) {
   pacer_->SetSendCallback([this](const uint8_t* data, size_t size) {
     SendPacket(data, size);
   });
-  pacer_->SetRecordCallback([this](uint16_t frame_sequence, uint8_t packet_index) {
+  pacer_->SetRecordCallback([this](uint16_t frame_sequence, uint16_t packet_index) {
     if (send_time_store_) send_time_store_->Record(frame_sequence, packet_index);
   });
   pacer_->SetMaxPacketSize(max_packet_size_);
@@ -129,22 +130,23 @@ int DataSender::SendFrame(const EncodedData* encoded_data) {
     LOG(WARNING) << "[DataSender] Invalid data or size";
     return -1;
   }
-  if (total_packets_count > 255) {
+  if (total_packets_count > std::numeric_limits<uint16_t>::max()) {
     LOG(ERROR) << "[DataSender] Frame needs " << total_packets_count
-               << " packets, but header supports at most 255";
+               << " packets, but header supports at most "
+               << std::numeric_limits<uint16_t>::max();
     return -1;
   }
 
-  uint8_t packets_sent = 0;
+  uint16_t packets_sent = 0;
   return SendFrameFragment(encoded_data, 0,
-                           static_cast<uint8_t>(total_packets_count),
+                           static_cast<uint16_t>(total_packets_count),
                            &packets_sent);
 }
 
 int DataSender::SendFrameFragment(const EncodedData* encoded_data,
-                                  uint8_t first_packet_index,
-                                  uint8_t total_packets_for_header,
-                                  uint8_t* packets_sent) {
+                                  uint16_t first_packet_index,
+                                  uint16_t total_packets_for_header,
+                                  uint16_t* packets_sent) {
   if (!initialized_) {
     LOG(ERROR) << "[DataSender] Not initialized";
     return -1;
@@ -155,7 +157,8 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
     LOG(WARNING) << "[DataSender] Invalid data or size";
     return -1;
   }
-  if (first_packet_index + fragment_packet_count > 255) {
+  if (static_cast<size_t>(first_packet_index) + fragment_packet_count >
+      std::numeric_limits<uint16_t>::max()) {
     LOG(ERROR) << "[DataSender] Fragment exceeds packet-index range: first="
                << (int)first_packet_index << " count=" << fragment_packet_count;
     return -1;
@@ -181,7 +184,7 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
   std::vector<uint8_t> packet_buffer(max_packet_size_);
 
   // Send data in chunks
-  uint8_t packet_index = first_packet_index;
+  uint32_t packet_index = first_packet_index;
   for (size_t i = 0; i < encoded_data->data_ptrs.size(); i++) {
     uint8_t* data = encoded_data->data_ptrs[i];
     size_t data_size = encoded_data->data_sizes[i];
@@ -193,8 +196,8 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
       uint8_t* packet = packet_buffer.data();
       FramePacketHeader* header = reinterpret_cast<FramePacketHeader*>(packet);
       header->frame_sequence = htons(frame_sequence);
-      header->packet_index = packet_index;
-      header->total_packets = total_packets_for_header;
+      header->packet_index = htons(static_cast<uint16_t>(packet_index));
+      header->total_packets = htons(total_packets_for_header);
       header->payload_size = htons(payload_size);
 
       // Copy payload
@@ -205,7 +208,8 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
         // Hand the packet to the pacer thread, which paces it (bounded token
         // bucket), records its send-time at actual send, and may interleave
         // probe padding. Enqueue copies the bytes, so packet_buffer is reusable.
-        pacer_->Enqueue(packet, packet_size, frame_sequence, packet_index);
+        pacer_->Enqueue(packet, packet_size, frame_sequence,
+                        static_cast<uint16_t>(packet_index));
       } else {
         if (dry_run_) {
           // Unit-test mode: exercise packetization and callbacks without a
@@ -214,7 +218,8 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
         } else {
           // No pacer: send inline immediately (record send-time at send).
           if (send_time_store_) {
-            send_time_store_->Record(frame_sequence, packet_index);
+            send_time_store_->Record(frame_sequence,
+                                     static_cast<uint16_t>(packet_index));
           }
           int ret = SendPacket(packet, packet_size);
           if (ret != 0) {
@@ -240,7 +245,8 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
                << " fragment in " << (int)(packet_index - first_packet_index)
                << " packets enqueue_done_us=" << enqueue_done_us;
 
-  uint8_t sent_count = packet_index - first_packet_index;
+  uint16_t sent_count =
+      static_cast<uint16_t>(packet_index - first_packet_index);
   if (packets_sent) {
     *packets_sent = sent_count;
   }
@@ -251,7 +257,8 @@ int DataSender::SendFrameFragment(const EncodedData* encoded_data,
   return 0;
 }
 
-int DataSender::SendFeedback(uint16_t frame_sequence, uint8_t packet_index, FeedbackType feedback_type) {
+int DataSender::SendFeedback(uint16_t frame_sequence, uint16_t packet_index,
+                             FeedbackType feedback_type) {
   if (!initialized_ || socket_fd_ < 0) {
     LOG(ERROR) << "[DataSender] Not initialized";
     return -1;
@@ -264,7 +271,7 @@ int DataSender::SendFeedback(uint16_t frame_sequence, uint8_t packet_index, Feed
   std::vector<uint8_t> packet_buffer(header_size);
   FeedbackPacketHeader* header = reinterpret_cast<FeedbackPacketHeader*>(packet_buffer.data());
   header->frame_sequence = htons(frame_sequence);
-  header->packet_index = packet_index;
+  header->packet_index = htons(packet_index);
   header->feedback_type = static_cast<uint8_t>(feedback_type);
 
   int ret = SendPacket(packet_buffer.data(), header_size);

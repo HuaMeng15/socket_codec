@@ -41,9 +41,9 @@ class Pacer {
   // record_fn (optional) records a real packet's send time by identity; it is
   // NOT called for padding. Both are invoked from the pacer thread.
   using SendFn = std::function<void(const uint8_t* data, size_t size)>;
-  using RecordFn = std::function<void(uint16_t frame_sequence, uint8_t packet_index)>;
+  using RecordFn = std::function<void(uint16_t frame_sequence, uint16_t packet_index)>;
   using PacketSentFn = std::function<void(uint16_t frame_sequence,
-                                          uint8_t packet_index,
+                                          uint16_t packet_index,
                                           size_t wire_bytes)>;
 
   void SetSendCallback(SendFn fn) { send_fn_ = std::move(fn); }
@@ -67,7 +67,7 @@ class Pacer {
 
   /** Enqueue a fully-formed real packet (header already written) for paced send. */
   void Enqueue(const uint8_t* data, size_t size,
-               uint16_t frame_sequence, uint8_t packet_index);
+               uint16_t frame_sequence, uint16_t packet_index);
 
   /** Launch the drain thread. Idempotent. */
   void Start();
@@ -86,7 +86,7 @@ class Pacer {
   struct QueuedPacket {
     std::vector<uint8_t> data;
     uint16_t frame_sequence;
-    uint8_t packet_index;
+    uint16_t packet_index;
   };
 
   struct FrameSendState {
@@ -98,8 +98,8 @@ class Pacer {
   double EffectiveRateBps();  // current pace rate in bits/s (probe-aware)
   void SendPadding(size_t payload_bytes);
   bool NoteFramePacketSent(uint16_t frame_sequence,
-                           uint8_t packet_index,
-                           uint8_t total_packets,
+                           uint16_t packet_index,
+                           uint16_t total_packets,
                            int* sent_packets,
                            int* expected_packets);
 

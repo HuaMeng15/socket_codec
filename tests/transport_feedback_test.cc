@@ -25,10 +25,10 @@ TEST(TransportFeedbackTest, SerializeDeserializeRoundtrip) {
 
   auto* records = reinterpret_cast<PacketArrivalRecord*>(
       buffer.data() + sizeof(FeedbackMessageHeader));
-  // {frame_seq, packet_index, padding, arrival_time_us, recv_size, reserved2}
-  records[0] = {htons(1), 0, 0, htonl(0),  htons(1200), 0};
-  records[1] = {htons(1), 1, 0, htonl(5),  htons(800),  0};
-  records[2] = {htons(2), 0, 0, htonl(10), htons(1454), 0};
+  // {frame_seq, packet_index, arrival_time_us, recv_size, reserved2}
+  records[0] = {htons(1), htons(0),   htonl(0),  htons(1200), 0};
+  records[1] = {htons(1), htons(300), htonl(5),  htons(800),  0};
+  records[2] = {htons(2), htons(0),   htonl(10), htons(1454), 0};
 
   // Parse on sender side via FeedbackHandler
   FeedbackHandler handler;
@@ -46,7 +46,7 @@ TEST(TransportFeedbackTest, SerializeDeserializeRoundtrip) {
   EXPECT_EQ(received_fb.packets[0].packet_index, 0);
   EXPECT_EQ(received_fb.packets[0].recv_size, 1200);
   EXPECT_EQ(received_fb.packets[1].frame_sequence, 1);
-  EXPECT_EQ(received_fb.packets[1].packet_index, 1);
+  EXPECT_EQ(received_fb.packets[1].packet_index, 300);
   EXPECT_EQ(received_fb.packets[1].recv_size, 800);
   EXPECT_EQ(received_fb.packets[2].frame_sequence, 2);
   EXPECT_EQ(received_fb.packets[2].packet_index, 0);
@@ -67,8 +67,8 @@ TEST(TransportFeedbackTest, LossReportSerializeDeserialize) {
 
   auto* records = reinterpret_cast<PacketLossRecord*>(
       buffer.data() + sizeof(FeedbackMessageHeader));
-  records[0] = {htons(5), 2, 0};
-  records[1] = {htons(5), 7, 0};
+  records[0] = {htons(5), htons(2)};
+  records[1] = {htons(5), htons(300)};
 
   FeedbackHandler handler;
   handler.Initialize();
@@ -84,7 +84,7 @@ TEST(TransportFeedbackTest, LossReportSerializeDeserialize) {
   EXPECT_EQ(received_report.packets[0].frame_sequence, 5);
   EXPECT_EQ(received_report.packets[0].packet_index, 2);
   EXPECT_EQ(received_report.packets[1].frame_sequence, 5);
-  EXPECT_EQ(received_report.packets[1].packet_index, 7);
+  EXPECT_EQ(received_report.packets[1].packet_index, 300);
 }
 
 TEST(TransportFeedbackTest, CountTriggerSendsAfterInterval) {
@@ -209,7 +209,7 @@ TEST(TransportFeedbackTest, FeedbackHandlerDistinguishesMessageTypes) {
     h->record_count = htons(1);
     auto* r = reinterpret_cast<PacketArrivalRecord*>(buf.data() + sizeof(FeedbackMessageHeader));
     r->frame_sequence = htons(1);
-    r->packet_index = 0;
+    r->packet_index = htons(0);
     r->arrival_time_us = htonl(0);
     handler.HandlePacketMessage(buf.data(), buf.size());
   }
@@ -223,7 +223,7 @@ TEST(TransportFeedbackTest, FeedbackHandlerDistinguishesMessageTypes) {
     h->record_count = htons(1);
     auto* r = reinterpret_cast<PacketLossRecord*>(buf.data() + sizeof(FeedbackMessageHeader));
     r->frame_sequence = htons(2);
-    r->packet_index = 3;
+    r->packet_index = htons(3);
     handler.HandlePacketMessage(buf.data(), buf.size());
   }
 

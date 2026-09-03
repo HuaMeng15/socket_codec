@@ -249,7 +249,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   // thread inside Initialize(); these setters are safe to call while it runs.
   if (pacer_ptr) {
     pacer_ptr->SetPacketSentCallback(
-        [&gcc](uint16_t frame_sequence, uint8_t packet_index,
+        [&gcc](uint16_t frame_sequence, uint16_t packet_index,
                size_t wire_bytes) {
           gcc.OnPacketSent(frame_sequence, packet_index, wire_bytes);
         });
