@@ -6,6 +6,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,12 @@ class DataReceiver {
   ~DataReceiver();
 
   int Initialize(int listen_port);
+
+  // Receive from an already-connected socket without taking ownership.
+  int InitializeFromSocket(int socket_fd);
+
+  // Send from this receiver's bound socket to the most recently observed peer.
+  int SendToLastSender(const uint8_t* data, size_t size);
 
   void SetMessageHandler(MessageHandler* handler);
 
@@ -42,6 +49,7 @@ class DataReceiver {
                     int64_t& arrival_time_us);
 
   int socket_fd_;
+  bool owns_socket_;
   int listen_port_;
   bool initialized_;
   std::atomic<bool> stop_requested_;
@@ -52,6 +60,7 @@ class DataReceiver {
   mutable std::string last_sender_ip_;
   mutable int last_sender_port_;
   mutable bool has_sender_info_;
+  mutable std::mutex sender_info_mutex_;
 };
 
 #endif  // TRANSMISSION_DATA_RECEIVER_H

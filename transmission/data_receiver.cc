@@ -13,6 +13,7 @@
 
 DataReceiver::DataReceiver()
     : socket_fd_(-1),
+      owns_socket_(true),
       listen_port_(0),
       initialized_(false),
       stop_requested_(false),
@@ -29,6 +30,7 @@ int DataReceiver::Initialize(int listen_port) {
   }
 
   listen_port_ = listen_port;
+  owns_socket_ = true;
 
   // Create UDP socket
   socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
@@ -94,6 +96,35 @@ int DataReceiver::Initialize(int listen_port) {
 
   LOG(INFO) << "[DataReceiver] Initialized: listening on port " << listen_port_;
 
+  return 0;
+}
+
+int DataReceiver::InitializeFromSocket(int socket_fd) {
+  if (initialized_) {
+    LOG(WARNING) << "[DataReceiver] Already initialized";
+    return 0;
+  }
+  if (socket_fd < 0) {
+    LOG(ERROR) << "[DataReceiver] Invalid shared socket";
+    return -1;
+  }
+
+  socket_fd_ = socket_fd;
+  listen_port_ = 0;
+  owns_socket_ = false;
+
+  int flags = fcntl(socket_fd_, F_GETFL, 0);
+  if (flags < 0 || fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+    LOG(ERROR) << "[DataReceiver] Failed to configure shared socket: "
+               << strerror(errno);
+    socket_fd_ = -1;
+    return -1;
+  }
+
+  initialized_ = true;
+  stop_requested_ = false;
+  message_handler_ = nullptr;
+  LOG(INFO) << "[DataReceiver] Initialized on shared connected media socket";
   return 0;
 }
 
@@ -231,6 +262,7 @@ int DataReceiver::ReceivePacket(uint8_t* buffer, size_t buffer_size,
   // Store sender information for feedback
   char ip_str[INET_ADDRSTRLEN];
   if (inet_ntop(AF_INET, &sender_addr.sin_addr, ip_str, INET_ADDRSTRLEN) != nullptr) {
+    std::lock_guard<std::mutex> lock(sender_info_mutex_);
     last_sender_ip_ = std::string(ip_str);
     last_sender_port_ = ntohs(sender_addr.sin_port);
     has_sender_info_ = true;
@@ -252,10 +284,10 @@ bool DataReceiver::IsStopped() const { return stop_requested_.load(); }
 void DataReceiver::Close() {
   Stop();
 
-  if (socket_fd_ >= 0) {
+  if (socket_fd_ >= 0 && owns_socket_) {
     close(socket_fd_);
-    socket_fd_ = -1;
   }
+  socket_fd_ = -1;
 
   initialized_ = false;
 }
@@ -264,10 +296,40 @@ bool DataReceiver::IsInitialized() const { return initialized_; }
 
 bool DataReceiver::GetLastSenderInfo(std::string& sender_ip,
                                         int& sender_port) const {
+  std::lock_guard<std::mutex> lock(sender_info_mutex_);
   if (!has_sender_info_) {
     return false;
   }
   sender_ip = last_sender_ip_;
   sender_port = last_sender_port_;
   return true;
+}
+
+int DataReceiver::SendToLastSender(const uint8_t* data, size_t size) {
+  if (socket_fd_ < 0 || !data || size == 0) {
+    return -1;
+  }
+
+  std::string sender_ip;
+  int sender_port = 0;
+  if (!GetLastSenderInfo(sender_ip, sender_port)) {
+    return -1;
+  }
+
+  struct sockaddr_in sender_addr;
+  memset(&sender_addr, 0, sizeof(sender_addr));
+  sender_addr.sin_family = AF_INET;
+  sender_addr.sin_port = htons(sender_port);
+  if (inet_pton(AF_INET, sender_ip.c_str(), &sender_addr.sin_addr) != 1) {
+    return -1;
+  }
+  ssize_t sent = sendto(socket_fd_, data, size, 0,
+                        reinterpret_cast<struct sockaddr*>(&sender_addr),
+                        sizeof(sender_addr));
+  if (sent < 0 || static_cast<size_t>(sent) != size) {
+    LOG(ERROR) << "[DataReceiver] Failed to send muxed feedback: "
+               << strerror(errno);
+    return -1;
+  }
+  return 0;
 }

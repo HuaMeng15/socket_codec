@@ -31,7 +31,8 @@ class VideoCaptureAndSend {
                   int fps,
                   int frames_to_encode,
                   CodecType codec_type,
-                  EncoderRateControlMode rate_control_mode);
+                  EncoderRateControlMode rate_control_mode,
+                  const std::string& bind_interface = "");
 
   // Run the capture and send loop (single thread)
   void Run();

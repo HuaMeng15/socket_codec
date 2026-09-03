@@ -24,7 +24,8 @@ class ReceivedFrameDataHandler : public MessageHandler {
  public:
   ReceivedFrameDataHandler(CodecType codec_type, int width, int height,
                             DataReceiver* data_receiver,
-                            int feedback_port, const std::string& output_file = "");
+                            int feedback_port, const std::string& output_file = "",
+                            bool feedback_mux = false);
   ~ReceivedFrameDataHandler();
 
   int HandlePacketMessage(const uint8_t* packet_data,
@@ -74,6 +75,7 @@ class ReceivedFrameDataHandler : public MessageHandler {
   FeedbackCollector feedback_collector_;
   int feedback_port_;
   bool feedback_sender_initialized_;
+  bool feedback_mux_;
   bool initialized_;
 
   // Frame assembly map: frame_sequence -> FrameAssembly

@@ -27,6 +27,11 @@ class DataSender {
 
   int Initialize(const std::string& dest_ip, int dest_port, size_t max_packet_size = kDefaultMaxPacketSize);
 
+  // Must be called before Initialize(). An empty value uses normal routing.
+  void SetBindInterface(const std::string& interface_name) {
+    bind_interface_ = interface_name;
+  }
+
   // Test-only: initialize packetization and callbacks without opening a socket.
   // SendFrame/SendFrameFragment will exercise the same framing logic but skip
   // the actual transport send.
@@ -58,6 +63,9 @@ class DataSender {
 
   bool IsInitialized() const;
 
+  // The connected media socket may also carry feedback when feedback_mux=1.
+  int GetSocketFd() const { return socket_fd_; }
+
   /** Optional: set to record send time for each (frame, packet) for latency stats. */
   void SetSendTimeStore(PacketSendTimeStore* store) { send_time_store_ = store; }
   /** Optional: set to pace packet sends (spread over time by bitrate). Wires
@@ -75,6 +83,7 @@ class DataSender {
 
   int socket_fd_;
   std::string dest_ip_;
+  std::string bind_interface_;
   int dest_port_;
   size_t max_packet_size_;
   bool initialized_;

@@ -27,7 +27,8 @@ int VideoCaptureAndSend::Initialize(const std::string& input_file,
                                      int fps,
                                      int frames_to_encode,
                                      CodecType codec_type,
-                                     EncoderRateControlMode rate_control_mode) {
+                                     EncoderRateControlMode rate_control_mode,
+                                     const std::string& bind_interface) {
   if (initialized_) {
     LOG(WARNING) << "[VideoCaptureAndSend] Already initialized";
     return 0;
@@ -35,6 +36,7 @@ int VideoCaptureAndSend::Initialize(const std::string& input_file,
 
   pacer_ = std::make_unique<Pacer>();
   data_sender_ = std::make_unique<DataSender>();
+  data_sender_->SetBindInterface(bind_interface);
   if (0 != data_sender_->Initialize(dest_ip, dest_port)) {
     LOG(ERROR) << "[VideoCaptureAndSend] Failed to initialize data sender";
     return -1;

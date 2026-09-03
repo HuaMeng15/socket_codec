@@ -24,18 +24,24 @@ BandwidthProber::BandwidthProber()
       last_startup_probe_ms_(0),
       current_probe_type_(ProbeType::kSeed),
       application_limited_(false),
+      alr_probing_enabled_(true),
       periodic_probing_allowed_(true),
       application_limited_since_ms_(-1),
       last_alr_probe_ms_(0),
+      unconditional_periodic_probe_interval_ms_(0),
+      last_unconditional_periodic_opportunity_ms_(0),
       probe_target_kbps_(0),
       next_cluster_id_(0),
       probe_start_ms_(0),
       last_overuse_time_ms_(0),
+      last_probe_time_ms_(0),
       fake_clock_ms_(nullptr) {
   int64_t now = NowMs();
   last_alr_probe_ms_ = now;
+  last_unconditional_periodic_opportunity_ms_ = now;
   probe_start_ms_ = now;
   last_overuse_time_ms_ = now;
+  last_probe_time_ms_ = now - kMinTimeBetweenProbesMs;
 }
 
 void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
@@ -43,9 +49,11 @@ void BandwidthProber::SetClockForTesting(int64_t* clock_ms) {
   if (clock_ms) {
     int64_t now = *clock_ms;
     last_alr_probe_ms_ = now;
+    last_unconditional_periodic_opportunity_ms_ = now;
     last_startup_probe_ms_ = now;
     probe_start_ms_ = now;
     last_overuse_time_ms_ = now - 2000;  // allow probing immediately in tests
+    last_probe_time_ms_ = now - kMinTimeBetweenProbesMs;
   }
 }
 
@@ -126,8 +134,13 @@ void BandwidthProber::OnProbeResult(int estimated_kbps, bool success) {
       return;
     }
 
-    if (current_probe_type_ == ProbeType::kPeriodic) {
-      LOG(INFO) << "[Prober] Periodic probe completed at one-step target="
+    if (current_probe_type_ == ProbeType::kAlr ||
+        current_probe_type_ == ProbeType::kPeriodic) {
+      const char* kind = current_probe_type_ == ProbeType::kAlr
+                             ? "ALR"
+                             : "scheduled";
+      LOG(INFO) << "[Prober] " << kind
+                << " periodic probe completed at one-step target="
                 << probe_target_kbps_ << " kbps measured=" << estimated_kbps
                 << " kbps";
     }
@@ -177,10 +190,36 @@ void BandwidthProber::SetApplicationLimited(bool limited) {
   application_limited_since_ms_ = limited ? NowMs() : -1;
 }
 
+void BandwidthProber::SetAlrProbingEnabled(bool enabled) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  alr_probing_enabled_ = enabled;
+  if (!enabled && current_probe_type_ == ProbeType::kAlr &&
+      state_ != State::kIdle) {
+    LOG(INFO) << "[Prober] ALR probing disabled, cancelling active ALR probe";
+    state_ = State::kIdle;
+    pending_probes_.clear();
+  }
+}
+
+void BandwidthProber::SetUnconditionalPeriodicProbeIntervalMs(
+    int interval_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  unconditional_periodic_probe_interval_ms_ = std::max(0, interval_ms);
+  last_unconditional_periodic_opportunity_ms_ = NowMs();
+  if (unconditional_periodic_probe_interval_ms_ == 0 &&
+      current_probe_type_ == ProbeType::kPeriodic && state_ != State::kIdle) {
+    LOG(INFO) << "[Prober] Scheduled periodic probing disabled, cancelling probe";
+    state_ = State::kIdle;
+    pending_probes_.clear();
+  }
+}
+
 void BandwidthProber::SetPeriodicProbingAllowed(bool allowed) {
   std::lock_guard<std::mutex> lock(mutex_);
   periodic_probing_allowed_ = allowed;
-  if (!allowed && current_probe_type_ == ProbeType::kPeriodic &&
+  if (!allowed &&
+      (current_probe_type_ == ProbeType::kAlr ||
+       current_probe_type_ == ProbeType::kPeriodic) &&
       state_ != State::kIdle) {
     LOG(INFO) << "[Prober] Network state became unhealthy during periodic "
                  "probe, cancelling";
@@ -209,7 +248,8 @@ std::vector<BandwidthProber::ProbeCluster> BandwidthProber::GetPendingProbes() {
 void BandwidthProber::MaybeInitiateProbe() {
   int64_t now = NowMs();
 
-  if (now - last_overuse_time_ms_ < kMinTimeBetweenProbesMs) {
+  if (now - last_overuse_time_ms_ < kMinTimeBetweenProbesMs ||
+      now - last_probe_time_ms_ < kMinTimeBetweenProbesMs) {
     return;
   }
 
@@ -235,7 +275,24 @@ void BandwidthProber::MaybeInitiateProbe() {
     }
   }
 
-  // 3. ALR periodic probing. WebRTC fires a periodic probe every
+  // 3. Optional non-ALR periodic discovery. This schedule is independent of
+  // ALR and has priority whenever its 30-second-style opportunity is due.
+  // Each opportunity is consumed even when GCC's health gate is closed, so a
+  // congestion episode cannot cause an overdue probe to fire on recovery.
+  if (unconditional_periodic_probe_interval_ms_ > 0 &&
+      now - last_unconditional_periodic_opportunity_ms_ >=
+          unconditional_periodic_probe_interval_ms_) {
+    last_unconditional_periodic_opportunity_ms_ = now;
+    if (periodic_probing_allowed_) {
+      InitiatePeriodicProbe();
+    } else {
+      LOG(INFO) << "[Prober] Scheduled periodic probe skipped: network "
+                   "health gate is closed";
+    }
+    return;
+  }
+
+  // 4. ALR periodic probing. WebRTC fires a periodic probe every
   //    kAlrProbeIntervalMs ONLY while the sender is application-limited — the
   //    encoder is producing below the estimate, so AIMD can't grow the estimate
   //    (nothing is pushing on the pipe) and a probe is the only way to discover
@@ -244,7 +301,8 @@ void BandwidthProber::MaybeInitiateProbe() {
   //    The application_limited_ flag is driven by the real AlrDetector
   //    (bytes-sent vs. target), so a greedy encoder never trips it — exactly
   //    like WebRTC.
-  if (periodic_probing_allowed_ && application_limited_ &&
+  if (alr_probing_enabled_ && periodic_probing_allowed_ &&
+      application_limited_ &&
       application_limited_since_ms_ >= 0) {
     if (now - application_limited_since_ms_ >= kAlrQualificationMs &&
         now - last_alr_probe_ms_ >= kAlrProbeIntervalMs) {
@@ -252,6 +310,7 @@ void BandwidthProber::MaybeInitiateProbe() {
       return;
     }
   }
+
 }
 
 void BandwidthProber::InitiateExponentialProbe() {
@@ -283,6 +342,7 @@ void BandwidthProber::InitiateExponentialProbe() {
   current_probe_type_ = ProbeType::kSeed;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
+  last_probe_time_ms_ = probe_start_ms_;
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
   // Start the startup-stage settle clock from the last seed, so the first
   // accelerator probe waits one settle interval after the seed commits.
@@ -309,6 +369,7 @@ void BandwidthProber::InitiateStartupProbe() {
   current_probe_type_ = ProbeType::kStartup;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
+  last_probe_time_ms_ = probe_start_ms_;
   last_startup_probe_ms_ = probe_start_ms_;
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
 
@@ -325,13 +386,35 @@ void BandwidthProber::InitiateAlrProbe() {
     return;
   }
 
-  current_probe_type_ = ProbeType::kPeriodic;
+  current_probe_type_ = ProbeType::kAlr;
   state_ = State::kProbing;
   probe_start_ms_ = NowMs();
+  last_probe_time_ms_ = probe_start_ms_;
   last_alr_probe_ms_ = probe_start_ms_;
   pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
 
   LOG(INFO) << "[Prober] ALR probe at " << probe_target_kbps_
+            << " kbps (est=" << estimated_bitrate_kbps_ << ")";
+}
+
+void BandwidthProber::InitiatePeriodicProbe() {
+  probe_target_kbps_ = CapProbeTarget(std::min(
+      static_cast<int>(estimated_bitrate_kbps_ * kAlrProbeMultiplier),
+      max_bitrate_kbps_));
+
+  if (probe_target_kbps_ <= estimated_bitrate_kbps_) {
+    LOG(INFO) << "[Prober] Scheduled periodic probe skipped: no bitrate "
+                 "headroom";
+    return;
+  }
+
+  current_probe_type_ = ProbeType::kPeriodic;
+  state_ = State::kProbing;
+  probe_start_ms_ = NowMs();
+  last_probe_time_ms_ = probe_start_ms_;
+  pending_probes_.push_back({probe_target_kbps_, next_cluster_id_++});
+
+  LOG(INFO) << "[Prober] Scheduled periodic probe at " << probe_target_kbps_
             << " kbps (est=" << estimated_bitrate_kbps_ << ")";
 }
 

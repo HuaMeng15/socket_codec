@@ -10,6 +10,14 @@ void InitializeFlags() {
   auto& parser = CmdLineParser::GetInstance();
 
   parser.AddStringFlag("ip", "10.0.0.4", "receiver IP address");
+  parser.AddStringFlag(
+      "bind_interface", "",
+      "optional sender network interface (for example wlo1); on Linux, "
+      "SO_BINDTODEVICE forces media packets onto this interface");
+  parser.AddIntFlag(
+      "feedback_mux", 0,
+      "1 sends and receives transport feedback on the media UDP socket; "
+      "useful across NAT, 0 keeps the legacy port+1 feedback socket");
   parser.AddIntFlag("port", 8888, "receiver port");
   parser.AddStringFlag(
       "file", "NONE",
@@ -35,6 +43,10 @@ void InitializeFlags() {
       "periodic_alr_probing", -1,
       "periodic ALR probe policy: -1=experiment default, 0=disabled, "
       "1=enabled; startup probing is unaffected");
+  parser.AddIntFlag(
+      "periodic_probe_interval_ms", 0,
+      "interval for congestion-aware probes outside ALR; 0 disables, "
+      "30000 probes at most once every 30 seconds when network state is healthy");
 
   // Network simulator flags (sender-side, 0 = disabled)
   parser.AddIntFlag("sim_bandwidth_kbps", 0,

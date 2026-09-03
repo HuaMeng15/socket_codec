@@ -16,13 +16,15 @@ ReceivedFrameDataHandler::ReceivedFrameDataHandler(CodecType codec_type,
                                          int height,
                                          DataReceiver* data_receiver,
                                          int feedback_port,
-                                         const std::string& output_file)
+                                         const std::string& output_file,
+                                         bool feedback_mux)
     : codec_type_(codec_type),
       width_(width),
       height_(height),
       data_receiver_(data_receiver),
       feedback_port_(feedback_port),
       feedback_sender_initialized_(false),
+      feedback_mux_(feedback_mux),
       initialized_(false),
       last_completed_frame_(0),
       output_file_(output_file) {
@@ -292,7 +294,14 @@ void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence,
                                             int64_t arrival_time_us) {
   // Try to initialize feedback sender if not already initialized
   if (!feedback_sender_initialized_) {
-    if (InitializeFeedbackSender()) {
+    if (feedback_mux_ && data_receiver_) {
+      feedback_sender_initialized_ = true;
+      feedback_collector_.SetSendCallback(
+          [this](const uint8_t* data, size_t size) {
+            data_receiver_->SendToLastSender(data, size);
+          });
+      LOG(INFO) << "[ReceivedFrameDataHandler] Feedback mux enabled on media socket";
+    } else if (InitializeFeedbackSender()) {
       feedback_sender_initialized_ = true;
       // Wire the collector to send via the feedback sender (TWCC-style)
       feedback_collector_.SetSendCallback(
@@ -306,7 +315,7 @@ void ReceivedFrameDataHandler::SendFeedback(uint16_t frame_sequence,
     }
   }
 
-  if (!feedback_sender_.IsInitialized()) {
+  if (!feedback_mux_ && !feedback_sender_.IsInitialized()) {
     LOG(WARNING) << "[ReceivedFrameDataHandler] Feedback sender not initialized";
     return;
   }

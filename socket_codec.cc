@@ -104,6 +104,8 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   /* Read Configurations */
   std::string input_video_file =
       parser.GetFlag<std::string>("input_video_file");
+  std::string bind_interface =
+      parser.GetFlag<std::string>("bind_interface");
   std::string output_video_file =
       parser.GetFlag<std::string>("output_video_file");
   int width = parser.GetFlag<int>("width");
@@ -128,10 +130,17 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   if (periodic_alr_override >= 0) {
     experiment.periodic_alr_probing = periodic_alr_override == 1;
   }
+  int periodic_probe_interval_ms =
+      parser.GetFlag<int>("periodic_probe_interval_ms");
+  if (periodic_probe_interval_ms < 0) {
+    LOG(ERROR) << "[socket_codec_main] periodic_probe_interval_ms must be >= 0";
+    return -1;
+  }
   CodecType codec_type = experiment.codec_type;
   LOG(INFO) << "[socket_codec_main] Experiment mode=" << experiment.name
             << " requested_codec=" << codec_name
-            << " periodic_alr_probing=" << experiment.periodic_alr_probing;
+            << " periodic_alr_probing=" << experiment.periodic_alr_probing
+            << " periodic_probe_interval_ms=" << periodic_probe_interval_ms;
 
   if (width <= 0 || height <= 0 || width > 7680 || height > 4320) {
     LOG(ERROR) << "[socket_codec_main] Invalid width/height: " << width << "x" << height;
@@ -208,7 +217,8 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
                                              fps,
                                              framesToBeEncoded,
                                              codec_type,
-                                             experiment.encoder_rate_control)) {
+                                             experiment.encoder_rate_control,
+                                             bind_interface)) {
     LOG(ERROR) << "[socket_codec_main] Failed to initialize video capture and send";
     return -1;
   }
@@ -225,6 +235,7 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
   // Set up GCC congestion controller
   GccController gcc;
   gcc.SetPeriodicAlrProbingEnabled(experiment.periodic_alr_probing);
+  gcc.SetUnconditionalPeriodicProbeIntervalMs(periodic_probe_interval_ms);
   int cc_initial = parser.GetFlag<int>("cc_initial_bitrate_kbps");
   int cc_min = parser.GetFlag<int>("cc_min_bitrate_kbps");
   int cc_max = parser.GetFlag<int>("cc_max_bitrate_kbps");
@@ -303,8 +314,13 @@ int sender_create_and_run(CmdLineParser& parser, const std::string& dest_ip, int
       });
 
   int feedback_port = dest_port + 1;
+  bool feedback_mux = parser.GetFlag<int>("feedback_mux") != 0;
   DataReceiver feedback_receiver;
-  if (0 != feedback_receiver.Initialize(feedback_port)) {
+  int feedback_init = feedback_mux
+                          ? feedback_receiver.InitializeFromSocket(
+                                video_capture_and_send.GetDataSender()->GetSocketFd())
+                          : feedback_receiver.Initialize(feedback_port);
+  if (feedback_init != 0) {
     LOG(ERROR) << "[socket_codec_main] Failed to initialize feedback receiver";
     return -1;
   }
@@ -365,8 +381,10 @@ int receiver_create_and_run(CmdLineParser& parser, int dest_port, const std::str
   // Feedback will be sent to sender on dest_port + 1
   // Decoder will be created inside the handler
   int feedback_port = dest_port + 1;
+  bool feedback_mux = parser.GetFlag<int>("feedback_mux") != 0;
   ReceivedFrameDataHandler received_frame_data_handler(codec_type, width, height,
-                                            &data_receiver, feedback_port, filename);
+                                            &data_receiver, feedback_port, filename,
+                                            feedback_mux);
   if (0 != received_frame_data_handler.Initialize()) {
     LOG(ERROR) << "[socket_codec_main] Failed to initialize received frame data handler";
     return -1;

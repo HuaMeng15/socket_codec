@@ -20,6 +20,10 @@
  *    the estimated capacity (application-limited), periodically probe
  *    to re-discover bandwidth (every kAlrProbeIntervalMs).
  *
+ * 3. Optional congestion-aware periodic probing: at a caller-configured
+ *    interval, probe even outside ALR, but only when GCC's delay, loss, byte
+ *    delivery, and congestion-window signals all report a healthy network.
+ *
  * There is deliberately NO probe-on-bitrate-drop path. WebRTC's only
  * drop-recovery probe (ProbeController::RequestProbe) is gated on being in ALR
  * (in_alr || alr_ended_recently) — a drop while the pipe was full is treated as
@@ -47,8 +51,9 @@ class BandwidthProber {
   //              link (e.g. 10 Mbps) converges in a few seconds instead of the
   //              ~16s AIMD crawl. Does not chain; the cadence is driven by the
   //              settle timer in MaybeInitiateProbe.
-  //   kPeriodic — conservative, one-step ALR discovery probe.
-  enum class ProbeType { kSeed, kStartup, kPeriodic };
+  //   kAlr      — conservative, one-step ALR discovery probe.
+  //   kPeriodic — conservative, one-step scheduled healthy-network probe.
+  enum class ProbeType { kSeed, kStartup, kAlr, kPeriodic };
 
   struct ProbeCluster {
     int target_bitrate_kbps;
@@ -93,6 +98,15 @@ class BandwidthProber {
    */
   void SetApplicationLimited(bool limited);
 
+  /** Enable or disable the ordinary WebRTC-style periodic ALR probes. */
+  void SetAlrProbingEnabled(bool enabled);
+
+  /**
+   * Configure an optional non-ALR periodic probe interval. A value <= 0
+   * disables it. The network-health gate still applies to every opportunity.
+   */
+  void SetUnconditionalPeriodicProbeIntervalMs(int interval_ms);
+
   /**
    * Allow periodic ALR discovery only while the controller's measured network
    * state is healthy (no congestion-window pushback or growing queue). This
@@ -115,6 +129,7 @@ class BandwidthProber {
   void InitiateExponentialProbe();
   void InitiateStartupProbe();
   void InitiateAlrProbe();
+  void InitiatePeriodicProbe();
   // Cap a probe target to a conservative increase over the current measured
   // capacity line. Startup probing has its own unchanged policy; this cap is
   // used only by periodic ALR discovery.
@@ -159,11 +174,12 @@ class BandwidthProber {
 
   // ALR periodic probing. Fires only while application-limited (the encoder is
   // sending below the estimate), driven by the real AlrDetector. This is the
-  // sole periodic probe mechanism — WebRTC-faithful: a greedy encoder that
-  // fills the pipe is never in ALR, so no periodic probe fires and AIMD alone
-  // tracks capacity; a variable/VBR encoder goes app-limited on simple content
-  // and gets a probe to keep the estimate warm for the next scene change.
+  // WebRTC-style source-limited probe mechanism: a greedy encoder that fills
+  // the pipe is never in ALR, while a variable/VBR encoder goes app-limited on
+  // simple content and gets a probe to keep the estimate warm. The optional
+  // scheduled mechanism below is separate and explicitly configured.
   bool application_limited_;
+  bool alr_probing_enabled_;
   bool periodic_probing_allowed_;
   int64_t application_limited_since_ms_;
   int64_t last_alr_probe_ms_;
@@ -174,6 +190,12 @@ class BandwidthProber {
   static constexpr int kAlrQualificationMs = 500;
   static constexpr double kAlrProbeMultiplier = 1.25;
 
+  // Optional non-ALR periodic probing. The schedule is based on opportunities,
+  // not successful probes: an unhealthy opportunity is skipped and the next
+  // check occurs after another full interval.
+  int unconditional_periodic_probe_interval_ms_;
+  int64_t last_unconditional_periodic_opportunity_ms_;
+
   // Current probe state
   int probe_target_kbps_;
   int next_cluster_id_;
@@ -183,6 +205,7 @@ class BandwidthProber {
 
   // Timing
   int64_t last_overuse_time_ms_;
+  int64_t last_probe_time_ms_;
   static constexpr int kMinTimeBetweenProbesMs = 1000;
 
   // Fake clock for testing

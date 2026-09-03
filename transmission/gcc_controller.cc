@@ -84,9 +84,18 @@ void GccController::SetCongestionWindowConfig(int queue_size_ms,
 void GccController::SetPeriodicAlrProbingEnabled(bool enabled) {
   std::lock_guard<std::mutex> lock(mutex_);
   periodic_alr_probing_enabled_ = enabled;
-  prober_.SetPeriodicProbingAllowed(enabled);
+  prober_.SetAlrProbingEnabled(enabled);
   LOG(INFO) << "[GCC] Periodic ALR probing "
             << (enabled ? "enabled" : "disabled");
+}
+
+void GccController::SetUnconditionalPeriodicProbeIntervalMs(int interval_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  unconditional_periodic_probe_interval_ms_ = std::max(0, interval_ms);
+  prober_.SetUnconditionalPeriodicProbeIntervalMs(
+      unconditional_periodic_probe_interval_ms_);
+  LOG(INFO) << "[GCC] Congestion-aware periodic probing interval="
+            << unconditional_periodic_probe_interval_ms_ << " ms";
 }
 
 void GccController::SetBitrateRange(int min_kbps, int max_kbps) {
@@ -151,6 +160,8 @@ void GccController::EnableAckedEstimatorForTesting() {
   acked_window_.clear();
   acked_window_bytes_ = 0;
   instant_acked_sample_valid_ = false;
+  instant_sent_bitrate_kbps_ = 0.0;
+  instant_delivery_ratio_ = 1.0;
 }
 
 double GccController::GetNetworkUsageState() const {
@@ -252,7 +263,8 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   // post-drop drain. Periodic probing remains guarded by delay/cwnd state below
   // because it is optional recovery, not initial capacity discovery.
   bool confirmed_probe_congestion =
-      byte_delivery_overuse_ || pushback_ratio_ < 0.999;
+      byte_delivery_overuse_ || congestion_episode_active_ ||
+      pushback_ratio_ < 0.999;
 
   // Periodic probing is more conservative than startup: ALR is necessary but
   // not sufficient. Do not start (or continue) a periodic probe while cwnd
@@ -262,11 +274,18 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
   bool cwnd_healthy = pushback_ratio_ >= 0.999 &&
       (current_data_window_bytes_ <= 0 ||
        outstanding_bytes_ <= current_data_window_bytes_);
-  bool periodic_probe_healthy = cwnd_healthy &&
-      usage != BandwidthUsage::kOveruse &&
-      accumulated_delay_ < kProbeAbortDelayMs;
-  prober_.SetPeriodicProbingAllowed(
-      periodic_alr_probing_enabled_ && periodic_probe_healthy);
+  // accumulated_delay_ is an integrated variation signal, not an absolute
+  // queue measurement. It can retain a positive offset after a transient even
+  // when RTT is low, no bytes are outstanding, and the trend is falling. Treat
+  // that history as unsafe only while it is both elevated and still growing;
+  // otherwise the live loss/byte/cwnd checks below decide congestion health.
+  bool delay_healthy = usage != BandwidthUsage::kOveruse &&
+      (accumulated_delay_ < kProbeAbortDelayMs || prev_trend_ <= 0.0);
+  bool periodic_probe_healthy = cwnd_healthy && delay_healthy &&
+      !byte_delivery_overuse_ && !congestion_episode_active_ &&
+      last_loss_fraction_ < kLossIncreaseThreshold &&
+      now_ms - last_overuse_time_ms_ >= kPeriodicProbeCongestionCooldownMs;
+  prober_.SetPeriodicProbingAllowed(periodic_probe_healthy);
 
   // Feed confirmed signals to the probe controller. Underuse remains useful
   // for state bookkeeping, although it does not itself arm a probe.
@@ -439,14 +458,14 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
             << " pushback_ratio=" << pushback_ratio_
             << " received_rate_kbps=" << last_received_rate_kbps_
             << " sent_rate_kbps=" << sent_rate_kbps_
-            << " delivery_ratio="
-            << (sent_rate_kbps_ > 0.0 && delay_based_bitrate_kbps_ > 0
-                    ? acked_bitrate_kbps_ /
-                          std::min(sent_rate_kbps_,
-                                   static_cast<double>(delay_based_bitrate_kbps_))
-                    : 0.0)
+            << " aligned_sent_kbps=" << aligned_sent_bitrate_kbps_
+            << " delivery_ratio=" << aligned_delivery_ratio_
             << " byte_overuse=" << (byte_delivery_overuse_ ? 1 : 0)
+            << " congestion_episode="
+            << (congestion_episode_active_ ? 1 : 0)
             << " instant_acked=" << (use_instant_acked_ ? 1 : 0)
+            << " delay_probe_healthy=" << (delay_healthy ? 1 : 0)
+            << " periodic_probe_healthy=" << (periodic_probe_healthy ? 1 : 0)
             << " probing=" << (is_probing ? 1 : 0);
 }
 
@@ -581,11 +600,6 @@ void GccController::ExpireStaleInflightPackets(int64_t now_ms) {
 GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
     BandwidthUsage delay_usage, int64_t now_ms) {
   byte_delivery_overuse_ = false;
-  if (delay_usage == BandwidthUsage::kOveruse) {
-    low_delivery_start_ms_ = -1;
-    return delay_usage;
-  }
-
   int64_t sent_span_ms = sent_rate_window_.size() >= 2
       ? now_ms - sent_rate_window_.front().time_ms
       : 0;
@@ -595,41 +609,90 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
   bool estimator_ready = !acked_frozen_for_testing_ &&
                          sent_span_ms >= kByteEstimatorMinSpanMs &&
                          acked_span_us >= kByteEstimatorMinSpanMs * 1000 &&
-                         sent_rate_kbps_ > 0.0 && acked_bitrate_kbps_ > 0.0;
+                         aligned_sent_bitrate_kbps_ > 0.0 &&
+                         acked_bitrate_kbps_ > 0.0;
   bool sender_saturated =
       sent_rate_kbps_ >= kSenderUtilizationThreshold *
                              delay_based_bitrate_kbps_;
-  // Compare against the lesser of actual send rate and the controller target.
-  // This still uses real sent bytes to prove the application is filling the
-  // pipe, but a short pacer/probe burst above target cannot create a false
-  // shortfall merely because receive feedback lags it by one RTT.
+  // Compare rates over the same acknowledged packet cohort. This avoids
+  // judging a frame burst in one source window against a different receiver
+  // window. Cap at the controller target so a short probe/pacer burst above
+  // the estimate cannot create a shortage by itself.
   double delivery_reference_kbps =
-      std::min(sent_rate_kbps_, static_cast<double>(delay_based_bitrate_kbps_));
+      std::min(aligned_sent_bitrate_kbps_,
+               static_cast<double>(delay_based_bitrate_kbps_));
   double delivery_ratio = estimator_ready && delivery_reference_kbps > 0.0
       ? acked_bitrate_kbps_ / delivery_reference_kbps
       : 1.0;
-  // Fast capacity-cliff path. The normal detector deliberately waits 100ms to
+  aligned_delivery_ratio_ = delivery_ratio;
+
+  // A congestion episode owns at most one permanent AIMD decrease. While its
+  // backlog remains, congestion-window pushback can still lower the effective
+  // send target. Rearm only after delivery, delay, loss, and outstanding data
+  // have all remained healthy for a continuous hysteresis interval.
+  if (congestion_episode_active_) {
+    bool cwnd_recovered = pushback_ratio_ >= 0.999 &&
+        (current_data_window_bytes_ <= 0 ||
+         outstanding_bytes_ * 2 <= current_data_window_bytes_);
+    bool delivery_recovered =
+        (estimator_ready &&
+         delivery_ratio >= kByteDeliveryRecoveryRatio) ||
+        (acked_frozen_for_testing_ && acked_bitrate_kbps_ >=
+             kByteDeliveryRecoveryRatio * delay_based_bitrate_kbps_);
+    bool recovery_healthy = delivery_recovered &&
+        delay_usage != BandwidthUsage::kOveruse && cwnd_recovered &&
+        last_loss_fraction_ < kLossIncreaseThreshold;
+    if (recovery_healthy) {
+      if (congestion_recovery_start_ms_ < 0) {
+        congestion_recovery_start_ms_ = now_ms;
+      } else if (now_ms - congestion_recovery_start_ms_ >=
+                 kCongestionRecoverySpanMs) {
+        congestion_episode_active_ = false;
+        congestion_recovery_start_ms_ = -1;
+        severe_capacity_cliff_active_ = false;
+        low_delivery_start_ms_ = -1;
+        LOG(INFO) << "[GCC] Congestion episode recovered; byte-delivery "
+                     "detector rearmed";
+      }
+    } else {
+      congestion_recovery_start_ms_ = -1;
+    }
+    if (congestion_episode_active_) {
+      low_delivery_start_ms_ = -1;
+      return delay_usage;
+    }
+    // Do not begin a fresh episode on the same feedback that completed
+    // recovery; the next feedback starts with a clean measurement history.
+    return delay_usage;
+  }
+
+  if (delay_usage == BandwidthUsage::kOveruse) {
+    low_delivery_start_ms_ = -1;
+    return delay_usage;
+  }
+
+  // Fast capacity-cliff path. The normal detector deliberately waits 200ms to
   // reject short pacing/ACK-rate mismatches. At a large bandwidth collapse,
   // however, the first completed trendline group already contains decisive
   // evidence. Waiting for a second 5ms send-time group can cost ~84ms at a
   // 1Mbps bottleneck because that group's packets must serialize first.
   bool severe_capacity_cliff =
-      estimator_ready &&
-      delivery_ratio < kSevereDeliveryRatioThreshold &&
+      sent_span_ms >= 50 && sent_rate_kbps_ > 0.0 &&
+      instant_acked_sample_valid_ && instant_sent_bitrate_kbps_ > 0.0 &&
+      instant_delivery_ratio_ < kSevereDeliveryRatioThreshold &&
       last_modified_trend_ > adaptive_threshold_ &&
       accumulated_delay_ >= kSevereQueueGrowthMs;
   if (severe_capacity_cliff && !severe_capacity_cliff_active_) {
     severe_capacity_cliff_active_ = true;
-    // Start the ordinary detector's cooldown here. If the mismatch persists,
-    // it may request another controlled decrease after its normal 100ms span.
-    low_delivery_start_ms_ = now_ms;
+    low_delivery_start_ms_ = -1;
     byte_delivery_overuse_ = true;
     last_bandwidth_usage_ = BandwidthUsage::kOveruse;
     LOG(INFO) << "[GCC] Severe capacity cliff: delivered="
               << static_cast<int>(acked_bitrate_kbps_) << " kbps sent="
               << static_cast<int>(sent_rate_kbps_) << " kbps reference="
-              << static_cast<int>(delivery_reference_kbps) << " kbps ratio="
-              << delivery_ratio << " accumulated_delay_ms="
+              << static_cast<int>(instant_sent_bitrate_kbps_)
+              << " kbps ratio=" << instant_delivery_ratio_
+              << " accumulated_delay_ms="
               << accumulated_delay_ << " modified_trend="
               << last_modified_trend_ << " threshold=" << adaptive_threshold_;
     return BandwidthUsage::kOveruse;
@@ -658,9 +721,9 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
     return delay_usage;
   }
 
-  // Re-arm after each decision so a persistent mismatch can cause controlled
-  // AIMD decreases at most once per sustained interval, not once per feedback.
-  low_delivery_start_ms_ = now_ms;
+  // UpdateDelayBasedRate latches the resulting reduction as one congestion
+  // episode. Do not rearm while feedback still describes this backlog.
+  low_delivery_start_ms_ = -1;
   byte_delivery_overuse_ = true;
   last_bandwidth_usage_ = BandwidthUsage::kOveruse;
   LOG(INFO) << "[GCC] Sustained byte-delivery shortfall: delivered="
@@ -689,9 +752,11 @@ bool GccController::ShouldIgnoreSourceLimitedOveruse(int64_t now_ms) const {
   // bytes than the source actually sends, keep the overuse signal actionable.
   // This also avoids depending on a large outstanding-byte residue to
   // distinguish genuine congestion from content-limited encoding.
-  const double delivery_ratio = sent_rate_kbps_ > 0.0
-      ? acked_bitrate_kbps_ / sent_rate_kbps_
-      : 0.0;
+  const double delivery_ratio = aligned_sent_bitrate_kbps_ > 0.0
+      ? aligned_delivery_ratio_
+      : (sent_rate_kbps_ > 0.0
+             ? acked_bitrate_kbps_ / sent_rate_kbps_
+             : 0.0);
   if (sent_rate_ready && acked_bitrate_kbps_ > 0.0 &&
       delivery_ratio < kByteDeliveryRatioThreshold) {
     return false;
@@ -776,7 +841,8 @@ void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
     if (pkt.recv_size == 0) {
       continue;
     }
-    acked_window_.push_back({pkt.arrival_time_us, pkt.recv_size});
+    acked_window_.push_back(
+        {pkt.send_time_us, pkt.arrival_time_us, pkt.recv_size});
     acked_window_bytes_ += pkt.recv_size;
   }
   if (acked_window_.empty()) {
@@ -795,7 +861,7 @@ void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
   // emits one packet per feedback message after a capacity cliff, so a
   // per-message rate has no span. Use the most recent <=50ms suffix of the
   // continuous arrival history instead. This remains byte-aware and reacts
-  // much faster than the 100ms AIMD window while avoiding stale pre-drop rates.
+  // much faster than the 200ms AIMD window while avoiding stale pre-drop rates.
   auto instant_first = acked_window_.begin();
   while (instant_first != acked_window_.end()) {
     auto next = std::next(instant_first);
@@ -809,13 +875,34 @@ void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
     int64_t instant_span_us = newest_us - instant_first->arrival_us;
     if (instant_span_us >= kMinInstantAckedSpanUs) {
       double instant_bytes = 0.0;
+      int64_t first_send_us = instant_first->send_us;
+      int64_t last_send_us = -1;
       for (auto it = std::next(instant_first); it != acked_window_.end(); ++it) {
         instant_bytes += it->bytes;
+        if (it->send_us >= 0) {
+          if (first_send_us < 0 || it->send_us < first_send_us) {
+            first_send_us = it->send_us;
+          }
+          if (last_send_us < 0 || it->send_us > last_send_us) {
+            last_send_us = it->send_us;
+          }
+        }
       }
       if (instant_bytes > 0.0) {
         last_received_rate_kbps_ =
             instant_bytes * 8.0 / 1000.0 / (instant_span_us / 1e6);
         instant_acked_sample_valid_ = true;
+        if (first_send_us >= 0 && last_send_us > first_send_us) {
+          instant_sent_bitrate_kbps_ =
+              instant_bytes * 8.0 / 1000.0 /
+              ((last_send_us - first_send_us) / 1e6);
+          double reference = std::min(
+              instant_sent_bitrate_kbps_,
+              static_cast<double>(delay_based_bitrate_kbps_));
+          instant_delivery_ratio_ = reference > 0.0
+              ? last_received_rate_kbps_ / reference
+              : 1.0;
+        }
       }
     }
   }
@@ -833,6 +920,26 @@ void GccController::UpdateAckedBitrate(const TransportFeedback& feedback) {
   double window_bytes = acked_window_bytes_ - acked_window_.front().bytes;
   // The window already smooths over time, so use it directly as the estimate.
   acked_bitrate_kbps_ = window_bytes * 8.0 / 1000.0 / (span_us / 1e6);
+
+  // Measure the sender-side rate over the exact same acknowledged packets.
+  // Absolute sender/receiver clock offsets cancel because each rate uses only
+  // the span within its own clock domain.
+  int64_t first_send_us = -1;
+  int64_t last_send_us = -1;
+  for (const auto& sample : acked_window_) {
+    if (sample.send_us < 0) continue;
+    if (first_send_us < 0 || sample.send_us < first_send_us) {
+      first_send_us = sample.send_us;
+    }
+    if (last_send_us < 0 || sample.send_us > last_send_us) {
+      last_send_us = sample.send_us;
+    }
+  }
+  if (first_send_us >= 0 && last_send_us > first_send_us) {
+    aligned_sent_bitrate_kbps_ =
+        window_bytes * 8.0 / 1000.0 /
+        ((last_send_us - first_send_us) / 1e6);
+  }
 }
 
 // --- Trendline estimator (faithful to WebRTC trendline_estimator.cc) ---
@@ -1135,6 +1242,19 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
   }
   switch (usage) {
     case BandwidthUsage::kOveruse: {
+      if (congestion_episode_active_) {
+        // This feedback still belongs to the already-reduced queue episode.
+        // Cwnd pushback below remains active, but do not permanently ratchet
+        // the delay-based estimate down again from stale queued packets.
+        last_overuse_time_ms_ = now_ms;
+        if (last_suppressed_overuse_log_ms_ < 0 ||
+            now_ms - last_suppressed_overuse_log_ms_ >= 1000) {
+          LOG(INFO) << "[GCC] Overuse reduction suppressed while existing "
+                       "congestion episode drains";
+          last_suppressed_overuse_log_ms_ = now_ms;
+        }
+        break;
+      }
       // WebRTC AimdRateControl decrease: snap to beta * measured throughput
       // (not beta * current estimate). This drains the self-induced queue and
       // lands the estimate right at ~capacity instead of just shaving the
@@ -1149,9 +1269,15 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
       } else {
         target = static_cast<int>(delay_based_bitrate_kbps_ * kMultiplicativeDecrease);
       }
+      int previous_bitrate_kbps = delay_based_bitrate_kbps_;
       delay_based_bitrate_kbps_ = std::max(target, min_bitrate_kbps_);
       overuse_counter_ = 0;
       last_overuse_time_ms_ = now_ms;
+      if (delay_based_bitrate_kbps_ < previous_bitrate_kbps) {
+        congestion_episode_active_ = true;
+        congestion_recovery_start_ms_ = -1;
+        last_suppressed_overuse_log_ms_ = -1;
+      }
       LOG(INFO) << "[GCC] Overuse → decrease to " << delay_based_bitrate_kbps_
                 << " kbps (eff_acked=" << static_cast<int>(eff_acked)
                 << " instant=" << (use_instant_acked_ ? 1 : 0)
@@ -1160,6 +1286,11 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
     }
     case BandwidthUsage::kUnderuse:
     case BandwidthUsage::kNormal: {
+      // The permanent estimate remains fixed while cwnd pushback drains an
+      // active episode. Normal additive growth resumes only after the recovery
+      // hysteresis in ApplyByteDeliverySignal has rearmed the controller.
+      if (congestion_episode_active_) break;
+
       // Additive increase: ~8% of current rate per second.
       int64_t time_since_last_ms = now_ms - last_increase_time_ms_;
       if (time_since_last_ms <= 0) break;

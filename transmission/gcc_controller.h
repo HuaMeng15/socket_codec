@@ -65,6 +65,12 @@ class GccController : public CongestionController {
   void SetPeriodicAlrProbingEnabled(bool enabled);
 
   /**
+   * Configure congestion-aware probes outside ALR. Zero disables them.
+   * Probe opportunities are skipped whenever controller health is uncertain.
+   */
+  void SetUnconditionalPeriodicProbeIntervalMs(int interval_ms);
+
+  /**
    * True while the bandwidth prober is actively probing (send rate elevated
    * above the estimate to test for headroom). The pacer uses this to fill idle
    * time with padding so the probe's measured received rate reflects true link
@@ -257,27 +263,30 @@ class GccController : public CongestionController {
   void UpdateAckedBitrate(const TransportFeedback& feedback);
   double acked_bitrate_kbps_;
   bool acked_frozen_for_testing_ = false;  // pin acked in detector unit tests
-  // Sliding window of (arrival_time_us, recv_bytes) samples, keyed on the
-  // receiver-clock arrival offset carried in the feedback.
+  // Sliding window of acknowledged packets. Keeping both send and arrival
+  // timestamps lets the delivery detector compare the same packet cohort on
+  // the two sides of the path; the clocks need not share an epoch because only
+  // spans are compared.
   struct AckedSample {
+    int64_t send_us;
     int64_t arrival_us;
     int bytes;
   };
   std::deque<AckedSample> acked_window_;
   int64_t acked_window_bytes_ = 0;  // running sum of bytes in the window
-  // 100ms sliding window, aligned with the congestion-window RTT horizon. A
-  // short window reacts to a capacity cliff within ~1 RTT instead of lagging a
-  // full second (the old 1s window kept pre-drop ACKs alive, so the AIMD
-  // decrease chased a stale-high acked rate and overshot the queue up).
-  static constexpr int64_t kAckedWindowUs = 100000;  // 100ms sliding window
+  // Normal delivery decisions use 200ms (roughly six 30fps frames), matching
+  // the source-rate horizon and smoothing frame-shaped bursts. The severe
+  // capacity-cliff path retains its separate 50ms estimator below.
+  static constexpr int64_t kAckedWindowUs = 200000;  // 200ms sliding window
   static constexpr int kAckedMinSamples = 2;          // need ≥2 for a span
+  double aligned_sent_bitrate_kbps_ = 0.0;
+  double aligned_delivery_ratio_ = 1.0;
 
-  // Secondary, byte-aware congestion signal. Delay trendlines correctly
-  // measure queue growth, while this compares actual wire bytes sent against
-  // actual bytes delivered. A smaller packet taking the same time lowers the
-  // delivered bitrate and is therefore visible here. It must be sustained and
-  // the sender must be filling its target, which avoids false positives for an
-  // application-limited encoder.
+  // Secondary, byte-aware congestion signal. Delay trendlines measure queue
+  // growth, while this compares send and arrival spans for the same
+  // acknowledged packet cohort. The separate aggregate source window below
+  // proves that the application is filling its target; packet loss is handled
+  // by the loss controller rather than inferred from mismatched byte windows.
   struct SentSample {
     int64_t time_ms;
     int64_t bytes;
@@ -288,11 +297,19 @@ class GccController : public CongestionController {
   int64_t low_delivery_start_ms_ = -1;
   bool byte_delivery_overuse_ = false;
   bool severe_capacity_cliff_active_ = false;
+  // One permanent AIMD reduction is allowed per congestion episode. Cwnd
+  // pushback remains free to lower the effective sending target while the
+  // existing backlog drains. Rearm only after a sustained healthy period.
+  bool congestion_episode_active_ = false;
+  int64_t congestion_recovery_start_ms_ = -1;
+  int64_t last_suppressed_overuse_log_ms_ = -1;
   static constexpr int64_t kSentRateWindowMs = 200;
-  static constexpr int64_t kByteEstimatorMinSpanMs = 50;
-  static constexpr int64_t kByteSignalMinSpanMs = 100;
+  static constexpr int64_t kByteEstimatorMinSpanMs = 150;
+  static constexpr int64_t kByteSignalMinSpanMs = 200;
   static constexpr double kByteDeliveryRatioThreshold = 0.85;
-  // A 10->1 Mbps-style cliff should not wait for the ordinary 100ms byte
+  static constexpr double kByteDeliveryRecoveryRatio = 0.95;
+  static constexpr int64_t kCongestionRecoverySpanMs = 300;
+  // A 10->1 Mbps-style cliff should not wait for the ordinary 200ms byte
   // confirmation or a second trendline group. Require three independent
   // signals before taking the fast path: delivery collapses below half the
   // offered rate, the delay trend is already over threshold, and accumulated
@@ -318,6 +335,8 @@ class GccController : public CongestionController {
   // timer can legitimately produce one-packet batches at low bandwidth, so
   // this estimate must be continuous across feedback message boundaries.
   bool instant_acked_sample_valid_ = false;
+  double instant_sent_bitrate_kbps_ = 0.0;
+  double instant_delivery_ratio_ = 1.0;
   static constexpr int64_t kInstantAckedWindowUs = 50000;
   static constexpr int64_t kMinInstantAckedSpanUs = 5000;
 
@@ -353,6 +372,7 @@ class GccController : public CongestionController {
   BandwidthProber prober_;
   AlrDetector alr_detector_;
   bool periodic_alr_probing_enabled_;
+  int unconditional_periodic_probe_interval_ms_ = 0;
   // Probe resolution bookkeeping (GCC side), following WebRTC's
   // ProbeBitrateEstimator: accumulate the probe traffic's received bytes and
   // arrival span across feedback batches starting when the probe begins, and
@@ -379,10 +399,13 @@ class GccController : public CongestionController {
   // WebRTC kTargetUtilizationFraction: when the link is saturated by the probe,
   // commit slightly below the measured receive rate to avoid immediate overuse.
   static constexpr double kProbeUtilizationFraction = 0.95;
-  // Delay/cwnd health threshold for optional periodic probing. Startup does
-  // not terminate on this timing-only signal: its measured probe result and
-  // byte/loss confirmation are codec-independent saturation evidence.
+  // Delay/cwnd health threshold for optional periodic probing. An accumulated
+  // delay above this is unsafe only while its live trend is still positive;
+  // the integrated signal can retain a stale offset after the queue drains.
+  // Startup does not terminate on this timing-only signal: its measured probe
+  // result and byte/loss confirmation are codec-independent saturation evidence.
   static constexpr double kProbeAbortDelayMs = 20.0;
+  static constexpr int64_t kPeriodicProbeCongestionCooldownMs = 5000;
   // Minimum accumulated arrival span before a probe may commit. Below this, the
   // measurement is dominated by bunching noise, not real throughput.
   static constexpr int64_t kProbeMinSpanUs = 30000;  // 30 ms

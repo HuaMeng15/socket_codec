@@ -276,7 +276,7 @@ TEST_F(GccControllerTest, SevereCapacityCliffUsesFirstDecisiveGroup) {
   // The first post-drop group models packets sent 1ms apart but serialized at
   // 12ms by a 1Mbps link. It simultaneously establishes a severe byte-rate
   // collapse and a large positive delay trend. That is enough evidence for the
-  // cliff fast path; it must not wait for a second slow group or 100ms timer.
+  // cliff fast path; it must not wait for the ordinary 200ms timer.
   gcc.OnBytesSent(7 * 1454);
   auto cliff = MakeFeedback(send, arrival, 7, 1000, 12000);
   gcc.OnTransportFeedback(cliff);
@@ -313,11 +313,11 @@ TEST_F(GccControllerTest, SinglePacketFeedbackUsesWindowRateOnOveruse) {
   }
 
   EXPECT_LT(gcc.GetDelayBasedBitrateKbps(), before);
-  // Delay-only overuse uses the smoothed 100ms ACK window. The instantaneous
+  // Delay-only overuse uses the smoothed 200ms ACK window. The instantaneous
   // suffix is around 1 Mbps here, but is intentionally reserved for a
   // byte-confirmed severe cliff.
-  EXPECT_GT(gcc.GetDelayBasedBitrateKbps(), 1800);
-  EXPECT_LT(gcc.GetDelayBasedBitrateKbps(), 2500);
+  EXPECT_GT(gcc.GetDelayBasedBitrateKbps(), 3000);
+  EXPECT_LT(gcc.GetDelayBasedBitrateKbps(), 4500);
 }
 
 TEST_F(GccControllerTest, OveruseDecreasesMultiplicatively) {
@@ -687,7 +687,7 @@ TEST_F(GccControllerTest, AckedWindowNotInflatedByBurstyArrivals) {
   EXPECT_LT(after_burst, 20000);  // not the ~232 Mbps the burst alone implies
 }
 
-TEST_F(GccControllerTest, SmallerPacketsAtSameTimingTriggerByteShortfall) {
+TEST_F(GccControllerTest, MatchedPacketCohortDoesNotInventByteShortfall) {
   gcc.SetInitialBitrate(5000);
   gcc.SetBitrateRange(100, 30000);
   gcc.EnableAckedEstimatorForTesting();
@@ -695,9 +695,10 @@ TEST_F(GccControllerTest, SmallerPacketsAtSameTimingTriggerByteShortfall) {
   int before = gcc.GetDelayBasedBitrateKbps();
   int64_t send = 1000000, arrival = 1000000;
   for (int round = 0; round < 10; ++round) {
-    // The pacer sends full-size wire-byte volume, while only 500-byte packets
-    // are delivered with identical send/arrival timing. Thus delay delta is
-    // exactly zero, but delivered capacity is materially lower.
+    // Deliberately make the aggregate OnBytesSent accounting disagree with
+    // the acknowledged packet sizes while preserving identical send/arrival
+    // timing. The delivery detector now compares the same acknowledged packet
+    // cohort, so aggregation differences alone are not network congestion.
     gcc.OnBytesSent(20 * 1454);
     auto fb = MakeFeedback(send, arrival, 20, 1000, 1000);
     for (auto& packet : fb.packets) {
@@ -709,7 +710,71 @@ TEST_F(GccControllerTest, SmallerPacketsAtSameTimingTriggerByteShortfall) {
     AdvanceMs(33);
   }
 
-  EXPECT_LT(gcc.GetDelayBasedBitrateKbps(), before);
+  EXPECT_EQ(gcc.GetDelayBasedBitrateKbps(), before);
+}
+
+TEST_F(GccControllerTest, PersistentBacklogCausesOneReductionPerEpisode) {
+  gcc.SetInitialBitrate(5000);
+  gcc.SetBitrateRange(100, 5000);  // keep startup probing out of the test
+  gcc.SetCongestionWindowConfig(0, 30);
+  gcc.EnableAckedEstimatorForTesting();
+
+  int64_t send = 1000000, arrival = 1000000;
+  for (int round = 0; round < 10; ++round) {
+    gcc.OnBytesSent(20 * 1454);
+    gcc.OnTransportFeedback(MakeFeedback(send, arrival, 20, 1000, 1000));
+    send += 33000;
+    arrival += 33000;
+    AdvanceMs(33);
+  }
+
+  const int before = gcc.GetDelayBasedBitrateKbps();
+  int after_first_reduction = before;
+  for (int round = 0; round < 30; ++round) {
+    gcc.OnBytesSent(20 * 1454);
+    gcc.OnTransportFeedback(MakeFeedback(send, arrival, 20, 1000, 2200));
+    send += 33000;
+    arrival += 44000;
+    AdvanceMs(44);
+    if (gcc.GetDelayBasedBitrateKbps() < before) {
+      after_first_reduction = gcc.GetDelayBasedBitrateKbps();
+      break;
+    }
+  }
+  ASSERT_LT(after_first_reduction, before);
+
+  // Continue feeding packets from the same growing queue for well beyond the
+  // byte detector's old 100ms rearm interval. The permanent estimate must not
+  // ratchet down again; temporary draining belongs to cwnd pushback.
+  for (int round = 0; round < 20; ++round) {
+    gcc.OnBytesSent(20 * 1454);
+    gcc.OnTransportFeedback(MakeFeedback(send, arrival, 20, 1000, 2200));
+    send += 33000;
+    arrival += 44000;
+    AdvanceMs(44);
+  }
+  EXPECT_EQ(gcc.GetDelayBasedBitrateKbps(), after_first_reduction);
+
+  // Once the same packet cohort is delivered normally for the recovery
+  // hysteresis interval, the next independently growing queue is a new
+  // congestion episode and may reduce the permanent estimate once more.
+  for (int round = 0; round < 20; ++round) {
+    gcc.OnBytesSent(20 * 1454);
+    gcc.OnTransportFeedback(MakeFeedback(send, arrival, 20, 1000, 1000));
+    send += 33000;
+    arrival += 33000;
+    AdvanceMs(33);
+  }
+  for (int round = 0; round < 30 &&
+                      gcc.GetDelayBasedBitrateKbps() >= after_first_reduction;
+       ++round) {
+    gcc.OnBytesSent(20 * 1454);
+    gcc.OnTransportFeedback(MakeFeedback(send, arrival, 20, 1000, 2200));
+    send += 33000;
+    arrival += 44000;
+    AdvanceMs(44);
+  }
+  EXPECT_LT(gcc.GetDelayBasedBitrateKbps(), after_first_reduction);
 }
 
 TEST_F(GccControllerTest, InflightBytesRetireByAckLossAndTimeout) {

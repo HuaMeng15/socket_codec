@@ -45,6 +45,26 @@ int DataSender::Initialize(const std::string& dest_ip, int dest_port,
     return -1;
   }
 
+  if (!bind_interface_.empty()) {
+#if defined(__linux__)
+    if (setsockopt(socket_fd_, SOL_SOCKET, SO_BINDTODEVICE,
+                   bind_interface_.c_str(), bind_interface_.size() + 1) < 0) {
+      LOG(ERROR) << "[DataSender] Failed to bind socket to interface "
+                 << bind_interface_ << ": " << strerror(errno);
+      close(socket_fd_);
+      socket_fd_ = -1;
+      return -1;
+    }
+    LOG(INFO) << "[DataSender] Bound media socket to interface "
+              << bind_interface_;
+#else
+    LOG(ERROR) << "[DataSender] bind_interface is supported only on Linux";
+    close(socket_fd_);
+    socket_fd_ = -1;
+    return -1;
+#endif
+  }
+
   // Set up destination address
   struct sockaddr_in dest_addr;
   memset(&dest_addr, 0, sizeof(dest_addr));
@@ -70,7 +90,9 @@ int DataSender::Initialize(const std::string& dest_ip, int dest_port,
 
   initialized_ = true;
   LOG(INFO) << "[DataSender] Initialized: " << dest_ip_ << ":" << dest_port_
-            << " max_packet_size=" << max_packet_size_;
+            << " max_packet_size=" << max_packet_size_
+            << " bind_interface="
+            << (bind_interface_.empty() ? "default-route" : bind_interface_);
 
   return 0;
 }
