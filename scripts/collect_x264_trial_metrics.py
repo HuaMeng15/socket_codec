@@ -7,6 +7,7 @@ import re
 import shutil
 import statistics
 import subprocess
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 
 
@@ -31,11 +32,13 @@ TRIAL_COLUMNS = [
     "frame_latency_max_ms",
     "frame_latency_p95_ms",
     "frame_latency_p99_ms",
+    "frame_latency_p999_ms",
     "overall_latency_count",
     "overall_latency_avg_ms",
     "overall_latency_max_ms",
     "overall_latency_p95_ms",
     "overall_latency_p99_ms",
+    "overall_latency_p999_ms",
     "overall_stall_100ms_count",
     "overall_stall_200ms_count",
     "packet_latency_count",
@@ -47,6 +50,21 @@ TRIAL_COLUMNS = [
     "frame_stall_200ms_count",
 ]
 TRIAL_TEXT_COLUMNS = {"experiment_mode", "codec", "slice_number", "result_dir"}
+TRIAL_INTEGER_COLUMNS = {
+    "trial",
+    "port",
+    "send_status",
+    "frames_requested",
+    "frames_decoded",
+    "frames_compared",
+    "frame_latency_count",
+    "overall_latency_count",
+    "overall_stall_100ms_count",
+    "overall_stall_200ms_count",
+    "packet_latency_count",
+    "frame_stall_100ms_count",
+    "frame_stall_200ms_count",
+}
 SUMMARY_TEXT_COLUMNS = {"experiment_mode", "codec", "slice_number"}
 QUALITY_FRAME_COLUMNS = [
     "frame_index",
@@ -609,7 +627,12 @@ def percentile(values, pct):
     if not values:
         return ""
     values = sorted(values)
-    index = math.ceil((pct / 100.0) * len(values)) - 1
+    rank = int(
+        (Decimal(str(pct)) * len(values) / Decimal(100)).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    index = rank - 1
     index = min(max(index, 0), len(values) - 1)
     return values[index]
 
@@ -626,7 +649,14 @@ def read_latency_stats(path, column):
                     pass
 
     if not values:
-        return {"count": 0, "avg": "", "max": "", "p95": "", "p99": ""}
+        return {
+            "count": 0,
+            "avg": "",
+            "max": "",
+            "p95": "",
+            "p99": "",
+            "p999": "",
+        }
 
     return {
         "count": len(values),
@@ -634,6 +664,7 @@ def read_latency_stats(path, column):
         "max": max(values),
         "p95": percentile(values, 95),
         "p99": percentile(values, 99),
+        "p999": percentile(values, 99.9),
     }
 
 
@@ -672,6 +703,253 @@ def format_row(row, columns, text_columns):
         else:
             formatted[key] = fmt(value)
     return formatted
+
+
+def resolve_existing_trial_dir(row, trials_csv):
+    result_dir = Path(row.get("result_dir", ""))
+    required_files = (
+        "frame_latency.csv",
+        "overall_latency.csv",
+        "packet_latency.csv",
+        "quality_frames.csv",
+    )
+    if all((result_dir / name).is_file() for name in required_files):
+        return result_dir.resolve()
+
+    experiment_mode = row.get("experiment_mode", row.get("codec", ""))
+    trial = row.get("trial", "")
+    relocated_dir = Path(trials_csv).parent / experiment_mode / f"trial_{trial}"
+    if not all((relocated_dir / name).is_file() for name in required_files):
+        raise RuntimeError(
+            f"cannot locate metric data for {experiment_mode}/trial_{trial}: "
+            f"checked {result_dir} and {relocated_dir}"
+        )
+    return relocated_dir.resolve()
+
+
+def upgrade_trials_csv_schema(trials_csv):
+    """Backfill new latency percentiles in an older trials CSV atomically."""
+    trials_csv = Path(trials_csv)
+    if not trials_csv.is_file():
+        return False
+
+    with trials_csv.open(newline="") as f:
+        reader = csv.DictReader(f)
+        existing_columns = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    if existing_columns == TRIAL_COLUMNS:
+        return False
+
+    unknown_columns = [col for col in existing_columns if col not in TRIAL_COLUMNS]
+    missing_columns = [col for col in TRIAL_COLUMNS if col not in existing_columns]
+    supported_missing = {
+        "frame_latency_p999_ms",
+        "overall_latency_p999_ms",
+    }
+    if unknown_columns or not set(missing_columns).issubset(supported_missing):
+        raise RuntimeError(
+            f"cannot safely upgrade {trials_csv}: "
+            f"unknown_columns={unknown_columns}, missing_columns={missing_columns}"
+        )
+
+    for row in rows:
+        result_dir = resolve_existing_trial_dir(row, trials_csv)
+        if row.get("result_dir") != str(result_dir):
+            row["result_dir"] = str(result_dir)
+        if "frame_latency_p999_ms" in missing_columns:
+            frame = read_latency_stats(
+                result_dir / "frame_latency.csv", "frame_latency"
+            )
+            row["frame_latency_p999_ms"] = fmt(frame["p999"])
+        if "overall_latency_p999_ms" in missing_columns:
+            overall = read_latency_stats(
+                result_dir / "overall_latency.csv", "overall_latency"
+            )
+            row["overall_latency_p999_ms"] = fmt(overall["p999"])
+
+    temporary = trials_csv.with_name(f".{trials_csv.name}.schema-upgrade.tmp")
+    with temporary.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in TRIAL_COLUMNS})
+    temporary.replace(trials_csv)
+    print(
+        f"Upgraded {trials_csv} with "
+        "frame_latency_p999_ms and overall_latency_p999_ms"
+    )
+    return True
+
+
+def read_rows_after_frame(path, minimum_frame_index):
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f"missing metric source: {path}")
+    rows = []
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        if "frame_index" not in (reader.fieldnames or []):
+            raise RuntimeError(f"missing frame_index column in {path}")
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                frame_index = int(row["frame_index"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"invalid frame_index at {path}:{line_number}"
+                ) from error
+            if frame_index >= minimum_frame_index:
+                rows.append(row)
+    if not rows:
+        raise RuntimeError(
+            f"no samples remain in {path} after frame_index >= {minimum_frame_index}"
+        )
+    return rows
+
+
+def numeric_values(rows, column, source):
+    values = []
+    for index, row in enumerate(rows, start=2):
+        try:
+            value = float(row[column])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"invalid {column} at {source}:{index}") from error
+        if not math.isfinite(value):
+            raise RuntimeError(f"non-finite {column} at {source}:{index}")
+        values.append(value)
+    return values
+
+
+def latency_stats_from_values(values):
+    return {
+        "count": len(values),
+        "avg": statistics.fmean(values),
+        "max": max(values),
+        "p95": percentile(values, 95),
+        "p99": percentile(values, 99),
+        "p999": percentile(values, 99.9),
+    }
+
+
+def recalculate_trials(args):
+    trials_csv = Path(args.recalculate_trials_csv)
+    upgrade_trials_csv_schema(trials_csv)
+    with trials_csv.open(newline="") as f:
+        reader = csv.DictReader(f)
+        if list(reader.fieldnames or []) != TRIAL_COLUMNS:
+            raise RuntimeError(f"unexpected trials CSV schema: {trials_csv}")
+        rows = list(reader)
+
+    minimum_frame_index = math.ceil(args.trim_start_seconds * args.fps)
+    for row in rows:
+        for column in TRIAL_INTEGER_COLUMNS:
+            value = row.get(column, "")
+            if value != "":
+                row[column] = int(float(value))
+        result_dir = resolve_existing_trial_dir(row, trials_csv)
+        if not (result_dir / "VALIDATED").is_file():
+            raise RuntimeError(f"trial is not validated: {result_dir}")
+
+        frame_rows = read_rows_after_frame(
+            result_dir / "frame_latency.csv", minimum_frame_index
+        )
+        overall_rows = read_rows_after_frame(
+            result_dir / "overall_latency.csv", minimum_frame_index
+        )
+        packet_rows = read_rows_after_frame(
+            result_dir / "packet_latency.csv", minimum_frame_index
+        )
+        quality_rows = read_rows_after_frame(
+            result_dir / "quality_frames.csv", minimum_frame_index
+        )
+
+        frame_indices = {int(item["frame_index"]) for item in frame_rows}
+        overall_indices = {int(item["frame_index"]) for item in overall_rows}
+        quality_indices = {int(item["frame_index"]) for item in quality_rows}
+        if frame_indices != overall_indices or frame_indices != quality_indices:
+            raise RuntimeError(
+                f"trimmed frame indices do not align across latency and quality: "
+                f"{result_dir}"
+            )
+
+        frame_values = numeric_values(
+            frame_rows, "frame_latency", result_dir / "frame_latency.csv"
+        )
+        overall_values = numeric_values(
+            overall_rows, "overall_latency", result_dir / "overall_latency.csv"
+        )
+        packet_values = numeric_values(
+            packet_rows, "packet_latency", result_dir / "packet_latency.csv"
+        )
+        frame = latency_stats_from_values(frame_values)
+        overall = latency_stats_from_values(overall_values)
+        packet = latency_stats_from_values(packet_values)
+
+        row.update(
+            {
+                "result_dir": str(result_dir),
+                "frames_decoded": len(quality_rows),
+                "frames_compared": len(quality_rows),
+                "psnr_y": statistics.fmean(
+                    numeric_values(quality_rows, "psnr_y", result_dir / "quality_frames.csv")
+                ),
+                "psnr_u": statistics.fmean(
+                    numeric_values(quality_rows, "psnr_u", result_dir / "quality_frames.csv")
+                ),
+                "psnr_v": statistics.fmean(
+                    numeric_values(quality_rows, "psnr_v", result_dir / "quality_frames.csv")
+                ),
+                "psnr_avg": statistics.fmean(
+                    numeric_values(
+                        quality_rows, "psnr_avg", result_dir / "quality_frames.csv"
+                    )
+                ),
+                "vmaf": statistics.fmean(
+                    numeric_values(quality_rows, "vmaf", result_dir / "quality_frames.csv")
+                ),
+                "frame_latency_count": frame["count"],
+                "frame_latency_avg_ms": frame["avg"],
+                "frame_latency_max_ms": frame["max"],
+                "frame_latency_p95_ms": frame["p95"],
+                "frame_latency_p99_ms": frame["p99"],
+                "frame_latency_p999_ms": frame["p999"],
+                "overall_latency_count": overall["count"],
+                "overall_latency_avg_ms": overall["avg"],
+                "overall_latency_max_ms": overall["max"],
+                "overall_latency_p95_ms": overall["p95"],
+                "overall_latency_p99_ms": overall["p99"],
+                "overall_latency_p999_ms": overall["p999"],
+                "overall_stall_100ms_count": sum(
+                    value > 100.0 for value in overall_values
+                ),
+                "overall_stall_200ms_count": sum(
+                    value > 200.0 for value in overall_values
+                ),
+                "packet_latency_count": packet["count"],
+                "packet_latency_avg_ms": packet["avg"],
+                "packet_latency_max_ms": packet["max"],
+                "packet_latency_p95_ms": packet["p95"],
+                "packet_latency_p99_ms": packet["p99"],
+                "frame_stall_100ms_count": sum(
+                    value > 100.0 for value in frame_values
+                ),
+                "frame_stall_200ms_count": sum(
+                    value > 200.0 for value in frame_values
+                ),
+            }
+        )
+
+    temporary = trials_csv.with_name(f".{trials_csv.name}.recalculate.tmp")
+    with temporary.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(format_row(row, TRIAL_COLUMNS, TRIAL_TEXT_COLUMNS))
+    temporary.replace(trials_csv)
+    print(
+        f"Recalculated {trials_csv} after excluding frames before "
+        f"{minimum_frame_index} ({args.trim_start_seconds:g} s at {args.fps} fps)"
+    )
 
 
 def append_trial_row(args):
@@ -714,11 +992,13 @@ def append_trial_row(args):
         "frame_latency_max_ms": frame["max"],
         "frame_latency_p95_ms": frame["p95"],
         "frame_latency_p99_ms": frame["p99"],
+        "frame_latency_p999_ms": frame["p999"],
         "overall_latency_count": overall["count"],
         "overall_latency_avg_ms": overall["avg"],
         "overall_latency_max_ms": overall["max"],
         "overall_latency_p95_ms": overall["p95"],
         "overall_latency_p99_ms": overall["p99"],
+        "overall_latency_p999_ms": overall["p999"],
         "overall_stall_100ms_count": overall_stall_100_count,
         "overall_stall_200ms_count": overall_stall_200_count,
         "packet_latency_count": packet["count"],
@@ -732,6 +1012,7 @@ def append_trial_row(args):
 
     trials_csv = Path(args.trials_csv)
     trials_csv.parent.mkdir(parents=True, exist_ok=True)
+    upgrade_trials_csv_schema(trials_csv)
     write_header = not trials_csv.exists()
     with trials_csv.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS)
@@ -763,10 +1044,12 @@ def summarize_trials(args):
         "frame_latency_max_ms",
         "frame_latency_p95_ms",
         "frame_latency_p99_ms",
+        "frame_latency_p999_ms",
         "overall_latency_avg_ms",
         "overall_latency_max_ms",
         "overall_latency_p95_ms",
         "overall_latency_p99_ms",
+        "overall_latency_p999_ms",
         "overall_stall_100ms_count",
         "overall_stall_200ms_count",
         "packet_latency_avg_ms",
@@ -810,7 +1093,11 @@ def summarize_trials(args):
             "codec": codec,
             "slice_number": slice_number,
             "trials": len(group),
-            "successful_trials": sum(1 for row in group if row.get("send_status") == "0"),
+            "successful_trials": sum(
+                1
+                for row in group
+                if float(row.get("send_status", "nan")) == 0.0
+            ),
         }
         for col in numeric_cols:
             vals = []
@@ -836,6 +1123,20 @@ def summarize_trials(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--summarize", help="summarize a trials CSV")
+    parser.add_argument(
+        "--upgrade-trials-schema",
+        help="atomically backfill P99.9 columns in an existing trials CSV",
+    )
+    parser.add_argument(
+        "--recalculate-trials-csv",
+        help="recalculate an existing trials CSV from its per-frame metric files",
+    )
+    parser.add_argument(
+        "--trim-start-seconds",
+        type=float,
+        default=0.0,
+        help="exclude frames before this media-time offset when recalculating",
+    )
     parser.add_argument("--summary-csv", default="summary.csv")
     parser.add_argument("--result-dir")
     parser.add_argument("--reference")
@@ -875,8 +1176,16 @@ def main():
 
     if args.reference_loop_count < 1:
         parser.error("--reference-loop-count must be at least 1")
+    if args.fps < 1:
+        parser.error("--fps must be at least 1")
+    if args.trim_start_seconds < 0:
+        parser.error("--trim-start-seconds must be non-negative")
 
-    if args.summarize:
+    if args.recalculate_trials_csv:
+        recalculate_trials(args)
+    elif args.upgrade_trials_schema:
+        upgrade_trials_csv_schema(args.upgrade_trials_schema)
+    elif args.summarize:
         summarize_trials(args)
     else:
         required = [

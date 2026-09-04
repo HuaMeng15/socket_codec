@@ -309,6 +309,10 @@ class GccController : public CongestionController {
   static constexpr double kByteDeliveryRatioThreshold = 0.85;
   static constexpr double kByteDeliveryRecoveryRatio = 0.95;
   static constexpr int64_t kCongestionRecoverySpanMs = 300;
+  // Recovery requires the outstanding backlog to represent at most 100 ms at
+  // the measured delivery rate. This prevents a pushback-limited send rate
+  // from inflating the delivery ratio and exposing a stale pre-cliff estimate.
+  static constexpr double kCongestionRecoveryMaxDrainMs = 100.0;
   // A 10->1 Mbps-style cliff should not wait for the ordinary 200ms byte
   // confirmation or a second trendline group. Require three independent
   // signals before taking the fast path: delivery collapses below half the
