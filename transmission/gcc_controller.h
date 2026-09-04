@@ -121,6 +121,7 @@ class GccController : public CongestionController {
   // measured received rate). Test-only.
   double GetAckedBitrateKbpsForTesting() const;
   int64_t GetOutstandingBytesForTesting() const;
+  int64_t GetDataWindowBytesForTesting() const;
   // Re-enable the real sliding-window acked estimator after a prior
   // SetAckedBitrateForTesting froze it. Resets the window. Test-only.
   void EnableAckedEstimatorForTesting();
@@ -301,6 +302,7 @@ class GccController : public CongestionController {
   // pushback remains free to lower the effective sending target while the
   // existing backlog drains. Rearm only after a sustained healthy period.
   bool congestion_episode_active_ = false;
+  bool congestion_episode_correction_applied_ = false;
   int64_t congestion_recovery_start_ms_ = -1;
   int64_t last_suppressed_overuse_log_ms_ = -1;
   static constexpr int64_t kSentRateWindowMs = 200;
@@ -313,6 +315,12 @@ class GccController : public CongestionController {
   // the measured delivery rate. This prevents a pushback-limited send rate
   // from inflating the delivery ratio and exposing a stale pre-cliff estimate.
   static constexpr double kCongestionRecoveryMaxDrainMs = 100.0;
+  // A fast cliff estimate can still contain pre-cliff acknowledgements. If a
+  // large backlog subsequently proves that first estimate was too high, allow
+  // one bounded correction from the settled acknowledged rate. The one-shot
+  // latch prevents queued packets from ratcheting the estimate repeatedly.
+  static constexpr double kCongestionCorrectionMinDrainMs = 250.0;
+  static constexpr double kCongestionCorrectionHeadroomRatio = 1.10;
   // A 10->1 Mbps-style cliff should not wait for the ordinary 200ms byte
   // confirmation or a second trendline group. Require three independent
   // signals before taking the fast path: delivery collapses below half the
@@ -448,13 +456,15 @@ class GccController : public CongestionController {
   static constexpr int64_t kMinInflightTimeoutMs = 2000;
   static constexpr int64_t kInflightTimeoutRttMultiplier = 4;
   // Feedback-max-RTT window (ms). Each batch contributes its max sample; the
-  // congestion window uses the MIN across the window (WebRTC semantics).
+  // congestion window uses the MIN across an elapsed-time window (WebRTC
+  // semantics). Never prune by callback count: slice-shaped traffic produces
+  // more feedback batches than frame-shaped traffic, so a sample-count cap
+  // makes the propagation-RTT baseline codec/frequency dependent.
   std::deque<std::pair<int64_t, int64_t>> feedback_max_rtts_;  // (time_ms, rtt_ms)
-  static constexpr int64_t kRttWindowMs = 1000;
+  static constexpr int64_t kRttWindowMs = 60000;
   int64_t last_rtt_ms_ = 0;              // most recent batch max, for logging
   double pushback_ratio_ = 1.0;          // for logging
   static constexpr int64_t kMinCwndBytes = 2 * 1500;
-  static constexpr int64_t kMaxRttWindowSamples = 100;
 
   // Fake clock for testing (nullptr = use real clock)
   int64_t* fake_clock_ms_;

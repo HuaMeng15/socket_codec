@@ -127,6 +127,38 @@ TEST_F(GccControllerTest, BitrateStaysWithinBounds) {
   EXPECT_LE(gcc.GetTargetBitrateKbps(), 8000);
 }
 
+TEST_F(GccControllerTest, CongestionWindowRttBaselineIsFeedbackFrequencyInvariant) {
+  gcc.SetBitrateRange(100, 5000);
+  gcc.SetInitialBitrate(5000);
+  gcc.SetCongestionWindowConfig(50, 30);
+
+  // Establish a 10 ms propagation-RTT sample. Then provide more than the old
+  // 100-sample cap's worth of high queued-RTT feedback within one second.
+  // A count-limited history discards the baseline and inflates the data window;
+  // an elapsed-time history retains it regardless of callback frequency.
+  auto feed_rtt = [&](int64_t rtt_ms, int sequence) {
+    TransportFeedback fb;
+    TransportFeedback::PacketInfo packet;
+    packet.frame_sequence = static_cast<uint16_t>(sequence);
+    packet.packet_index = 0;
+    packet.send_time_us = (clock_ms_ - rtt_ms) * 1000;
+    packet.arrival_time_us = clock_ms_ * 1000;
+    packet.recv_size = 1454;
+    fb.packets.push_back(packet);
+    gcc.OnTransportFeedback(fb);
+    AdvanceMs(1);
+  };
+
+  feed_rtt(10, 0);
+  int64_t baseline_window = gcc.GetDataWindowBytesForTesting();
+  ASSERT_GT(baseline_window, 0);
+  for (int i = 1; i <= 150; ++i) {
+    feed_rtt(500, i);
+  }
+
+  EXPECT_LT(gcc.GetDataWindowBytesForTesting(), baseline_window * 2);
+}
+
 // --- Delay-based: overuse detection ---
 
 TEST_F(GccControllerTest, OveruseDetectedOnGrowingDelay) {

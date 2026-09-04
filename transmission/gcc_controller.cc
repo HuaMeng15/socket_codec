@@ -154,6 +154,11 @@ int64_t GccController::GetOutstandingBytesForTesting() const {
   return outstanding_bytes_;
 }
 
+int64_t GccController::GetDataWindowBytesForTesting() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return current_data_window_bytes_;
+}
+
 void GccController::EnableAckedEstimatorForTesting() {
   std::lock_guard<std::mutex> lock(mutex_);
   acked_frozen_for_testing_ = false;
@@ -227,9 +232,7 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
     last_rtt_ms_ = batch_max_rtt_ms;
     feedback_max_rtts_.emplace_back(now_ms, batch_max_rtt_ms);
     while (feedback_max_rtts_.size() > 1 &&
-           (now_ms - feedback_max_rtts_.front().first > kRttWindowMs ||
-            feedback_max_rtts_.size() >
-                static_cast<size_t>(kMaxRttWindowSamples))) {
+           now_ms - feedback_max_rtts_.front().first > kRttWindowMs) {
       feedback_max_rtts_.pop_front();
     }
   }
@@ -642,6 +645,7 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
     // Let UpdateDelayBasedRate apply one immediate reduction from the newly
     // measured capacity. It will latch a fresh episode for the new backlog.
     congestion_episode_active_ = false;
+    congestion_episode_correction_applied_ = false;
     congestion_recovery_start_ms_ = -1;
     last_suppressed_overuse_log_ms_ = -1;
     severe_capacity_cliff_active_ = true;
@@ -677,6 +681,25 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
     double outstanding_drain_ms = acked_bitrate_kbps_ > 0.0
         ? outstanding_bytes_ * 8.0 / acked_bitrate_kbps_
         : std::numeric_limits<double>::infinity();
+    if (!congestion_episode_correction_applied_ && estimator_ready &&
+        delay_usage == BandwidthUsage::kOveruse &&
+        outstanding_drain_ms >= kCongestionCorrectionMinDrainMs &&
+        delay_based_bitrate_kbps_ >
+            kCongestionCorrectionHeadroomRatio * acked_bitrate_kbps_) {
+      int corrected_bitrate_kbps = std::max(
+          min_bitrate_kbps_,
+          static_cast<int>(acked_bitrate_kbps_ * kMultiplicativeDecrease));
+      if (corrected_bitrate_kbps < delay_based_bitrate_kbps_) {
+        LOG(INFO) << "[GCC] Persistent congestion correction to "
+                  << corrected_bitrate_kbps << " kbps (acked="
+                  << static_cast<int>(acked_bitrate_kbps_)
+                  << " kbps drain_ms=" << outstanding_drain_ms << ")";
+        delay_based_bitrate_kbps_ = corrected_bitrate_kbps;
+        congestion_episode_correction_applied_ = true;
+        last_overuse_time_ms_ = now_ms;
+        byte_delivery_overuse_ = true;
+      }
+    }
     bool backlog_recovered =
         outstanding_drain_ms <= kCongestionRecoveryMaxDrainMs;
     bool recovery_healthy = delivery_recovered &&
@@ -689,6 +712,7 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
       } else if (now_ms - congestion_recovery_start_ms_ >=
                  kCongestionRecoverySpanMs) {
         congestion_episode_active_ = false;
+        congestion_episode_correction_applied_ = false;
         congestion_recovery_start_ms_ = -1;
         severe_capacity_cliff_active_ = false;
         low_delivery_start_ms_ = -1;
@@ -1289,6 +1313,7 @@ void GccController::UpdateDelayBasedRate(BandwidthUsage usage, int64_t now_ms) {
       last_overuse_time_ms_ = now_ms;
       if (delay_based_bitrate_kbps_ < previous_bitrate_kbps) {
         congestion_episode_active_ = true;
+        congestion_episode_correction_applied_ = false;
         congestion_recovery_start_ms_ = -1;
         last_suppressed_overuse_log_ms_ = -1;
       }
