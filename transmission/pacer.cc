@@ -96,7 +96,7 @@ void Pacer::SendPadding(size_t payload_bytes) {
   h->payload_size = htons(static_cast<uint16_t>(payload_bytes));
   if (send_fn_) send_fn_(pkt.data(), pkt.size());
   if (packet_sent_fn_) {
-    packet_sent_fn_(kPaddingFrameSequence, packet_index, pkt.size());
+    packet_sent_fn_(kPaddingFrameSequence, h->packet_index, pkt.size());
   }
 }
 

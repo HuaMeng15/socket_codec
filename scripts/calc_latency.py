@@ -246,6 +246,7 @@ def main():
         print(f"Frame latencies:")
         print(f"Frame latency (ms):   avg={avg_frm:.2f} max={max(frm_lats):.2f} "
               f"p95={nearest_rank(frm_lats, 0.95):.2f} p99={nearest_rank(frm_lats, 0.99):.2f} "
+              f"p99.9={nearest_rank(frm_lats, 0.999):.2f} "
               f"top1pct_mean={tail_mean(frm_lats, 0.99):.2f} "
               f"top0.1pct_mean={tail_mean(frm_lats, 0.999):.2f} (n={n})")
         print(f"Frame stalls:         >100ms={stall_100} >200ms={stall_200}")
@@ -256,6 +257,7 @@ def main():
         print(f"Overall latencies:")
         print(f"Overall latency (ms):  avg={avg_ov:.2f} max={max(ov_lats):.2f} "
               f"p95={nearest_rank(ov_lats, 0.95):.2f} p99={nearest_rank(ov_lats, 0.99):.2f} "
+              f"p99.9={nearest_rank(ov_lats, 0.999):.2f} "
               f"top1pct_mean={tail_mean(ov_lats, 0.99):.2f} "
               f"top0.1pct_mean={tail_mean(ov_lats, 0.999):.2f} (n={n})")
     if pacer_queue_delays:

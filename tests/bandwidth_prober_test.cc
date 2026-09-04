@@ -308,6 +308,19 @@ TEST_F(BandwidthProberTest, AlrProbingOnlyWhileApplicationLimited) {
   EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
 }
 
+TEST_F(BandwidthProberTest, ScheduledPeriodicProbeFiresOutsideAlr) {
+  prober.OnOveruseDetected();  // complete startup
+  prober.SetUnconditionalPeriodicProbeIntervalMs(30000);
+
+  AdvanceMs(29999);
+  EXPECT_EQ(prober.GetEffectiveBitrateKbps(), 5000);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kIdle);
+
+  AdvanceMs(1);
+  EXPECT_EQ(prober.GetEffectiveBitrateKbps(), 6250);
+  EXPECT_EQ(prober.GetState(), BandwidthProber::State::kProbing);
+}
+
 TEST_F(BandwidthProberTest, BitrateDropDoesNotProbe) {
   // WebRTC-faithful: a bitrate drop is recovered by AIMD, never a probe. The
   // only drop-recovery probe in WebRTC (ProbeController::RequestProbe) is ALR-

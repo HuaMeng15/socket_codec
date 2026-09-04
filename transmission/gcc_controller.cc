@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
 
@@ -416,7 +417,7 @@ void GccController::OnTransportFeedback(const TransportFeedback& feedback) {
     }
     pushback_->UpdateOutstandingData(outstanding_bytes_);
     uint32_t pushed_bps = pushback_->UpdateTargetBitrate(
-        static_cast<uint32_t>(base_kbps) * 1000u);
+        static_cast<uint32_t>(base_kbps) * 1000u, now_ms);
     pushback_ratio_ = pushback_->encoding_rate_ratio();
     // Pushback deliberately drives the target BELOW the operational min during
     // a drain (down to its own floor, cwnd_min_bitrate_kbps_), so we do NOT
@@ -626,6 +627,40 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
       : 1.0;
   aligned_delivery_ratio_ = delivery_ratio;
 
+  // A large new capacity cliff is a distinct congestion event even if an
+  // earlier, mild overuse episode is still draining. Check it before the
+  // one-reduction-per-episode guard; otherwise that old episode can suppress
+  // the only reduction that reflects the new link capacity.
+  bool severe_capacity_cliff =
+      sent_span_ms >= 50 && sent_rate_kbps_ > 0.0 &&
+      instant_acked_sample_valid_ && instant_sent_bitrate_kbps_ > 0.0 &&
+      instant_delivery_ratio_ < kSevereDeliveryRatioThreshold &&
+      last_modified_trend_ > adaptive_threshold_ &&
+      accumulated_delay_ >= kSevereQueueGrowthMs;
+  if (severe_capacity_cliff && !severe_capacity_cliff_active_) {
+    bool superseded_episode = congestion_episode_active_;
+    // Let UpdateDelayBasedRate apply one immediate reduction from the newly
+    // measured capacity. It will latch a fresh episode for the new backlog.
+    congestion_episode_active_ = false;
+    congestion_recovery_start_ms_ = -1;
+    last_suppressed_overuse_log_ms_ = -1;
+    severe_capacity_cliff_active_ = true;
+    low_delivery_start_ms_ = -1;
+    byte_delivery_overuse_ = true;
+    last_bandwidth_usage_ = BandwidthUsage::kOveruse;
+    LOG(INFO) << "[GCC] Severe capacity cliff"
+              << (superseded_episode ? " superseded prior episode:" : ":")
+              << " delivered=" << static_cast<int>(acked_bitrate_kbps_)
+              << " kbps sent=" << static_cast<int>(sent_rate_kbps_)
+              << " kbps reference="
+              << static_cast<int>(instant_sent_bitrate_kbps_)
+              << " kbps ratio=" << instant_delivery_ratio_
+              << " accumulated_delay_ms=" << accumulated_delay_
+              << " modified_trend=" << last_modified_trend_
+              << " threshold=" << adaptive_threshold_;
+    return BandwidthUsage::kOveruse;
+  }
+
   // A congestion episode owns at most one permanent AIMD decrease. While its
   // backlog remains, congestion-window pushback can still lower the effective
   // send target. Rearm only after delivery, delay, loss, and outstanding data
@@ -639,8 +674,14 @@ GccController::BandwidthUsage GccController::ApplyByteDeliverySignal(
          delivery_ratio >= kByteDeliveryRecoveryRatio) ||
         (acked_frozen_for_testing_ && acked_bitrate_kbps_ >=
              kByteDeliveryRecoveryRatio * delay_based_bitrate_kbps_);
+    double outstanding_drain_ms = acked_bitrate_kbps_ > 0.0
+        ? outstanding_bytes_ * 8.0 / acked_bitrate_kbps_
+        : std::numeric_limits<double>::infinity();
+    bool backlog_recovered =
+        outstanding_drain_ms <= kCongestionRecoveryMaxDrainMs;
     bool recovery_healthy = delivery_recovered &&
-        delay_usage != BandwidthUsage::kOveruse && cwnd_recovered &&
+        backlog_recovered && delay_usage != BandwidthUsage::kOveruse &&
+        cwnd_recovered &&
         last_loss_fraction_ < kLossIncreaseThreshold;
     if (recovery_healthy) {
       if (congestion_recovery_start_ms_ < 0) {

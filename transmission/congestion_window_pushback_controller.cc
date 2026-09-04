@@ -1,6 +1,7 @@
 #include "congestion_window_pushback_controller.h"
 
 #include <algorithm>
+#include <cmath>
 
 CongestionWindowPushbackController::CongestionWindowPushbackController(
     uint32_t min_pushback_target_bitrate_bps, bool add_pacing)
@@ -23,9 +24,10 @@ void CongestionWindowPushbackController::SetDataWindow(
 }
 
 uint32_t CongestionWindowPushbackController::UpdateTargetBitrate(
-    uint32_t bitrate_bps) {
+    uint32_t bitrate_bps, int64_t now_ms) {
   // No window yet (or zero) -> pushback inactive, pass the estimate through.
   if (current_data_window_bytes_ <= 0) {
+    last_update_ms_ = now_ms;
     return bitrate_bps;
   }
   int64_t total_bytes = outstanding_bytes_;
@@ -34,15 +36,28 @@ uint32_t CongestionWindowPushbackController::UpdateTargetBitrate(
   }
   double fill_ratio =
       total_bytes / static_cast<double>(current_data_window_bytes_);
-  if (fill_ratio > 1.5) {
-    encoding_rate_ratio_ *= 0.9;
-  } else if (fill_ratio > 1.0) {
-    encoding_rate_ratio_ *= 0.95;
-  } else if (fill_ratio < 0.1) {
+
+  // A drained queue can release pushback immediately. For all gradual
+  // adjustments, scale by elapsed time so receiving ten feedback messages in
+  // one millisecond has the same effect as receiving one. Cap a single update
+  // interval so a long feedback outage cannot cause an unbounded jump.
+  if (fill_ratio < 0.1) {
     encoding_rate_ratio_ = 1.0;
+    last_update_ms_ = now_ms;
   } else {
-    encoding_rate_ratio_ *= 1.05;
-    encoding_rate_ratio_ = std::min(encoding_rate_ratio_, 1.0);
+    if (last_update_ms_ < 0 || now_ms < last_update_ms_) {
+      last_update_ms_ = now_ms;
+    } else if (now_ms > last_update_ms_) {
+      int64_t elapsed_ms =
+          std::min(now_ms - last_update_ms_, kMaxElapsedMs);
+      double intervals = elapsed_ms / kAdjustmentIntervalMs;
+      double factor = fill_ratio > 1.5 ? 0.9
+                    : fill_ratio > 1.0 ? 0.95
+                                       : 1.05;
+      encoding_rate_ratio_ *= std::pow(factor, intervals);
+      encoding_rate_ratio_ = std::min(encoding_rate_ratio_, 1.0);
+      last_update_ms_ = now_ms;
+    }
   }
   uint32_t adjusted_target_bitrate_bps =
       static_cast<uint32_t>(bitrate_bps * encoding_rate_ratio_);

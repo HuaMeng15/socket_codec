@@ -2,11 +2,11 @@
 import argparse
 import csv
 import json
-import math
 import re
 import shutil
 import statistics
 import subprocess
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 
 
@@ -31,11 +31,13 @@ TRIAL_COLUMNS = [
     "frame_latency_max_ms",
     "frame_latency_p95_ms",
     "frame_latency_p99_ms",
+    "frame_latency_p999_ms",
     "overall_latency_count",
     "overall_latency_avg_ms",
     "overall_latency_max_ms",
     "overall_latency_p95_ms",
     "overall_latency_p99_ms",
+    "overall_latency_p999_ms",
     "overall_stall_100ms_count",
     "overall_stall_200ms_count",
     "packet_latency_count",
@@ -609,7 +611,12 @@ def percentile(values, pct):
     if not values:
         return ""
     values = sorted(values)
-    index = math.ceil((pct / 100.0) * len(values)) - 1
+    rank = int(
+        (Decimal(str(pct)) * len(values) / Decimal(100)).to_integral_value(
+            rounding=ROUND_CEILING
+        )
+    )
+    index = rank - 1
     index = min(max(index, 0), len(values) - 1)
     return values[index]
 
@@ -626,7 +633,14 @@ def read_latency_stats(path, column):
                     pass
 
     if not values:
-        return {"count": 0, "avg": "", "max": "", "p95": "", "p99": ""}
+        return {
+            "count": 0,
+            "avg": "",
+            "max": "",
+            "p95": "",
+            "p99": "",
+            "p999": "",
+        }
 
     return {
         "count": len(values),
@@ -634,6 +648,7 @@ def read_latency_stats(path, column):
         "max": max(values),
         "p95": percentile(values, 95),
         "p99": percentile(values, 99),
+        "p999": percentile(values, 99.9),
     }
 
 
@@ -672,6 +687,59 @@ def format_row(row, columns, text_columns):
         else:
             formatted[key] = fmt(value)
     return formatted
+
+
+def upgrade_trials_csv_schema(trials_csv):
+    """Backfill new latency percentiles in an older trials CSV atomically."""
+    trials_csv = Path(trials_csv)
+    if not trials_csv.is_file():
+        return False
+
+    with trials_csv.open(newline="") as f:
+        reader = csv.DictReader(f)
+        existing_columns = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    if existing_columns == TRIAL_COLUMNS:
+        return False
+
+    unknown_columns = [col for col in existing_columns if col not in TRIAL_COLUMNS]
+    missing_columns = [col for col in TRIAL_COLUMNS if col not in existing_columns]
+    supported_missing = {
+        "frame_latency_p999_ms",
+        "overall_latency_p999_ms",
+    }
+    if unknown_columns or not set(missing_columns).issubset(supported_missing):
+        raise RuntimeError(
+            f"cannot safely upgrade {trials_csv}: "
+            f"unknown_columns={unknown_columns}, missing_columns={missing_columns}"
+        )
+
+    for row in rows:
+        result_dir = Path(row.get("result_dir", ""))
+        if "frame_latency_p999_ms" in missing_columns:
+            frame = read_latency_stats(
+                result_dir / "frame_latency.csv", "frame_latency"
+            )
+            row["frame_latency_p999_ms"] = fmt(frame["p999"])
+        if "overall_latency_p999_ms" in missing_columns:
+            overall = read_latency_stats(
+                result_dir / "overall_latency.csv", "overall_latency"
+            )
+            row["overall_latency_p999_ms"] = fmt(overall["p999"])
+
+    temporary = trials_csv.with_name(f".{trials_csv.name}.schema-upgrade.tmp")
+    with temporary.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in TRIAL_COLUMNS})
+    temporary.replace(trials_csv)
+    print(
+        f"Upgraded {trials_csv} with "
+        "frame_latency_p999_ms and overall_latency_p999_ms"
+    )
+    return True
 
 
 def append_trial_row(args):
@@ -714,11 +782,13 @@ def append_trial_row(args):
         "frame_latency_max_ms": frame["max"],
         "frame_latency_p95_ms": frame["p95"],
         "frame_latency_p99_ms": frame["p99"],
+        "frame_latency_p999_ms": frame["p999"],
         "overall_latency_count": overall["count"],
         "overall_latency_avg_ms": overall["avg"],
         "overall_latency_max_ms": overall["max"],
         "overall_latency_p95_ms": overall["p95"],
         "overall_latency_p99_ms": overall["p99"],
+        "overall_latency_p999_ms": overall["p999"],
         "overall_stall_100ms_count": overall_stall_100_count,
         "overall_stall_200ms_count": overall_stall_200_count,
         "packet_latency_count": packet["count"],
@@ -732,6 +802,7 @@ def append_trial_row(args):
 
     trials_csv = Path(args.trials_csv)
     trials_csv.parent.mkdir(parents=True, exist_ok=True)
+    upgrade_trials_csv_schema(trials_csv)
     write_header = not trials_csv.exists()
     with trials_csv.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=TRIAL_COLUMNS)
@@ -763,10 +834,12 @@ def summarize_trials(args):
         "frame_latency_max_ms",
         "frame_latency_p95_ms",
         "frame_latency_p99_ms",
+        "frame_latency_p999_ms",
         "overall_latency_avg_ms",
         "overall_latency_max_ms",
         "overall_latency_p95_ms",
         "overall_latency_p99_ms",
+        "overall_latency_p999_ms",
         "overall_stall_100ms_count",
         "overall_stall_200ms_count",
         "packet_latency_avg_ms",
@@ -836,6 +909,10 @@ def summarize_trials(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--summarize", help="summarize a trials CSV")
+    parser.add_argument(
+        "--upgrade-trials-schema",
+        help="atomically backfill P99.9 columns in an existing trials CSV",
+    )
     parser.add_argument("--summary-csv", default="summary.csv")
     parser.add_argument("--result-dir")
     parser.add_argument("--reference")
@@ -876,7 +953,9 @@ def main():
     if args.reference_loop_count < 1:
         parser.error("--reference-loop-count must be at least 1")
 
-    if args.summarize:
+    if args.upgrade_trials_schema:
+        upgrade_trials_csv_schema(args.upgrade_trials_schema)
+    elif args.summarize:
         summarize_trials(args)
     else:
         required = [
