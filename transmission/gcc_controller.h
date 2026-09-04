@@ -303,6 +303,7 @@ class GccController : public CongestionController {
   // existing backlog drains. Rearm only after a sustained healthy period.
   bool congestion_episode_active_ = false;
   bool congestion_episode_correction_applied_ = false;
+  int64_t congestion_correction_start_ms_ = -1;
   int64_t congestion_recovery_start_ms_ = -1;
   int64_t last_suppressed_overuse_log_ms_ = -1;
   static constexpr int64_t kSentRateWindowMs = 200;
@@ -321,6 +322,7 @@ class GccController : public CongestionController {
   // latch prevents queued packets from ratcheting the estimate repeatedly.
   static constexpr double kCongestionCorrectionMinDrainMs = 250.0;
   static constexpr double kCongestionCorrectionHeadroomRatio = 1.10;
+  static constexpr int64_t kCongestionCorrectionConfirmMs = 200;
   // A 10->1 Mbps-style cliff should not wait for the ordinary 200ms byte
   // confirmation or a second trendline group. Require three independent
   // signals before taking the fast path: delivery collapses below half the
